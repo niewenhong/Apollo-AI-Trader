@@ -18,3 +18,35 @@ config/strategies/*.json
 config/config/
 core/core/
 "@ | Out-File -FilePath "D:\Apollo-AI-Trader-v2.6.0\.gitignore" -Encoding UTF8
+
+# 临时文件
+output.txt
+*.bak
+config.json
+system_config.json
+vt_setting.json
+package.json
+diag_account.py
+zip_all.py
+
+# 编译产物
+build/
+dist/
+*.egg-info/
+# 临时文件
+output.txt
+*.bak
+config.json
+system_config.json
+vt_setting.json
+package.json
+diag_account.py
+zip_all.py
+
+# 编译产物
+build/
+dist/
+*.egg-info/
+
+# 第三方库源码（应通过 pip 安装）
+vnpy_futu/

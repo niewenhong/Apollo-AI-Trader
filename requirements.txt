@@ -8,3 +8,4 @@ numpy>=1.23.5
 requests>=2.28.0
 python-telegram-bot>=20.0
 loguru>=0.7.0
+vnpy-futu>=1.0.0
