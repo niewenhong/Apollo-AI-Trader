@@ -1,9 +1,0 @@
-{
-  "reversal_threshold_pct": 2.0,
-  "knockout_buffer_pct": 2.0,
-  "max_leverage": 5.0,
-  "min_days_to_expiry": 30,
-  "fixed_size": 10000,
-  "debug_mode": false,
-  "dry_run": false
-}

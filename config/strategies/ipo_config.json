@@ -1,9 +1,0 @@
-{
-  "min_subscription_amount": 10000,
-  "max_allocation_pct": 10.0,
-  "min_ipo_score": 7.0,
-  "markets": ["HK", "US"],
-  "auto_subscribe": false,
-  "debug_mode": false,
-  "dry_run": true
-}
