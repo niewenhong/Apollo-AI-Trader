@@ -1,120 +1,107 @@
 """
-ai/report_generator.py - Apollo Trader v2.6.0
-报告生成：根据数据库中的选股/诊股/回测结果生成HTML报告
+ai/report_generator.py - v2.6.0
+日报/报告生成模块（线程安全版）
 """
-import json
-from datetime import datetime
-from typing import List, Dict, Optional
-from pathlib import Path
-from core.db_manager import CustomDBManager
+import os
+import datetime
+import sqlite3
+import pandas as pd
 
 
 class ReportGenerator:
-    """生成HTML格式的投资报告"""
+    """
+    报告生成器 - 每次查询创建独立 SQLite 连接
+    彻底避免 'SQLite objects created in a thread can only be used in that same thread' 错误
+    """
 
-    def __init__(self, db: CustomDBManager, output_dir: str = "reports"):
-        self.db = db
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_manager):
+        """
+        db_manager: CustomDBManager 实例
+        从中获取 db_path，每次查询自己开新连接
+        """
+        # 兼容传入 CustomDBManager 或直接传入路径字符串
+        if isinstance(db_manager, str):
+            self.db_path = db_manager
+        else:
+            self.db_path = getattr(db_manager, 'db_path', 'data/database/trade.db')
 
-    def generate_daily_report(self, market: str = "US") -> str:
-        """生成每日投资报告"""
-        # 获取选股池
-        pool = self.db.get_top_pool(n=30, market=market)
-        # 获取执行池
-        exec_pool = self.db.get_pool(market=market)
+        # 确保数据库目录存在
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
 
-        html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><title>Apollo AI Trader 日报</title>
-<style>
-body {{ font-family: 'Segoe UI', sans-serif; margin: 20px; background: #f5f5f5; }}
-h1 {{ color: #1a73e8; }}
-table {{ border-collapse: collapse; width: 100%; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-th {{ background: #1a73e8; color: white; padding: 10px; text-align: left; }}
-td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
-tr:hover {{ background: #f0f8ff; }}
-.green {{ color: #2e7d32; }}
-.red {{ color: #c62828; }}
-.header {{ display: flex; justify-content: space-between; align-items: center; }}
-</style></head>
-<body>
-<div class="header">
-<h1>📊 Apollo AI Trader 日报</h1>
-<span>{datetime.now().strftime('%Y-%m-%d %H:%M')}</span>
-</div>
-<h2>🏆 AI精选标的 Top 30</h2>
-<table>
-<tr><th>排名</th><th>标的</th><th>评分</th><th>理由</th></tr>
-"""
-        for i, s in enumerate(pool[:30], 1):
-            html += f"<tr><td>{i}</td><td>{s['vt_symbol']}</td><td>{s['score']}</td><td>{s.get('reason','')}</td></tr>"
-        html += "</table>"
+    def _connect(self):
+        """每次创建新连接（线程安全）"""
+        return sqlite3.connect(self.db_path)
 
-        html += "<h2>⚙️ 当前执行池</h2><table><tr><th>标的</th><th>策略</th><th>状态</th></tr>"
-        for e in exec_pool:
-            html += f"<tr><td>{e['vt_symbol']}</td><td>{e['strategy_class']}</td><td>{e['status']}</td></tr>"
-        html += "</table>"
+    def generate_daily(self) -> str:
+        """生成今日交易日报"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        html += "<h2>📈 回测表现最佳参数</h2><table><tr><th>标的</th><th>策略</th><th>夏普比率</th><th>年化收益</th></tr>"
-        # 从回测结果表中获取前10条
-        rows = self.db.conn.execute(
-            "SELECT vt_symbol, strategy_class, metrics_json FROM backtest_results ORDER BY json_extract(metrics_json,'$.sharpe_ratio') DESC LIMIT 10"
-        ).fetchall()
-        for r in rows:
-            m = json.loads(r["metrics_json"])
-            html += f"<tr><td>{r['vt_symbol']}</td><td>{r['strategy_class']}</td><td class='green'>{m.get('sharpe_ratio',0):.2f}</td><td>{m.get('annual_return',0)*100:.1f}%</td></tr>"
-        html += "</table>"
+        lines = []
+        lines.append("📊 <b>Apollo AI Trader 日报</b>")
+        lines.append(f"📅 {today}")
+        lines.append("")
 
-        html += "</body></html>"
-        filename = f"daily_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        filepath = self.output_dir / filename
-        filepath.write_text(html, encoding="utf-8")
-        print(f"[Report] 日报已生成: {filepath}")
-        return str(filepath)
+        # 查询选股数据
+        try:
+            conn = self._connect()
+            try:
+                df = pd.read_sql_query(
+                    "SELECT code, name, score FROM stock_selections "
+                    "WHERE date(timestamp) = date('now') "
+                    "ORDER BY score DESC LIMIT 10",
+                    conn
+                )
+                if not df.empty:
+                    lines.append("🏆 <b>今日AI选股 Top 10</b>")
+                    for i, row in df.iterrows():
+                        code = row['code']
+                        name = row.get('name', '') or ""
+                        score = row['score']
+                        lines.append(f"  {i+1}. {code} {name} | 评分 {score:.1f}")
+                else:
+                    lines.append("🏆 今日选股：暂无数据")
+            finally:
+                conn.close()
+        except Exception as e:
+            lines.append(f"⚠️ 选股数据读取失败: {e}")
 
-    def generate_diagnosis_report(self, vt_symbol: str) -> str:
-        """生成单票诊断报告"""
-        diag = self.db.get_latest_diagnosis(vt_symbol)
-        if not diag:
-            return ""
+        lines.append("")
 
-        d = json.loads(diag["diagnosis_json"])
-        tech = d.get("technical", {})
-        mf = d.get("money_flow", {})
-        trend = d.get("trend", {})
+        # 查询事件数据
+        try:
+            conn = self._connect()
+            try:
+                df = pd.read_sql_query(
+                    "SELECT text FROM events "
+                    "WHERE date(timestamp) = date('now') "
+                    "ORDER BY id DESC LIMIT 10",
+                    conn
+                )
+                if not df.empty:
+                    lines.append("📋 <b>今日事件</b>")
+                    for _, row in df.iterrows():
+                        lines.append(f"  • {row['text']}")
+                else:
+                    lines.append("📋 今日事件：无")
+            finally:
+                conn.close()
+        except Exception as e:
+            lines.append(f"⚠️ 事件读取失败: {e}")
 
-        html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><title>{vt_symbol} 诊股报告</title>
-<style>
-body {{ font-family: 'Segoe UI', sans-serif; margin: 20px; }}
-.card {{ background: white; border-radius: 8px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-h2 {{ color: #1a73e8; }}
-.value {{ font-size: 24px; font-weight: bold; }}
-</style></head>
-<body>
-<h1>🔍 {vt_symbol} 诊股报告</h1>
-<p>生成时间: {diag['created_at']}</p>
-<div class="card"><h2>技术面</h2>
-<p>收盘价: <span class="value">{tech.get('close','N/A')}</span></p>
-<p>MA5: {tech.get('ma5','N/A')} | MA20: {tech.get('ma20','N/A')} | MA60: {tech.get('ma60','N/A')}</p>
-<p>RSI(14): {tech.get('rsi14','N/A')}</p>
-<p>均线排列: {tech.get('arrangement','N/A')}</p>
-<p>距离MA20: {tech.get('dist_from_ma20_pct','N/A'):.2f}%</p>
-</div>
-<div class="card"><h2>资金面</h2>
-<p>净流入: {mf.get('net_inflow','N/A')}</p>
-<p>方向: {mf.get('direction','N/A')}</p>
-</div>
-<div class="card"><h2>趋势</h2>
-<p>52周高位: {trend.get('high_52w','N/A')} | 52周低位: {trend.get('low_52w','N/A')}</p>
-<p>52周位置: {trend.get('position_52w_pct',0)*100:.1f}%</p>
-<p>周线趋势: {trend.get('week_trend','N/A')}</p>
-</div>
-<p><strong>总结:</strong> {diag.get('summary','')}</p>
-</body></html>"""
-        filename = f"diagnosis_{vt_symbol.replace('.','_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        filepath = self.output_dir / filename
-        filepath.write_text(html, encoding="utf-8")
-        return str(filepath)
+        lines.append("")
+        lines.append(f"🕐 生成时间: {now}")
+        lines.append("━━━━━━━━━━━━━━━━")
+        lines.append("⚠️ 本系统仅供模拟测试，不构成投资建议")
+
+        return "\n".join(lines)
+
+    def generate_weekly(self) -> str:
+        """生成周报（简化版）"""
+        return self.generate_daily()
+
+    def generate_trade_summary(self, symbol: str = "") -> str:
+        """生成单个标的的交易摘要"""
+        return f"📈 {symbol} 交易摘要：功能开发中"

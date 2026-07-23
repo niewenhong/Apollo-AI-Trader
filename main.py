@@ -15,11 +15,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.setting import SETTINGS
-from vnpy.trader.constant import LogLevel
 from vnpy_futu import FutuGateway
 from vnpy_ctastrategy import CtaStrategyApp
 from vnpy_ctabacktester import CtaBacktesterApp
-from vnpy_sqlite import SqliteDatabase
+from vnpy_sqlite import sqlite_database as SqliteDatabase
 
 try:
     import zoneinfo
@@ -27,8 +26,10 @@ except ImportError:
     from backports import zoneinfo
     sys.modules['zoneinfo'] = zoneinfo
 
-SETTINGS["log.level"] = LogLevel.DEBUG.name
+# 直接设置日志级别为 DEBUG（字符串形式）
+SETTINGS["log.level"] = "debug"
 
+os.makedirs("data/database", exist_ok=True)
 from core.db_manager import CustomDBManager
 from core.engine import StrategyEngine
 from core.decision_engine import DecisionEngine
@@ -50,7 +51,7 @@ def main():
     # 加载配置
     config_path = Path("config/system_config.json")
     if config_path.exists():
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     else:
         cfg = {}
@@ -73,16 +74,19 @@ def main():
         "密码": password, "环境": env
     }
 
+    # 禁用数据服务（vnpy_futu 是交易接口，不是数据服务）
+    SETTINGS["datafeed.name"] = ""
+
     print("[Main] 启动美股引擎...")
     main_us = MainEngine()
-    main_us.add_gateway(FutuGateway)
+    gateway_us = main_us.add_gateway(FutuGateway)
     main_us.add_app(CtaStrategyApp)
     main_us.add_app(CtaBacktesterApp)
     main_us.connect(us_setting, "FUTU")
 
     print("[Main] 启动港股引擎...")
     main_hk = MainEngine()
-    main_hk.add_gateway(FutuGateway)
+    gateway_hk = main_hk.add_gateway(FutuGateway)
     main_hk.add_app(CtaStrategyApp)
     main_hk.add_app(CtaBacktesterApp)
     main_hk.connect(hk_setting, "FUTU")
@@ -93,7 +97,7 @@ def main():
     db = CustomDBManager()
 
     # 初始化AI模块
-    quote_ctx = main_us.get_engine("FutuGateway").quote_ctx
+    quote_ctx = gateway_us.quote_ctx
     llm = LLMClient(api_key=cfg.get("llm_api_key", ""))
     selector = AIStockSelector(quote_ctx, db, top_n=cfg.get("ai_top_n", 25), market="US")
     diagnoser = StockDiagnosis(quote_ctx, db)
@@ -117,8 +121,20 @@ def main():
 
     # 启动Telegram通知
     tg_token = cfg.get("telegram_token", "")
-    tg_chat_id = cfg.get("telegram_chat_id", "")
+    tg_chat_id_raw = cfg.get("telegram_chat_id", "")
+    tg_chat_id = str(tg_chat_id_raw) if tg_chat_id_raw is not None else ""
+
+    print(f"[Debug] Telegram配置: token={'已设置' if tg_token else '空'}, chat_id={tg_chat_id}")
+    # 创建通知器
     notifier = TelegramNotifier(tg_token, tg_chat_id, db, selector, diagnoser, reporter)
+
+
+    # ⭐️ 关键步骤：将引擎传递给通知器，否则它不知道怎么查持仓
+    if 'main_us' in locals() and 'main_hk' in locals():
+        notifier.set_engines(main_us, main_hk)
+    else:
+        print("[Warning] 未找到 main_us 或 main_hk 引擎，持仓/余额查询将不可用")
+
     notifier.start_polling()
 
     # 启动Webhook服务器

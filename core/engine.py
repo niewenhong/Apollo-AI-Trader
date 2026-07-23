@@ -1,97 +1,115 @@
 """
-core/engine.py - Apollo Trader v2.6.0
-策略引擎：从数据库读取执行池，动态注册策略到双引擎
+core/engine.py - v2.6.0
+策略引擎：管理策略的加载、启动、停止
 """
-import json
-import time
-from typing import Dict, List, Optional
-from vnpy.trader.engine import MainEngine, EventEngine
-from vnpy.trader.constant import Interval, Direction, Offset
-from vnpy_ctastrategy import CtaTemplate
+import logging
+from typing import Optional
+from vnpy.trader.engine import MainEngine
 from core.db_manager import CustomDBManager
-from ai.param_advisor import ParamAdvisor
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyEngine:
-    """策略注册与管理引擎"""
+    """策略引擎"""
 
     def __init__(self, main_us: MainEngine, main_hk: MainEngine, db: CustomDBManager):
         self.main_us = main_us
         self.main_hk = main_hk
         self.db = db
-        self.advisor = ParamAdvisor(db)
-        self.active_strategies: Dict[str, CtaTemplate] = {}
 
-    def load_strategies(self, market: str = None):
-        """从执行池加载策略到对应的引擎"""
-        pool = self.db.get_pool(market=market)
-        for item in pool:
-            vt_symbol = item["vt_symbol"]
-            strategy_class = item["strategy_class"]
-            params_json = item.get("params_json", "{}")
-            params = json.loads(params_json) if params_json else {}
-
-            # 确定目标引擎
-            if ".SMART" in vt_symbol:
-                engine = self.main_us.cta_engine
-            elif ".SEHK" in vt_symbol:
-                engine = self.main_hk.cta_engine
-            else:
-                print(f"[Engine] 未知市场: {vt_symbol}，跳过")
+    def load_strategies(self):
+        """加载所有策略配置"""
+        # 从数据库或配置文件加载策略列表
+        strategies_config = self._load_config()
+        for config in strategies_config:
+            engine = self._get_cta_engine(config["market"])
+            if engine is None:
+                logger.warning(f"无法获取 {config['market']} 市场的CTA引擎")
                 continue
-
-            # 检查策略是否已存在
-            if vt_symbol in self.active_strategies:
-                print(f"[Engine] {vt_symbol} 策略已存在，跳过")
-                continue
-
-            # 从参数建议获取优化参数
-            suggested = self.advisor.suggest(vt_symbol, strategy_class, params)
-            if suggested:
-                params.update(suggested)
-
-            # 注册策略
             try:
-                strategy_name = f"{strategy_class}_{vt_symbol.replace('.','_')}"
                 engine.add_strategy(
-                    class_name=strategy_class,
-                    strategy_name=strategy_name,
-                    vt_symbol=vt_symbol,
-                    setting=params
+                    config["class_name"],
+                    config["strategy_name"],
+                    config["vt_symbol"],
+                    config["setting"]
                 )
-                self.active_strategies[vt_symbol] = strategy_name
-                print(f"[Engine] 注册策略成功: {strategy_name}")
+                logger.info(f"策略加载成功: {config['strategy_name']}")
             except Exception as e:
-                print(f"[Engine] 注册策略失败 {vt_symbol}: {e}")
+                logger.error(f"策略加载失败: {config['strategy_name']}: {e}")
 
     def start_all(self):
-        """启动所有已注册的策略"""
-        for engine in [self.main_us.cta_engine, self.main_hk.cta_engine]:
-            for name in engine.strategies.keys():
-                try:
-                    engine.start_strategy(name)
-                    print(f"[Engine] 启动策略: {name}")
-                except Exception as e:
-                    print(f"[Engine] 启动失败 {name}: {e}")
+        """启动所有已加载的策略"""
+        # 通过 get_engine 获取 CTA 引擎实例（兼容 vnpy 4.x）
+        us_cta = self.main_us.get_engine("CtaStrategy")
+        hk_cta = self.main_hk.get_engine("CtaStrategy")
+        engines = [eng for eng in [us_cta, hk_cta] if eng is not None]
+
+        for engine in engines:
+            if hasattr(engine, 'strategies'):
+                for strategy_name in list(engine.strategies.keys()):
+                    try:
+                        engine.start_strategy(strategy_name)
+                        self.db.log_event(f"策略已启动: {strategy_name}")
+                        logger.info(f"策略已启动: {strategy_name}")
+                    except Exception as e:
+                        logger.error(f"启动策略失败 {strategy_name}: {e}")
+            else:
+                logger.warning("CTA引擎没有 strategies 属性，可能未正确初始化")
+
+        logger.info("所有策略启动完成")
 
     def stop_all(self):
         """停止所有策略"""
-        for engine in [self.main_us.cta_engine, self.main_hk.cta_engine]:
-            for name in engine.strategies.keys():
-                try:
-                    engine.stop_strategy(name)
-                except:
-                    pass
+        us_cta = self.main_us.get_engine("CtaStrategy")
+        hk_cta = self.main_hk.get_engine("CtaStrategy")
+        engines = [eng for eng in [us_cta, hk_cta] if eng is not None]
 
-    def reload_strategies(self):
-        """重新加载策略（停掉旧的，加载新的）"""
-        self.stop_all()
-        self.active_strategies.clear()
-        self.load_strategies()
-        self.start_all()
+        for engine in engines:
+            if hasattr(engine, 'strategies'):
+                for strategy_name in list(engine.strategies.keys()):
+                    try:
+                        engine.stop_strategy(strategy_name)
+                        self.db.log_event(f"策略已停止: {strategy_name}")
+                        logger.info(f"策略已停止: {strategy_name}")
+                    except Exception as e:
+                        logger.error(f"停止策略失败 {strategy_name}: {e}")
 
-    def add_to_pool_and_load(self, vt_symbol: str, market: str,
-                              strategy_class: str, params: dict = None):
-        """添加到执行池并立即加载"""
-        self.db.add_to_pool(vt_symbol, market, strategy_class, params)
-        self.load_strategies(market=market)
+    def _get_cta_engine(self, market: str):
+        """根据市场获取对应的CTA引擎"""
+        main = self.main_us if market == "US" else self.main_hk
+        return main.get_engine("CtaStrategy")
+
+    def _load_config(self) -> list:
+        """从数据库或配置文件加载策略配置（示例）"""
+        # TODO: 实际应从数据库读取
+        return [
+            {
+                "market": "US",
+                "class_name": "SellPutStrategy",
+                "strategy_name": "SellPut_NVDA",
+                "vt_symbol": "NVDA.SMART",
+                "setting": {
+                    "strike_percent": 0.95,
+                    "expiry_days": 30,
+                    "premium_target": 0.02,
+                    "fixed_size": 1
+                }
+            },
+            {
+                "market": "US",
+                "class_name": "CoveredCallStrategy",
+                "strategy_name": "CoveredCall_AAPL",
+                "vt_symbol": "AAPL.SMART",
+                "setting": {
+                    "call_strike_percent": 1.05,
+                    "expiry_days": 30,
+                    "premium_target": 0.015,
+                    "fixed_size": 100
+                }
+            }
+        ]
+
+    def write_log(self, msg: str):
+        """写入日志"""
+        logger.info(msg)
