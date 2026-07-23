@@ -1,0 +1,20 @@
+@"
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+data/cache/
+data/database/*.db
+config/system_config.json
+config/accounts_config.json
+config/ai_config.example.json
+config/alerts_config.json
+config/database_config.json
+config/logging_config.json
+config/risk_config.json
+config/symbols_config.json
+config/strategies/*.json
+config/config/
+core/core/
+"@ | Out-File -FilePath "D:\Apollo-AI-Trader-v2.6.0\.gitignore" -Encoding UTF8
