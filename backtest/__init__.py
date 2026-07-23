@@ -1,2 +1,2 @@
 """backtest package"""
-from backtest.optimizer import ParamOptimizer
+from backtest.optimizer import ParameterOptimizer
