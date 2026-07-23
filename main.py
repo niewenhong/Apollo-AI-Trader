@@ -44,7 +44,7 @@ from ai.report_generator import ReportGenerator
 from ai.llm_client import LLMClient
 from monitoring.telegram_notifier import TelegramNotifier
 from monitoring.webhook_server import WebhookServer
-from backtest.optimizer import ParamOptimizer
+from backtest.optimizer import ParameterOptimizer
 
 
 def main():
@@ -105,7 +105,7 @@ def main():
     diagnoser = StockDiagnosis(quote_ctx, db)
     advisor = ParamAdvisor(db, llm)
     reporter = ReportGenerator(db)
-    optimizer = ParamOptimizer(db, n_jobs=4)
+    optimizer = ParameterOptimizer(db, n_jobs=4)
     decision_engine = DecisionEngine(db, llm)
 
     # ---- AI选股 ----

@@ -11,7 +11,7 @@ from core.db_manager import CustomDBManager
 from core.decision_engine import DecisionEngine
 
 
-class ParamOptimizer:
+class ParameterOptimizer:
     """参数优化器：对执行池标的执行网格搜索+Walk-forward验证"""
 
     def __init__(self, db: CustomDBManager, decision_engine: DecisionEngine,
