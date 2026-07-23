@@ -105,7 +105,7 @@ def main():
     diagnoser = StockDiagnosis(quote_ctx, db)
     advisor = ParamAdvisor(db, llm)
     reporter = ReportGenerator(db)
-    optimizer = ParameterOptimizer(db, n_jobs=4)
+    optimizer = ParamOptimizer(db, n_jobs=4)
     decision_engine = DecisionEngine(db, llm)
 
     # ---- AI选股 ----
