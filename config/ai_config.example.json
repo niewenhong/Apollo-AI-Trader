@@ -1,0 +1,22 @@
+{
+  "_comment": "AI 配置文件示例，复制为 ai_config.json 并填入真实 API Key",
+  "primary": "zhipu",
+  "fallback": "deepseek",
+  "models": {
+    "zhipu": {
+      "api_key": "你的智谱AI_API_Key",
+      "model": "glm-4-plus"
+    },
+    "deepseek": {
+      "api_key": "你的DeepSeek_API_Key",
+      "model": "deepseek-chat"
+    },
+    "openai": {
+      "api_key": "你的OpenAI_API_Key",
+      "model": "gpt-4o-mini"
+    }
+  },
+  "temperature": 0.3,
+  "max_tokens": 2048,
+  "timeout": 30
+}

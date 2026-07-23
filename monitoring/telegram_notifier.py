@@ -28,7 +28,6 @@ class TelegramNotifier:
         self.main_us = main_us
         self.main_hk = main_hk
 
-    # ---------------- 启动 ----------------
     def start_polling(self):
         if not self.token or not self.chat_id:
             print("[Telegram] 未配置Token或ChatID，跳过启动")
@@ -55,7 +54,6 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[Telegram] 连接异常: {e}")
 
-    # ---------------- 轮询 ----------------
     def _poll_loop(self):
         while self._running:
             try:
@@ -88,7 +86,6 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[Telegram] 处理更新异常: {e}")
 
-    # ---------------- 命令 ----------------
     def _handle_command(self, text, chat_id):
         if text in ("/start", "/help"):
             self._reply(chat_id, self._help_text())
@@ -119,7 +116,6 @@ class TelegramNotifier:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return f"📡 <b>状态</b>\n🕐 {now}\n🟢 运行中\n📊 选股完成\n🌐 Webhook 运行中"
 
-    # ---------------- 持仓（关键字段）----------------
     def _get_positions(self):
         lines = ["💼 <b>当前持仓</b>"]
         try:
@@ -168,7 +164,6 @@ class TelegramNotifier:
             lines.append(f"  ⚠️ {e}")
         return "\n".join(lines)
 
-    # ---------------- 资金（只打关键字段）----------------
     def _get_balance(self):
         lines = ["💰 <b>账户资金</b>"]
         try:
@@ -206,7 +201,6 @@ class TelegramNotifier:
                         us_cash = g("us_cash")
                         hk_cash = g("hk_cash")
 
-                        # 现金展示（分币种优先）
                         if label == "港股":
                             cash_disp = hk_cash if hk_cash is not None else cash
                             cash_unit = "HKD"
@@ -214,7 +208,6 @@ class TelegramNotifier:
                             cash_disp = us_cash if us_cash is not None else cash
                             cash_unit = "USD"
 
-                        # 购买力兜底
                         if power is None or power == 0:
                             if label == "港股":
                                 power_disp = cash * 2
@@ -239,7 +232,6 @@ class TelegramNotifier:
             lines.append(f"  ⚠️ 全局异常: {e}")
         return "\n".join(lines)
 
-    # ---------------- 发送 ----------------
     def _reply(self, chat_id, text):
         try:
             requests.post(

@@ -1,98 +1,70 @@
 """
-strategies/options/bear_put_spread_strategy.py - v2.6.0
-熊市看跌价差：买入高行权价Put + 卖出低行权价Put，风险有限收益有限
-实盘级别：支持价差构建、止盈止损、展期
+strategies/options/bear_put_spread_strategy.py - Apollo-AI-Trader v2.6.0
+Bear Put Spread：买高行权价Put + 卖低行权价Put
+温和看跌，风险有限
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-import numpy as np
+from vnpy.trader.object import BarData
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
-class BearPutSpreadStrategy(CtaTemplate):
+class BearPutSpreadStrategy(BaseOptionStrategy):
     author = "Apollo"
+    version = "v2.6.0"
+
+    delta_long = -0.35          # 买入腿Delta（负值）
+    delta_short = -0.15         # 卖出腿Delta（负值，更接近ATM）
+    min_days_to_expiry = 14
+    max_days_to_expiry = 45
+    min_credit_ratio = 0.30
+    rolling_days = 7
+    max_positions = 3
 
     parameters = [
-        "delta_long",           # 买入腿Delta目标（-0.30~-0.40）
-        "delta_short",          # 卖出腿Delta目标（-0.15~-0.20）
-        "min_days_to_expiry",
-        "max_days_to_expiry",
-        "min_credit_ratio",
-        "rolling_days",
+        "delta_long", "delta_short", "min_days_to_expiry",
+        "max_days_to_expiry", "min_credit_ratio", "rolling_days",
         "max_positions",
     ]
-
-    variables = [
-        "pos", "long_put", "short_put", "expiry_date",
-        "net_premium", "max_loss", "max_profit", "pnl"
-    ]
-
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
-        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.long_put = None
-        self.short_put = None
-        self.expiry_date = None
-        self.net_premium = 0.0
-        self.max_loss = 0.0
-        self.max_profit = 0.0
-        self.pnl = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
-
-    def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log("BearPutSpread策略初始化完成")
-
-    def on_start(self):
-        self.write_log("BearPutSpread策略启动")
-
-    def on_stop(self):
-        self.write_log("BearPutSpread策略停止")
-
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
+    variables = ["net_premium", "max_loss", "max_profit", "pnl", "legs"]
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
-            return
+        if self._manage_expiry(bar): return
+        if self.legs and len(self.legs) >= 2:
+            for leg in self.legs.values():
+                if leg.get("days_to_expiry",999) <= self.rolling_days:
+                    self._roll_positions(); return
+        if len(self.legs) < 2:
+            self._find_spread(bar)
 
-        if self.long_put is None and self.short_put is None:
-            self._find_spread_opportunity(bar)
-        else:
-            self._manage_position(bar)
+    def _find_spread(self, bar: BarData):
+        code = self._to_futu_code()
+        chain = self._query_option_chain(code)
+        if not chain: return
+        puts = [c for c in chain if c.get("is_put", True)]
+        if len(puts) < 2: return
+        # long: 高行权价(Delta更负), short: 低行权价(Delta更接近0)
+        long_cands = [p for p in puts if abs(abs(p.get("delta",0))-abs(self.delta_long))<=0.1]
+        short_cands = [p for p in puts if abs(abs(p.get("delta",0))-abs(self.delta_short))<=0.1]
+        if not long_cands or not short_cands: return
+        best = None
+        for lc in long_cands:
+            for sc in short_cands:
+                if sc.get("strike_price",0) >= lc.get("strike_price",0): continue
+                net = lc.get("premium",0) - sc.get("premium",0)
+                if net > 0 and net < (lc["strike_price"]-sc["strike_price"]):
+                    if best is None or net < best[2]:
+                        best = (lc, sc, net, lc["strike_price"]-sc["strike_price"])
+        if best:
+            long_leg, short_leg, net, width = best
+            long_leg["name"] = "bps_long"; long_leg["is_long"] = True
+            short_leg["name"] = "bps_short"; short_leg["is_long"] = False
+            ok = self._open_spread(long_leg, short_leg)
+            if ok:
+                self.max_loss = net
+                self.max_profit = width - net
+                self.write_log(f"[BPS] ✅ 开仓 long@{long_leg['strike_price']} "
+                              f"short@{short_leg['strike_price']} net={net:.1f}")
 
-    def _find_spread_opportunity(self, bar: BarData):
-        """寻找熊市价差机会：温和看跌时建立"""
-        if len(self.am.close) < 20:
-            return
-        ma5 = np.mean(self.am.close[-5:])
-        ma20 = np.mean(self.am.close[-20:])
-        rsi = self.am.rsi(14)
-
-        # 条件：均线空头，RSI中性偏弱
-        if ma5 < ma20 and 32 < rsi < 58:
-            # 构建价差：买入ATM Put，卖出OTM Put
-            long_strike = bar.close_price * 1.02  # 略高于现价
-            short_strike = bar.close_price * 0.93  # 虚值7%
-            self.long_put = {"strike": round(long_strike, 2), "type": "put"}
-            self.short_put = {"strike": round(short_strike, 2), "type": "put"}
-            self.net_premium = bar.close_price * 0.025  # 模拟净权利金支出
-            self.max_loss = self.net_premium
-            self.max_profit = (long_strike - short_strike) * 100 - self.net_premium
-            self.pos = -1
-            self.write_log(f"BearPutSpread开仓: Long@{self.long_put['strike']} Short@{self.short_put['strike']}")
-
-    def _manage_position(self, bar: BarData):
-        """管理持仓：止盈止损、展期"""
-        underlying_pct = (self.am.close[-20] - bar.close_price) / self.am.close[-20]
-        self.pnl = self.net_premium * underlying_pct * 10
-
-        # 如果价格接近买入腿，考虑平仓
-        if bar.close_price <= self.long_put["strike"] * 0.96:
-            self.cover(bar.close_price, abs(self.pos))
-            self.long_put = None
-            self.short_put = None
-            self.pos = 0
-            self.write_log(f"BearPutSpread平仓: 接近买入腿行权价")
+    def _to_futu_code(self) -> str:
+        if ".SMART" in self.vt_symbol: return f"US.{self.vt_symbol.split('.')[0]}"
+        if ".SEHK" in self.vt_symbol: return f"HK.{self.vt_symbol.split('.')[0]}"
+        return self.vt_symbol

@@ -1,57 +1,26 @@
-@"
+# 数据库
+data/
+*.db
+*.sqlite
+
+# 配置文件（含Token和密码）
+config/system_config.json
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 日志
+*.log
 logs/
-data/cache/
-data/database/*.db
-config/system_config.json
-config/accounts_config.json
-config/ai_config.example.json
-config/alerts_config.json
-config/database_config.json
-config/logging_config.json
-config/risk_config.json
-config/symbols_config.json
-config/strategies/*.json
-config/config/
-core/core/
-"@ | Out-File -FilePath "D:\Apollo-AI-Trader-v2.6.0\.gitignore" -Encoding UTF8
 
-# 临时文件
-output.txt
-*.bak
-config.json
-system_config.json
-vt_setting.json
-package.json
-diag_account.py
-zip_all.py
-
-# 编译产物
-build/
-dist/
-*.egg-info/
-# 临时文件
-output.txt
-*.bak
-config.json
-system_config.json
-vt_setting.json
-package.json
-diag_account.py
-zip_all.py
-
-# 编译产物
-build/
-dist/
-*.egg-info/
-
-# 第三方库源码（应通过 pip 安装）
-vnpy_futu/
-# BFG 工具
-bfg.jar
-
-# 机器注册信息
-config/machine_registry.json
+# OS
+Thumbs.db
+desktop.ini

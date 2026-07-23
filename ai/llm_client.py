@@ -78,9 +78,7 @@ class LLMClient:
 
         if not response:
             return None
-
         try:
-            # 尝试提取JSON
             start = response.find("{")
             end = response.rfind("}") + 1
             if start >= 0 and end > start:

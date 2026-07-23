@@ -1,109 +1,85 @@
 """
-strategies/options/straddle_strategy.py - v2.6.0
-跨式策略：同时买入平值Call和Put，赌大波动（事件驱动）
-注：高难度策略，默认实验状态，谨慎使用
+strategies/options/straddle_strategy.py - Apollo-AI-Trader v2.6.0
+Straddle：同时买入平值Call+Put，赌大波动（事件驱动）
+⚠️ 高难度策略：双份权利金损耗，仅适合重大事件前（财报/议息/FOMC）
+📦 当前状态：实验占位，待事件检测模块完成后启用
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-import numpy as np
+from vnpy.trader.object import BarData
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
-class StraddleStrategy(CtaTemplate):
+class StraddleStrategy(BaseOptionStrategy):
     author = "Apollo"
+    version = "v2.6.0"
+
+    atm_offset_pct = 0.02        # 平值附近偏移
+    min_days_to_expiry = 7
+    max_days_to_expiry = 30
+    min_iv_percentile = 20       # IV百分位低于此值才考虑（便宜时买）
+    event_types = ["earnings", "fomc", "cpi", "nfp"]
+    profit_target = 2.0          # 盈利目标：权利金的2倍
+    stop_loss_pct = 0.5         # 止损：权利金的50%
+    max_positions = 1
 
     parameters = [
-        "at_the_money_offset", # 平值附近偏移百分比
-        "min_days_to_expiry",
-        "max_days_to_expiry",
-        "min_iv_percentile",   # 最低IV百分位（越低越好，波动率低时买入）
-        "event_type",          # 事件类型：earnings, fed, etc.
-        "profit_target",       # 盈利目标倍数（权利金的倍数）
-        "stop_loss",           # 止损比例
-        "max_positions"
+        "atm_offset_pct", "min_days_to_expiry", "max_days_to_expiry",
+        "min_iv_percentile", "profit_target", "stop_loss_pct",
+        "max_positions",
     ]
-
-    variables = [
-        "pos", "call_leg", "put_leg", "expiry_date",
-        "total_cost", "current_value", "pnl", "iv_percentile"
-    ]
+    variables = ["total_cost", "current_value", "pnl", "legs", "event_detected"]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.call_leg = None
-        self.put_leg = None
-        self.expiry_date = None
         self.total_cost = 0.0
         self.current_value = 0.0
-        self.pnl = 0.0
-        self.iv_percentile = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
-
-    def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log("Straddle策略初始化完成")
-
-    def on_start(self):
-        self.write_log("Straddle策略启动")
-
-    def on_stop(self):
-        self.write_log("Straddle策略停止")
-
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
+        self.event_detected = False
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
-            return
-
-        if self.call_leg is None and self.put_leg is None:
-            self._find_opportunity(bar)
-        else:
+        """事件驱动：检测到重大事件临近时才建仓"""
+        # TODO: 接入事件日历模块（财报日期/FOMC日程）
+        # 当前为占位实现
+        if not self.event_detected:
+            self._check_upcoming_event()
+        if self.event_detected and not self.legs:
+            self._find_straddle(bar)
+        elif self.legs:
             self._manage_position(bar)
 
-    def _find_opportunity(self, bar: BarData):
-        """寻找跨式机会：重大事件前IV较低时建立"""
-        if len(self.am.close) < 20:
-            return
-        rsi = self.am.rsi(14)
-        atr = self.am.atr(14)
-        # 模拟IV百分位（实际应从期权链获取）
-        self.iv_percentile = np.random.uniform(20, 40)
+    def _check_upcoming_event(self):
+        """检查是否有重大事件在7天内（占位：需接入事件API）"""
+        # TODO: 实现事件检测
+        self.event_detected = False
 
-        # 条件：RSI中性，IV处于低位，临近事件
-        if 30 < rsi < 67 and self.iv_percentile < self.min_iv_percentile:
-            atm_strike = bar.close_price * (1 + self.at_the_money_offset)
-            self.call_leg = {"strike": round(atm_strike, 2), "type": "call"}
-            self.put_leg = {"strike": round(atm_strike, 2), "type": "put"}
-            # 模拟权利金成本
-            self.total_cost = bar.close_price * 0.035 * 2  # 两条腿
-            self.pos = 1
-            self.write_log(
-                f"Straddle开仓: Call@{atm_strike:.2f} Put@{atm_strike:.2f} "
-                f"总成本{self.total_cost:.2f}"
-            )
+    def _find_straddle(self, bar: BarData):
+        code = self._to_futu_code()
+        chain = self._query_option_chain(code)
+        if not chain: return
+        # 找ATM Call和Put
+        spot = bar.close_price
+        calls = [c for c in chain if c.get("is_call",True)]
+        puts = [c for c in chain if c.get("is_put",True)]
+        atm_call = min(calls, key=lambda c: abs(c.get("strike_price",0)-spot), default=None)
+        atm_put = min(puts, key=lambda p: abs(p.get("strike_price",0)-spot), default=None)
+        if not atm_call or not atm_put: return
+        # 买入双腿
+        atm_call["name"]="std_call"; atm_call["is_long"]=True
+        atm_put["name"]="std_put"; atm_put["is_long"]=True
+        ok1 = self._send_option_order(atm_call, Direction.LONG, Offset.OPEN)
+        ok2 = self._send_option_order(atm_put, Direction.LONG, Offset.OPEN)
+        if ok1 and ok2:
+            self.total_cost = atm_call.get("premium",0) + atm_put.get("premium",0)
+            self.write_log(f"[Straddle] ✅ 买入双腿 cost={self.total_cost:.1f}")
 
     def _manage_position(self, bar: BarData):
-        """管理持仓：事件后平仓或止损"""
-        # 模拟当前价值
-        move = abs(bar.close_price - self.am.close[-20]) / self.am.close[-20]
-        self.current_value = self.total_cost * (1 + move * 5)  # 粗略估算
-        self.pnl = self.current_value - self.total_cost
+        """管理持仓：达到盈利目标或止损"""
+        if self.current_value >= self.total_cost * self.profit_target:
+            self._close_all_legs()
+            self.write_log("[Straddle] 达到盈利目标，平仓")
+        elif self.current_value <= self.total_cost * self.stop_loss_pct:
+            self._close_all_legs()
+            self.write_log("[Straddle] 止损平仓")
 
-        # 止盈
-        if self.pnl >= self.total_cost * self.profit_target:
-            self.sell(bar.close_price, abs(self.pos))
-            self.call_leg = None
-            self.put_leg = None
-            self.pos = 0
-            self.write_log(f"Straddle止盈: PnL={self.pnl:.2f}")
-        # 止损
-        elif self.pnl <= -self.total_cost * self.stop_loss:
-            self.sell(bar.close_price, abs(self.pos))
-            self.call_leg = None
-            self.put_leg = None
-            self.pos = 0
-            self.write_log(f"Straddle止损: PnL={self.pnl:.2f}")
+    def _to_futu_code(self) -> str:
+        if ".SMART" in self.vt_symbol: return f"US.{self.vt_symbol.split('.')[0]}"
+        if ".SEHK" in self.vt_symbol: return f"HK.{self.vt_symbol.split('.')[0]}"
+        return self.vt_symbol

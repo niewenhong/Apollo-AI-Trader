@@ -1,116 +1,125 @@
 """
-ai/stock_selector.py - v2.6.0
-AI选股模块：基于富途行情数据筛选优质标的
+ai/stock_selector.py - Apollo-AI-Trader v2.6.0
+AI选股：富途行情 → 多维指标评分 → 排序 → 写数据库 → 供策略自动读取
 """
-import pandas as pd
-import numpy as np
+import json
+import time
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
-import logging
+from typing import List, Dict, Optional
+import numpy as np
 
-logger = logging.getLogger(__name__)
+try:
+    from futu import RET_OK, KLType
+except ImportError:
+    RET_OK = 0
+    KLType = None
 
 
 class AIStockSelector:
-    """AI选股器"""
+    """技术面+资金面AI选股器"""
 
-    def __init__(self, quote_ctx, db, top_n: int = 25, market: str = "US"):
+    def __init__(self, quote_ctx, db, top_n: int = 30, market: str = "US"):
         self.ctx = quote_ctx
         self.db = db
         self.top_n = top_n
         self.market = market
+        self.min_score = 55.0
 
-    def select(self) -> List[str]:
-        """执行选股流程，返回选中的股票代码列表"""
-        selected_codes = []
-
-        # 1. 获取候选股票池
-        candidates = self._get_candidates()
-        if not candidates:
-            logger.warning("候选股票池为空")
-            return selected_codes
-
-        # 2. 逐个分析评分
-        scores = []
-        for stock in candidates:
+    def select(self, universe: Optional[List[str]] = None) -> List[Dict]:
+        if universe is None:
+            universe = self._get_default_universe()
+        scored = []
+        for code in universe:
             try:
-                # 安全解包：兼容富途API返回的各种格式
-                code, name = self._safe_unpack_stock(stock)
-                score = self._score_stock(code, name)
-                if score > 0:
-                    scores.append((code, name, score))
-                    logger.info(f"[Selector] {code} ({name}) 评分: {score:.2f}")
+                s = self._score(code)
+                if s["score"] >= self.min_score:
+                    scored.append(s)
             except Exception as e:
-                logger.error(f"[Selector] {stock} 失败: {e}")
+                print(f"[Selector] {code} 失败: {e}")
+            time.sleep(0.3)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        selected = scored[:self.top_n]
+        # 写入数据库
+        pool = []
+        for s in selected:
+            pool.append({
+                "vt_symbol": s["vt_symbol"], "market": self.market,
+                "score": s["score"], "reason": s.get("reason",""),
+                "indicators": s.get("indicators",{}),
+                "expires_at": (datetime.now()+timedelta(hours=24)).isoformat(),
+                "status": "selected"})
+            # 同时加入执行池
+            self.db.add_to_pool(s["vt_symbol"], self.market)
+        self.db.save_stock_pool(pool)
+        print(f"[Selector] ✅ {len(selected)} 只写入 ai_stock_pool")
+        return selected
 
-        # 3. 按评分排序取前N只
-        scores.sort(key=lambda x: x[2], reverse=True)
-        selected = scores[:self.top_n]
-        selected_codes = [s[0] for s in selected]
+    def _score(self, code: str) -> Dict:
+        indicators = {}
+        # 快照
+        ret, data = self.ctx.get_market_snapshot([code])
+        if ret != RET_OK or data.empty:
+            raise RuntimeError("snapshot fail")
+        row = data.iloc[0]
+        last = float(row.get("last_price",0))
+        prev = float(row.get("prev_close_price",last))
+        chg = (last-prev)/prev if prev else 0
+        turnover = float(row.get("turnover",0))
 
-        # 4. 写入数据库
-        self._save_to_db(selected)
+        # K线
+        ret, k = self.ctx.request_history_kline(
+            code, ktype=KLType.K_DAY if KLType else "K_DAY",
+            start=(datetime.now()-timedelta(days=120)).strftime("%Y-%m-%d"),
+            end=datetime.now().strftime("%Y-%m-%d"), max_count=120)
+        if ret != RET_OK or k.empty:
+            raise RuntimeError("kline fail")
+        c = k["close"].astype(float).values
+        v = k["volume"].astype(float).values
 
-        logger.info(f"[Selector] 选股完成: {len(selected_codes)} 只")
-        return selected_codes
+        ma5, ma10, ma20, ma60 = self._ma(c,5), self._ma(c,10), self._ma(c,20), self._ma(c,60)
+        rsi = self._rsi(c, 14)
+        macd, sig, hist = self._macd(c)
+        vr = float(v[-1])/(self._ma(v,20)+1e-6)
 
-    def _safe_unpack_stock(self, stock) -> Tuple[str, str]:
-        """
-        安全解包股票数据，兼容富途API返回的不同格式
-        可能的格式：
-        - ("US.NVDA", "NVIDIA Corporation")
-        - ["US.NVDA", "NVIDIA Corporation"]
-        - ("NVDA",)
-        - 自定义对象
-        """
-        if isinstance(stock, (list, tuple)):
-            if len(stock) >= 2:
-                code = str(stock[0])
-                name = str(stock[1])
-            elif len(stock) == 1:
-                code = str(stock[0])
-                name = ""
-            else:
-                raise ValueError(f"无法解包股票数据: {stock}")
-        elif hasattr(stock, 'code') and hasattr(stock, 'name'):
-            # 如果是富途API返回的对象
-            code = stock.code
-            name = stock.name
-        else:
-            code = str(stock)
-            name = ""
-        return code, name
+        indicators = {"last":last,"chg":chg,"ma5":ma5,"ma20":ma20,"rsi":rsi,"macd_hist":hist,"vr":vr}
 
-    def _get_candidates(self) -> List:
-        """获取候选股票池（从富途行情或本地数据库）"""
-        try:
-            # 优先从富途获取热门股票列表
-            codes = ["US.NVDA", "US.AAPL", "US.MSFT", "US.AMZN", "US.TSLA",
-                     "US.META", "US.GOOGL", "US.AMD", "US.NFLX", "US.BABA",
-                     "US.COIN", "US.MARA", "US.RIOT", "US.UPST", "US.ARM"]
-            # 转换为富途API期望的格式（带market前缀）
-            return [(c, "") for c in codes]
-        except Exception as e:
-            logger.error(f"获取候选池失败: {e}")
-            return []
+        score = 50.0; reasons = []
+        if ma5 > ma10 > ma20: score += 15; reasons.append("多头排列")
+        if last > ma20: score += 10; reasons.append("站上MA20")
+        if 30 < rsi < 70: score += 10; reasons.append(f"RSI{rsi:.0f}")
+        if hist > 0: score += 10; reasons.append("MACD金叉")
+        if vr > 1.5: score += 5; reasons.append(f"放量{vr:.1f}x")
+        if 0.01 < chg < 0.05: score += 5; reasons.append(f"温和涨{chg*100:.1f}%")
+        if turnover > 1e8: score += 5; reasons.append("大市值")
+        score = min(score, 100.0)
 
-    def _score_stock(self, code: str, name: str) -> float:
-        """对单只股票进行评分（简化版）"""
-        # 这里实现实际的评分逻辑，例如基于技术指标、基本面等
-        # 由于当前阶段主要是修复解包错误，暂时返回随机分数供测试
-        import random
-        return round(random.uniform(0, 100), 2)
+        return {"vt_symbol": self._to_vt(code), "code": code,
+                "score": round(score,2), "reason": ";".join(reasons),
+                "indicators": indicators}
 
-    def _save_to_db(self, selected: List[Tuple[str, str, float]]):
-        """将选股结果保存到数据库"""
-        try:
-            for code, name, score in selected:
-                self.db.save_stock_selection({
-                    "code": code,
-                    "name": name,
-                    "score": score,
-                    "timestamp": datetime.now().isoformat()
-                })
-            logger.info(f"[Selector] {len(selected)} 只标的写入数据库")
-        except Exception as e:
-            logger.error(f"保存选股结果失败: {e}")
+    def _get_default_universe(self) -> List[str]:
+        if self.market == "US":
+            return ["US.NVDA","US.AAPL","US.MSFT","US.AMZN","US.TSLA",
+                    "US.META","US.GOOGL","US.AMD","US.NFLX","US.BABA"]
+        return ["HK.00700","HK.09988","HK.03690","HK.00388","HK.00941"]
+
+    @staticmethod
+    def _to_vt(code): return code.replace("US.","")+".SMART" if code.startswith("US.") else code.replace("HK.","")+".SEHK"
+    @staticmethod
+    def _ma(d,n): return float(np.mean(d[-n:])) if len(d)>=n else float(d[-1])
+    @staticmethod
+    def _rsi(c,n=14):
+        if len(c)<n+1: return 50.0
+        d=np.diff(c[-(n+1):]); g=np.maximum(d,0).sum()/n; l=np.maximum(-d,0).sum()/n
+        return 100.0 if l==0 else float(100-100/(1+g/(l+1e-6)))
+    @staticmethod
+    def _macd(c,fast=12,slow=26,sig=9):
+        if len(c)<slow+sig: return 0.0,0.0,0.0
+        ema_f=AIStockSelector._ema(c,fast); ema_s=AIStockSelector._ema(c,slow)
+        m=ema_f-ema_s; s=AIStockSelector._ema(np.r_[np.array([m[:slow].mean()]),m[slow:]],sig)
+        return float(m[-1]), float(s[-1]), float(m[-1]-s[-1])
+    @staticmethod
+    def _ema(d,n):
+        r=np.zeros_like(d); r[0]=d[0]; k=2.0/(n+1)
+        for i in range(1,len(d)): r[i]=d[i]*k+r[i-1]*(1-k)
+        return r

@@ -1,118 +1,78 @@
 """
-strategies/options/covered_call_strategy.py - v2.6.0
-持股卖Call策略：持有正股的同时卖出虚值Call，增强收益
-实盘级别：支持分红调整、行权风险管理
+strategies/options/covered_call_strategy.py - Apollo-AI-Trader v2.6.0
+Covered Call：持股 + 卖Call（持股收租金增强收益）
+前提：必须先持有正股，才能卖对应数量的Call
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-import numpy as np
+from vnpy.trader.object import BarData, Direction, Offset
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
-class CoveredCallStrategy(CtaTemplate):
+class CoveredCallStrategy(BaseOptionStrategy):
     author = "Apollo"
+    version = "v2.6.0"
+
+    target_delta = 0.20
+    min_otm_prob = 0.70         # Covered Call 要求更高OTM（更不容易被行权）
+    min_days_to_expiry = 14
+    max_days_to_expiry = 45
+    min_annual_roi = 0.20
+    position_size = 1
+    max_positions = 5
+    underlying_shares_per_contract = 100  # 每张期权对应正股数
+    roll_when_ditm = 0.35
 
     parameters = [
-        "delta_target",         # 目标Delta（如0.2）
-        "days_to_expiry",
-        "min_dividend_yield",   # 最低股息率（用于筛选持股标的）
-        "profit_take_pct",
-        "stop_loss_pct",
-        "max_positions",
-        "roll_dte",
+        "target_delta", "min_otm_prob", "min_days_to_expiry",
+        "max_days_to_expiry", "min_annual_roi", "position_size",
+        "max_positions", "underlying_shares_per_contract", "roll_when_ditm",
     ]
-
-    variables = [
-        "pos", "stock_pos", "option_pos", "entry_stock_price",
-        "entry_option_price", "strike", "expiry", "pnl"
-    ]
+    variables = ["net_premium", "pnl", "legs", "stock_position"]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.stock_pos = 0
-        self.option_pos = 0
-        self.entry_stock_price = 0.0
-        self.entry_option_price = 0.0
-        self.strike = 0.0
-        self.expiry = None
-        self.pnl = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
-
-    def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log("CoveredCall策略初始化完成")
-
-    def on_start(self):
-        self.write_log("CoveredCall策略启动")
-
-    def on_stop(self):
-        self.write_log("CoveredCall策略停止")
-
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
+        self.stock_position = 0  # 持有的正股数量
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
-            return
+        if self._manage_expiry(bar): return
+        # 检查正股持仓是否足够
+        self._sync_stock_position()
+        if self.stock_position < self.underlying_shares_per_contract:
+            return  # 持仓不足，不开Covered Call
+        # 展期
+        if self.legs:
+            for leg in self.legs.values():
+                if abs(leg.get("delta",0)) > self.roll_when_ditm:
+                    self._roll_positions(); return
+        # 开仓
+        if not self.legs:
+            self._find_call_to_sell(bar)
 
-        if self.stock_pos == 0:
-            # 未持股：先买入正股
-            self._buy_stock(bar)
-        elif self.stock_pos > 0 and self.option_pos == 0:
-            # 已持股未卖Call：卖出Call
-            self._sell_call(bar)
-        else:
-            # 已有持仓：管理
-            self._manage_position(bar)
+    def _sync_stock_position(self):
+        """从账户同步正股持仓"""
+        # 通过cta_engine查询持仓
+        try:
+            pos_manager = getattr(self.cta_engine.main_engine, "position_manager", None)
+            if pos_manager:
+                pos = pos_manager.get_position(self.vt_symbol)
+                self.stock_position = pos.volume if pos else 0
+        except: pass
 
-    def _buy_stock(self, bar: BarData):
-        """买入正股（作为底仓）"""
-        if len(self.am.close) < 20:
-            return
-        ma5 = np.mean(self.am.close[-5:])
-        ma20 = np.mean(self.am.close[-20:])
-        if ma5 > ma20 and bar.close_price > ma20:
-            self.buy(bar.close_price, 100)  # 买入100股
-            self.entry_stock_price = bar.close_price
-            self.stock_pos = 100
-            self.write_log(f"CoveredCall买入正股: {self.vt_symbol} @ {bar.close_price}")
+    def _find_call_to_sell(self, bar: BarData):
+        code = self._to_futu_code()
+        chain = self._query_option_chain(code)
+        calls = self._select_contracts(chain, "call")
+        if not calls: return
+        calls.sort(key=lambda x: (-x.get("otm_prob",0), x.get("annual_roi",0)))
+        target = calls[0]
+        target["name"] = "covered_call"
+        target["is_long"] = False
+        ok = self._send_option_order(target, Direction.SHORT, Offset.OPEN)
+        if ok:
+            self.net_premium += target.get("premium", 0)
+            self.write_log(f"[CovCall] ✅ 卖出Covered Call {target['code']} "
+                          f"premium={target.get('premium')}")
 
-    def _sell_call(self, bar: BarData):
-        """卖出虚值Call"""
-        strike = self.entry_stock_price * (1 + 0.03)  # 3%虚值
-        self.strike = round(strike, 2)
-        self.sell(bar.close_price, 1)  # 卖出一张Call
-        self.entry_option_price = bar.close_price
-        self.option_pos = -1
-        self.write_log(f"CoveredCall卖Call: Strike={self.strike}")
-
-    def _manage_position(self, bar: BarData):
-        """管理持仓：止盈止损、展期"""
-        # 计算盈亏
-        stock_pnl = (bar.close_price - self.entry_stock_price) * self.stock_pos
-        option_pnl = (self.entry_option_price - bar.close_price) * abs(self.option_pos)
-        total_pnl = stock_pnl + option_pnl
-        self.pnl = total_pnl
-
-        # 如果股价接近行权价，考虑展期或平仓
-        if bar.close_price >= self.strike * 0.95:
-            # 接近行权价，平仓或展期
-            self.cover(bar.close_price, abs(self.option_pos))
-            self.option_pos = 0
-            self.write_log(f"CoveredCall平仓Call: {self.vt_symbol} 接近行权价")
-
-    def on_trade(self, trade):
-        if trade.direction == Direction.LONG:
-            if trade.offset == "OPEN":
-                self.stock_pos += trade.volume
-            else:
-                self.stock_pos -= trade.volume
-        elif trade.direction == Direction.SHORT:
-            if trade.offset == "OPEN":
-                self.option_pos -= trade.volume
-            else:
-                self.option_pos += trade.volume
-        self.pos = self.stock_pos + self.option_pos
+    def _to_futu_code(self) -> str:
+        if ".SMART" in self.vt_symbol: return f"US.{self.vt_symbol.split('.')[0]}"
+        if ".SEHK" in self.vt_symbol: return f"HK.{self.vt_symbol.split('.')[0]}"
+        return self.vt_symbol

@@ -1,119 +1,101 @@
 """
-strategies/options/iron_condor_strategy.py - v2.6.0
-铁鹰式：同时卖出虚值Call和Put（各一条腿），买入更虚值的Call和Put保护
-预期市场窄幅震荡，赚取时间价值
-实盘级别：支持四腿构建、盈亏平衡点监控、展期
+strategies/options/iron_condor_strategy.py - Apollo-AI-Trader v2.6.0
+Iron Condor：卖OTM Call + 卖OTM Put + 买更OTM Call/Put保护
+预期震荡，双向收权利金，风险有限
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-import numpy as np
+from vnpy.trader.object import BarData
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
-class IronCondorStrategy(CtaTemplate):
+class IronCondorStrategy(BaseOptionStrategy):
     author = "Apollo"
+    version = "v2.6.0"
+
+    delta_short_call = 0.15
+    delta_short_put = -0.15
+    wing_width_pct = 0.10      # 保护腿宽度（行权价偏离百分比）
+    min_days_to_expiry = 21    # 铁鹰式通常需要更长到期
+    max_days_to_expiry = 45
+    min_credit_ratio = 0.40    # 净权利金/最大风险
+    rolling_days = 10
+    max_positions = 2
 
     parameters = [
-        "delta_short_call",    # 卖出Call Delta目标 0.15-0.20
-        "delta_short_put",     # 卖出Put Delta目标 -0.15~-0.20
-        "wing_width",          # 保护腿宽度（百分比，如0.08表示8%）
-        "min_days_to_expiry",
-        "max_days_to_expiry",
-        "min_credit_ratio",    # 最小权利金收入/最大亏损比例
-        "rolling_days",
-        "max_positions"
+        "delta_short_call", "delta_short_put", "wing_width_pct",
+        "min_days_to_expiry", "max_days_to_expiry", "min_credit_ratio",
+        "rolling_days", "max_positions",
     ]
-
-    variables = [
-        "pos", "short_call", "short_put", "long_call", "long_put",
-        "expiry_date", "net_credit", "max_loss", "max_profit", "pnl",
-        "upper_breakeven", "lower_breakeven"
-    ]
-
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
-        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.short_call = None
-        self.short_put = None
-        self.long_call = None
-        self.long_put = None
-        self.expiry_date = None
-        self.net_credit = 0.0
-        self.max_loss = 0.0
-        self.max_profit = 0.0
-        self.pnl = 0.0
-        self.upper_breakeven = 0.0
-        self.lower_breakeven = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
-
-    def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log("IronCondor策略初始化完成")
-
-    def on_start(self):
-        self.write_log("IronCondor策略启动")
-
-    def on_stop(self):
-        self.write_log("IronCondor策略停止")
-
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
+    variables = ["net_premium", "max_loss", "max_profit", "pnl", "legs"]
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
-            return
+        if self._manage_expiry(bar): return
+        if self.legs and len(self.legs) >= 4:
+            for leg in self.legs.values():
+                if leg.get("days_to_expiry",999) <= self.rolling_days:
+                    self._roll_positions(); return
+        if len(self.legs) < 4:
+            self._find_condor(bar)
 
-        if self.short_call is None and self.short_put is None:
-            self._find_opportunity(bar)
-        else:
-            self._manage_position(bar)
+    def _find_condor(self, bar: BarData):
+        """寻找Iron Condor组合（4条腿）"""
+        code = self._to_futu_code()
+        chain = self._query_option_chain(code)
+        if not chain: return
+        calls = [c for c in chain if c.get("is_call", True)]
+        puts = [c for c in chain if c.get("is_put", True)]
+        # 简化：选Delta最接近目标的腿
+        sc = self._find_nearest_delta(calls, self.delta_short_call, "call")
+        sp = self._find_nearest_delta(puts, self.delta_short_put, "put")
+        if not sc or not sp: return
+        # 保护腿
+        wing_call = self._find_wing(sc, calls, "call", self.wing_width_pct)
+        wing_put = self._find_wing(sp, puts, "put", self.wing_width_pct)
+        if not wing_call or not wing_put: return
+        # 计算净权利金
+        net = sc.get("premium",0) + sp.get("premium",0) \
+              - wing_call.get("premium",0) - wing_put.get("premium",0)
+        if net <= 0: return
+        # 开仓4条腿
+        sc["name"]="ic_sc"; sc["is_long"]=False
+        sp["name"]="ic_sp"; sp["is_long"]=False
+        wing_call["name"]="ic_wc"; wing_call["is_long"]=True
+        wing_put["name"]="ic_wp"; wing_put["is_long"]=True
+        for leg in [sc, sp, wing_call, wing_put]:
+            self._send_option_order(leg,
+                Direction.SHORT if not leg["is_long"] else Direction.LONG,
+                Offset.OPEN)
+        self.net_premium = net
+        # 最大风险 = 翼宽 - 净权利金
+        wing_width = min(
+            abs(sc["strike_price"]-wing_call["strike_price"]),
+            abs(sp["strike_price"]-wing_put["strike_price"]))
+        self.max_loss = wing_width - net
+        self.max_profit = net
+        self.write_log(f"[IronCondor] ✅ 开仓 net_premium={net:.1f} max_loss={self.max_loss:.1f}")
 
-    def _find_opportunity(self, bar: BarData):
-        """寻找铁鹰式机会：预期震荡时建立"""
-        if len(self.am.close) < 20:
-            return
-        rsi = self.am.rsi(14)
-        atr = self.am.atr(14)
-        mid = bar.close_price
+    def _find_nearest_delta(self, chain, target_delta, opt_type):
+        best = None; best_diff = 999
+        for c in chain:
+            d = abs(abs(c.get("delta",0))-abs(target_delta))
+            if d < best_diff: best_diff=d; best=c
+        return best
 
-        # 条件：RSI中性，波动率适中
-        if 35 < rsi < 62:
-            # 计算行权价
-            wing = mid * self.wing_width
-            sc_strike = mid + wing * 0.5   # 卖出Call行权价（虚值）
-            sp_strike = mid - wing * 0.5   # 卖出Put行权价（虚值）
-            lc_strike = mid + wing * 1.5   # 买入Call保护（更虚值）
-            lp_strike = mid - wing * 1.5   # 买入Put保护（更虚值）
+    def _find_wing(self, anchor, chain, opt_type, width_pct):
+        """找保护腿：比anchor更OTM"""
+        anchor_strike = anchor.get("strike_price",0)
+        best = None; best_diff = 999
+        for c in chain:
+            if c.get("code") == anchor.get("code"): continue
+            if opt_type == "call":
+                if c.get("strike_price",0) <= anchor_strike: continue
+                diff = abs(c["strike_price"]-anchor_strike-anchor_strike*width_pct)
+            else:
+                if c.get("strike_price",0) >= anchor_strike: continue
+                diff = abs(anchor_strike-c["strike_price"]-anchor_strike*width_pct)
+            if diff < best_diff: best_diff=diff; best=c
+        return best
 
-            self.short_call = {"strike": round(sc_strike, 2), "type": "call"}
-            self.short_put = {"strike": round(sp_strike, 2), "type": "put"}
-            self.long_call = {"strike": round(lc_strike, 2), "type": "call"}
-            self.long_put = {"strike": round(lp_strike, 2), "type": "put"}
-
-            # 模拟净权利金收入
-            self.net_credit = bar.close_price * 0.015
-            self.max_loss = (lc_strike - sc_strike) * 100 - self.net_credit
-            self.max_profit = self.net_credit
-            self.upper_breakeven = sc_strike + self.net_credit / 100
-            self.lower_breakeven = sp_strike - self.net_credit / 100
-            self.pos = 1
-
-            self.write_log(
-                f"IronCondor开仓: SC@{sc_strike:.2f} SP@{sp_strike:.2f} "
-                f"LC@{lc_strike:.2f} LP@{lp_strike:.2f} "
-                f"盈亏区间[{self.lower_breakeven:.2f}, {self.upper_breakeven:.2f}]"
-            )
-
-    def _manage_position(self, bar: BarData):
-        """管理持仓：价格突破盈亏平衡点时调整或平仓"""
-        if bar.close_price >= self.upper_breakeven or bar.close_price <= self.lower_breakeven:
-            # 平仓所有腿
-            self.sell(bar.close_price, abs(self.pos))
-            self.short_call = None
-            self.short_put = None
-            self.long_call = None
-            self.long_put = None
-            self.pos = 0
-            self.write_log(f"IronCondor平仓: 价格突破盈亏平衡点")
+    def _to_futu_code(self) -> str:
+        if ".SMART" in self.vt_symbol: return f"US.{self.vt_symbol.split('.')[0]}"
+        if ".SEHK" in self.vt_symbol: return f"HK.{self.vt_symbol.split('.')[0]}"
+        return self.vt_symbol

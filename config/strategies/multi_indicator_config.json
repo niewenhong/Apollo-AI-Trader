@@ -1,0 +1,63 @@
+{
+    "_comment": "ApolloMultiIndicatorStrategy 全参数配置（热加载：改此文件无需重启）",
+
+    "ema_fast_period": 20,
+    "ema_slow_period": 60,
+
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal_period": 9,
+
+    "rsi_period": 6,
+    "rsi_oversold": 25,
+    "rsi_overbought": 78,
+
+    "kdj_n": 9,
+    "kdj_m": 3,
+    "kdj_s": 3,
+    "kdj_oversold": 20,
+    "kdj_overbought": 80,
+
+    "atr_period": 14,
+    "keltner_mult": 2.0,
+    "boll_period": 20,
+    "boll_mult": 2.0,
+
+    "vwap_deviation_entry": 0.003,
+    "vwap_deviation_exit": 0.0015,
+
+    "vol_ma_period": 20,
+    "rvol_threshold": 1.5,
+
+    "imbalance_threshold_long": 0.62,
+    "imbalance_threshold_short": 0.38,
+
+    "ai_score": 0.70,
+    "backtest_win_loss_ratio": 1.8,
+    "sentiment_index": 0.50,
+    "kelly_capital_hk": 810000.0,
+    "kelly_capital_us": 50000.0,
+    "kelly_max_fraction": 0.08,
+
+    "atr_stop_mult": 1.5,
+    "stop_loss_pct": 0.008,
+
+    "profit_activation_pct": 0.020,
+    "profit_rollback_pct": 0.005,
+
+    "enable_time_filter": true,
+    "avoid_open_minutes": 30,
+
+    "_scoring": {
+        "comment": "共振评分：满分 11，门槛 ≥ 6 才开仓",
+        "ema_bullish": 2,
+        "keltner_above": 1,
+        "macd_hist_up": 2,
+        "macd_golden_cross": 2,
+        "rsi_oversold": 2,
+        "kdj_golden_cross": 1,
+        "rvol_confirm": 1,
+        "imbalance_confirm": 2,
+        "vwap_near": 1
+    }
+}

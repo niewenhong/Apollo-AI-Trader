@@ -1,0 +1,9 @@
+{
+  "grid_upper": 5.0,
+  "grid_lower": -5.0,
+  "grid_step": 0.5,
+  "grid_size": 1,
+  "price_offset": 0.001,
+  "debug_mode": false,
+  "dry_run": false
+}

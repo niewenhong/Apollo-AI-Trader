@@ -1,0 +1,10 @@
+{
+  "threshold_long": -1.5,
+  "threshold_short": 1.0,
+  "exit_band": 0.3,
+  "vol_rank_limit": 0.8,
+  "fixed_size": 1,
+  "price_offset": 0.003,
+  "debug_mode": false,
+  "dry_run": false
+}

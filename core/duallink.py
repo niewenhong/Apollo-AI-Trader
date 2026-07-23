@@ -1,67 +1,79 @@
 """
-duallink.py — Apollo-AI-Tra-der v2.5.0-DEBUG
-双链路调度器（最小可用版）
-仅做链路存活检查 + 定时 query，不做订单操作
+core/duallink.py - Apollo-AI-Trader v2.6.0
+DualLink 双链路调度器：US/HK 市场切换 + 交易时段管理
 """
-import time
 import logging
-from threading import Thread
+import time
+import threading
+from datetime import datetime, time as dtime
+from typing import Dict
 
 logger = logging.getLogger("DualLink")
 
 
 class DualLink:
-    """双链路调度器 — 链路存活检查 + 定时 query"""
+    """双市场链路调度器"""
 
-    def __init__(self, main_engine, gateways: dict, remote_controller=None):
-        self.main_engine = main_engine
-        self.gateways = gateways  # {"US": gw_us, "HK": gw_hk}
-        self.rc = remote_controller
-        self._running = False
+    def __init__(self, main_engines: dict, gateways: dict, rc=None):
+        self.engines = main_engines  # {"US": main_us, "HK": main_hk}
+        self.gateways = gateways
+        self.rc = rc
+        self._stop = False
         self._thread = None
-        self.interval = 30  # 秒
-        self.review_count = 0
+        self.current_market = None
+        self.extended_hours = False
 
     def start(self):
-        self._running = True
-        self._thread = Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info(f"[DualLink] 双链路调度器已启动 | interval={self.interval}s")
+        logger.info("[DualLink] 启动")
 
     def stop(self):
-        self._running = False
-        logger.info("[DualLink] 双链路调度器已停止")
+        self._stop = True
 
     def _run(self):
-        while self._running:
+        while not self._stop:
             try:
-                self._review()
+                self._check_and_switch()
+                time.sleep(30)  # 30秒检查一次
             except Exception as e:
-                logger.warning(f"[DualLink] REVIEW 异常: {e}")
-            for _ in range(self.interval):
-                if not self._running:
-                    break
-                time.sleep(1)
+                logger.error(f"[DualLink] {e}")
+                time.sleep(60)
 
-    def _review(self):
-        """链路健康检查 — 只读，不操作订单"""
-        self.review_count += 1
-        for tag, gw in self.gateways.items():
-            ctx = getattr(gw, 'trade_ctx', None)
-            quote_ctx = getattr(gw, 'quote_ctx', None)
-            trade_alive = ctx is not None
-            quote_alive = quote_ctx is not None
+    def _check_and_switch(self):
+        now = datetime.now()
+        weekday = now.weekday()  # 0=Mon
+        if weekday >= 5:
+            self._switch_to("CLOSED")
+            return
+        # 港股交易时段（HKT = UTC+8）
+        hk_open = dtime(9,30); hk_close = dtime(16,0)
+        # 美股交易时段（EST = UTC-5, 夏令时UTC-4）
+        # 简化：用本地时间估算
+        us_open = dtime(21,30); us_close = dtime(4,0)  # 近似
+        current = now.time()
+        if hk_open <= current <= hk_close:
+            self._switch_to("HK")
+        elif current >= us_open or current <= us_close:
+            self._switch_to("US")
+        else:
+            # 盘前盘后
+            self._switch_to("EXTENDED")
 
-            try:
-                gw.query_account()
-            except Exception as e:
-                logger.warning(f"[DualLink] {tag} query_account 失败: {e}")
-
-            logger.info(f"[DualLink] 🔍 {tag} REVIEW #{self.review_count} | "
-                        f"trade={'✅' if trade_alive else '❌'} | "
-                        f"quote={'✅' if quote_alive else '❌'}")
-
-            if not trade_alive or not quote_alive:
-                logger.warning(f"[DualLink] ⚠️ {tag} 链路异常，需重连")
-                # TODO: 重连逻辑
-                # gw.connect(...)
+    def _switch_to(self, market: str):
+        if self.current_market == market: return
+        logger.info(f"[DualLink] 切换: {self.current_market} → {market}")
+        self.current_market = market
+        # 通知RC
+        if self.rc and hasattr(self.rc, '_on_market_switch'):
+            self.rc._on_market_switch(market)
+        # 可以在此暂停/恢复对应市场策略
+        if market == "HK":
+            # 激活HK策略
+            pass
+        elif market == "US":
+            pass
+        elif market == "EXTENDED":
+            self.extended_hours = True
+        elif market == "CLOSED":
+            self.extended_hours = False

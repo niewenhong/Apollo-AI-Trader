@@ -1,0 +1,10 @@
+{
+  "target_delta": 0.3,
+  "days_to_expiry_min": 30,
+  "days_to_expiry_max": 45,
+  "min_premium_yield_pct": 1.5,
+  "max_strike_distance_pct": 10.0,
+  "allocation_pct": 5.0,
+  "debug_mode": false,
+  "dry_run": false
+}

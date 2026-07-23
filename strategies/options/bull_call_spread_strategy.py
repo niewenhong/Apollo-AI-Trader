@@ -1,99 +1,79 @@
 """
-strategies/options/bull_call_spread_strategy.py - v2.6.0
-牛市看涨价差：买入低行权价Call + 卖出高行权价Call，风险有限收益有限
-实盘级别：支持价差构建、止盈止损、展期
+strategies/options/bull_call_spread_strategy.py - Apollo-AI-Trader v2.6.0
+Bull Call Spread：买低行权价Call + 卖高行权价Call
+温和看涨，风险有限（最大亏损=净权利金），收益有限
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-import numpy as np
+from vnpy.trader.object import BarData
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
-class BullCallSpreadStrategy(CtaTemplate):
+class BullCallSpreadStrategy(BaseOptionStrategy):
     author = "Apollo"
+    version = "v2.6.0"
+
+    delta_long = 0.35           # 买入腿Delta
+    delta_short = 0.15          # 卖出腿Delta
+    min_days_to_expiry = 14
+    max_days_to_expiry = 45
+    min_credit_ratio = 0.30     # 卖出腿权利金/买入腿权利金最低比
+    rolling_days = 7            # 剩余天数<此值时展期
+    max_positions = 3
 
     parameters = [
-        "delta_long",           # 买入腿Delta目标（0.30-0.40）
-        "delta_short",          # 卖出腿Delta目标（0.15-0.20）
-        "min_days_to_expiry",   # 最短到期天数
-        "max_days_to_expiry",   # 最长到期天数
-        "min_credit_ratio",     # 最小权利金收入/最大亏损比例
-        "rolling_days",         # 展期提前天数
-        "max_positions",        # 最大同时持仓数
+        "delta_long", "delta_short", "min_days_to_expiry",
+        "max_days_to_expiry", "min_credit_ratio", "rolling_days",
+        "max_positions",
     ]
-
-    variables = [
-        "pos", "long_call", "short_call", "expiry_date",
-        "net_premium", "max_loss", "max_profit", "pnl"
-    ]
-
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
-        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.long_call = None
-        self.short_call = None
-        self.expiry_date = None
-        self.net_premium = 0.0
-        self.max_loss = 0.0
-        self.max_profit = 0.0
-        self.pnl = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
-
-    def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log("BullCallSpread策略初始化完成")
-
-    def on_start(self):
-        self.write_log("BullCallSpread策略启动")
-
-    def on_stop(self):
-        self.write_log("BullCallSpread策略停止")
-
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
+    variables = ["net_premium", "max_loss", "max_profit", "pnl", "legs"]
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
-            return
+        if self._manage_expiry(bar): return
+        # 展期
+        if self.legs and len(self.legs) >= 2:
+            for leg in self.legs.values():
+                days = leg.get("days_to_expiry", 999)
+                if days <= self.rolling_days:
+                    self.write_log("[BCS] 临近到期，展期")
+                    self._roll_positions(); return
+        # 开仓
+        if len(self.legs) < 2:
+            self._find_spread(bar)
 
-        if self.long_call is None and self.short_call is None:
-            self._find_spread_opportunity(bar)
-        else:
-            self._manage_position(bar)
+    def _find_spread(self, bar: BarData):
+        """寻找Bull Call Spread组合"""
+        code = self._to_futu_code()
+        chain = self._query_option_chain(code)
+        if not chain: return
+        # 分离Call
+        calls = [c for c in chain if c.get("is_call", True)]
+        if len(calls) < 2: return
+        # 按Delta筛选
+        long_candidates = [c for c in calls if abs(c.get("delta",0)-self.delta_long)<=0.1]
+        short_candidates = [c for c in calls if abs(c.get("delta",0)-self.delta_short)<=0.1]
+        if not long_candidates or not short_candidates: return
+        # 选最优组合
+        best = None
+        for lc in long_candidates:
+            for sc in short_candidates:
+                if sc.get("strike_price",0) <= lc.get("strike_price",0): continue
+                net = lc.get("premium",0) - sc.get("premium",0)
+                ratio = sc.get("premium",0) / (lc.get("premium",0)+1e-6)
+                if ratio >= self.min_credit_ratio:
+                    spread_width = sc["strike_price"] - lc["strike_price"]
+                    if best is None or net < best[2]:  # 选净成本最低的
+                        best = (lc, sc, net, spread_width)
+        if best:
+            long_leg, short_leg, net, width = best
+            long_leg["name"] = "bcs_long"; long_leg["is_long"] = True
+            short_leg["name"] = "bcs_short"; short_leg["is_long"] = False
+            ok = self._open_spread(long_leg, short_leg)
+            if ok:
+                self.max_loss = net
+                self.max_profit = width - net
+                self.write_log(f"[BCS] ✅ 开仓 long@{long_leg['strike_price']} "
+                              f"short@{short_leg['strike_price']} net={net:.1f}")
 
-    def _find_spread_opportunity(self, bar: BarData):
-        """寻找牛市价差机会：温和看涨时建立"""
-        if len(self.am.close) < 20:
-            return
-        ma5 = np.mean(self.am.close[-5:])
-        ma20 = np.mean(self.am.close[-20:])
-        rsi = self.am.rsi(14)
-
-        # 条件：均线多头，RSI中性偏强
-        if ma5 > ma20 and 40 < rsi < 68:
-            # 构建价差：买入ATM Call，卖出OTM Call
-            long_strike = bar.close_price * 0.98  # 略低于现价
-            short_strike = bar.close_price * 1.05  # 虚值5%
-            self.long_call = {"strike": round(long_strike, 2), "type": "call"}
-            self.short_call = {"strike": round(short_strike, 2), "type": "call"}
-            self.net_premium = bar.close_price * 0.02  # 模拟净权利金支出
-            self.max_loss = self.net_premium
-            self.max_profit = (short_strike - long_strike) * 100 - self.net_premium
-            self.pos = 1
-            self.write_log(f"BullCallSpread开仓: Long@{self.long_call['strike']} Short@{self.short_call['strike']}")
-
-    def _manage_position(self, bar: BarData):
-        """管理持仓：止盈止损、展期"""
-        # 模拟盈亏
-        underlying_pct = (bar.close_price - self.am.close[-20]) / self.am.close[-20]
-        self.pnl = self.net_premium * underlying_pct * 10  # 粗略估算
-
-        # 如果价格接近卖出腿，考虑平仓
-        if bar.close_price >= self.short_call["strike"] * 0.97:
-            self.sell(bar.close_price, abs(self.pos))
-            self.long_call = None
-            self.short_call = None
-            self.pos = 0
-            self.write_log(f"BullCallSpread平仓: 接近卖出腿行权价")
+    def _to_futu_code(self) -> str:
+        if ".SMART" in self.vt_symbol: return f"US.{self.vt_symbol.split('.')[0]}"
+        if ".SEHK" in self.vt_symbol: return f"HK.{self.vt_symbol.split('.')[0]}"
+        return self.vt_symbol
