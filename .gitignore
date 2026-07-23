@@ -50,3 +50,8 @@ dist/
 
 # 第三方库源码（应通过 pip 安装）
 vnpy_futu/
+# BFG 工具
+bfg.jar
+
+# 机器注册信息
+config/machine_registry.json
