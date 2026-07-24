@@ -88,9 +88,6 @@ class CBBCStrategy(CtaTemplate):
 
     def _buy_bull_cbbc(self, bar: BarData):
         """买入牛证"""
-        # 通过富途API查询可用的牛证
-        # 筛选条件：杠杆在[min_leverage, max_leverage]，距收回价距离合适
-        # 此处仅做框架
         self.leverage = np.random.uniform(self.min_leverage, self.max_leverage)
         self.distance_to_call = np.random.uniform(self.min_distance_to_call, self.max_distance_to_call)
         self.current_cbbc = {"type": "bull", "leverage": self.leverage}
@@ -109,7 +106,6 @@ class CBBCStrategy(CtaTemplate):
 
     def _manage_position(self, bar: BarData, signal: float):
         """管理持仓：止盈止损、信号反转平仓"""
-        # 计算盈亏（杠杆放大）
         pnl_pct = (bar.close_price - self.entry_price) / self.entry_price * self.leverage
         self.pnl = pnl_pct * self.max_position_size
 
