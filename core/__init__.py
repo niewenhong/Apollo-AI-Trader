@@ -1,1 +1,1 @@
-"""core 包初始化"""
+"""core package — Apollo AI Trader v2.7.0"""

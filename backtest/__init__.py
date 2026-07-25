@@ -1,1 +1,1 @@
-"""backtest 包初始化"""
+"""backtest package — Apollo AI Trader v2.7.0"""

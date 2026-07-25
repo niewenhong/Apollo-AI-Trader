@@ -1,143 +1,141 @@
-#!/usr/bin/env python3
-import sys, json, time
-from pathlib import Path
+"""
+main.py — Apollo AI Trader v2.7.0 入口
+集成: SubscriptionManager + MarketDataBus + MultiPeriodDB + StrategyMatcher
+"""
+
+import time
+import json
+import logging
+import threading
 from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).parent))
+# ===== 日志 =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[
+        logging.FileHandler("logs/main.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("Main")
 
+# ===== 导入 =====
+from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
-from vnpy.trader.setting import SETTINGS
+from vnpy.trader.object import Interval
+
+from core.subscription_manager import SubscriptionManager
+from core.multi_period_db import MultiPeriodDB
+from core.market_data_bus import MarketDataBus
+from core.strategy_matcher import StrategyMatcher
 from vnpy_futu import FutuGateway
-from vnpy_ctastrategy import CtaStrategyApp
-from vnpy_ctabacktester import CtaBacktesterApp
 
-SETTINGS["log.level"] = "DEBUG"
-SETTINGS["datafeed.name"] = "local"
+# ===== 加载配置 =====
+try:
+    with open("config/system_config.json", "r", encoding="utf-8") as f:
+        CONFIG = json.load(f)
+except FileNotFoundError:
+    logger.warning("config/system_config.json 不存在，使用空配置")
+    CONFIG = {}
 
-from core.db_manager import CustomDBManager
-from core.strategy_engine import StrategyEngine
-from core.decision_engine import DecisionEngine
-from ai.stock_selector import AIStockSelector           # 正确导入
-from ai.stock_diagnosis import StockDiagnosis
-from ai.param_advisor import ParamAdvisor
-from ai.report_generator import ReportGenerator
-from ai.llm_client import LLMClient
-from monitoring.telegram_notifier import TelegramNotifier
-from monitoring.telegram_webhook import TelegramCommandListener  # 匹配类名
-from monitoring.webhook_server import WebhookServer
-from remote.remote_controller import RemoteController
-from backtest.optimizer import ParameterOptimizer
+# ===== 初始化引擎 =====
+event_engine = EventEngine()
+main_engine = MainEngine(event_engine)
+main_engine.add_gateway(FutuGateway)
+logger.info("✅ MainEngine + EventEngine 初始化完成")
 
+# ===== 数据库 =====
+db = MultiPeriodDB("data/history.db")
 
-def get_quote_ctx(main_engine, retries=10, delay=1):
-    for _ in range(retries):
-        gateway = main_engine.get_gateway("FUTU")
-        if gateway and getattr(gateway, "quote_ctx", None):
-            return gateway.quote_ctx
-        time.sleep(delay)
-    print("[Main] 警告：无法获取 quote_ctx，AI选股降级运行")
-    return None
+# ===== 行情总线 =====
+market_bus = MarketDataBus(db=db, gate_threshold=3.0)
 
+# ===== 订阅管理器 =====
+# 注意：main_engine 单实例，US/HK 通过 symbol 前缀路由
+sub_manager = SubscriptionManager(
+    main_us=main_engine,
+    main_hk=main_engine,
+    max_quota=300,
+)
+sub_manager.db = db
+market_bus.strategy_engine = sub_manager  # 复用引用
 
-def main():
-    print("=" * 48)
-    print("  Apollo AI Trader v2.6.0 启动中...")
-    print("=" * 48)
+# ===== 策略匹配器 =====
+matcher = StrategyMatcher(db=db)
 
-    config_path = Path("config/system_config.json")
+# ===== 连接网关 =====
+futu_cfg = CONFIG.get("futu", {})
+us_setting = futu_cfg.get("US", {})
+hk_setting = futu_cfg.get("HK", {})
+
+try:
+    main_engine.connect(us_setting, "FUTU")
+    logger.info("✅ FUTU 网关连接（US配置）")
+except Exception as e:
+    logger.error(f"US连接失败: {e}")
+
+# 注册K线回调（需在connect之后）
+try:
+    from vnpy_futu.multi_period_kline_handler import MultiPeriodKlineHandler
+    gateway = main_engine.get_gateway("FUTU")
+    if gateway:
+        handler = MultiPeriodKlineHandler(gateway, market_bus=market_bus)
+        gateway.quote_ctx.set_handler(handler)
+        logger.info("✅ MultiPeriodKlineHandler 已注册")
+except Exception as e:
+    logger.error(f"K线Handler注册失败: {e}")
+
+# 行情总线挂载到事件引擎
+market_bus.attach_to_engine(event_engine)
+
+# ===== AI选股 → 全套订阅 → 策略匹配 =====
+def run_selector_and_subscribe():
     try:
-        with open(config_path) as f:
-            cfg = json.load(f)
-    except Exception:
-        cfg = {}
-
-    opend_host = cfg.get("opend_host", "127.0.0.1")
-    opend_port = cfg.get("opend_port", 11111)
-    account = cfg.get("futu_account", "")
-    password = cfg.get("futu_password", "")
-    env = cfg.get("trade_env", "SIMULATE")
-
-    us_setting = {"地址": opend_host, "端口": opend_port, "市场": "US",
-                  "证券账号": account, "密码": password, "环境": env}
-    hk_setting = {"地址": opend_host, "端口": opend_port, "市场": "HK",
-                  "证券账号": account, "密码": password, "环境": env}
-
-    print("[Main] 启动美股引擎...")
-    main_us = MainEngine()
-    main_us.add_gateway(FutuGateway)
-    main_us.add_app(CtaStrategyApp)
-    main_us.add_app(CtaBacktesterApp)
-    main_us.connect(us_setting, "FUTU")
-
-    print("[Main] 启动港股引擎...")
-    main_hk = MainEngine()
-    main_hk.add_gateway(FutuGateway)
-    main_hk.add_app(CtaStrategyApp)
-    main_hk.add_app(CtaBacktesterApp)
-    main_hk.connect(hk_setting, "FUTU")
-
-    time.sleep(3)
-
-    db = CustomDBManager()
-    quote_ctx = get_quote_ctx(main_us)
-    llm = LLMClient(api_key=cfg.get("llm_api_key", ""))
-    selector = AIStockSelector(quote_ctx, db, top_n=cfg.get("ai_top_n", 25), market="US")
-    diagnoser = StockDiagnosis(quote_ctx, db)
-    advisor = ParamAdvisor(db, llm)
-    reporter = ReportGenerator(db)
-    optimizer = ParameterOptimizer(db, n_jobs=cfg.get("optimizer_jobs", 4))
-    decision_engine = DecisionEngine(db, llm)
-
-    print("[Main] 执行AI选股...")
-    try:
+        from ai.stock_selector import AIStockSelector
+        selector = AIStockSelector(CONFIG)
         selected = selector.select()
-        print(f"[Main] 选股完成: {len(selected)} 只")
+        logger.info(f"📋 选股结果: {selected}")
+
+        for sym in selected:
+            sub_manager.subscribe_all(sym)
+
+        for sym in selected:
+            sub_manager.get_daily_bars(sym, "2024-01-01",
+                                       datetime.now().strftime("%Y-%m-%d"))
+
+        matched = matcher.match(selected)
+        for combo in matched:
+            logger.info(f"🎯 {combo['symbol']} → {combo['strategy']} "
+                        f"params={combo['params']} score={combo['score']}")
+        return matched
     except Exception as e:
-        print(f"[Main] 选股失败: {e}")
+        logger.error(f"选股流程异常: {e}")
+        return []
 
-    strategy_engine = StrategyEngine(main_us, main_hk, db)
-    strategy_engine.start_all()
+matched = run_selector_and_subscribe()
 
-    # ── Telegram 初始化 ──
-    tg_token = cfg.get("telegram_token", "")
-    tg_chat_id = cfg.get("telegram_chat_id", "")
-    proxy = cfg.get("proxy", "")
+# ===== 定时任务 =====
+def periodic_task():
+    while True:
+        time.sleep(300)
+        sub_manager.process_unsub_queue()
+        sub_manager.audit_quota()
 
-    notifier = TelegramNotifier(tg_token, tg_chat_id, proxy if proxy else None)
-    remote_controller = RemoteController(db, strategy_engine, notifier)
+t = threading.Thread(target=periodic_task, daemon=True)
+t.start()
+logger.info("⏰ 定时任务已启动（5分钟/次）")
 
-    # 发送启动通知
-    notifier.send_message("Apollo AI Trader v2.6.0 已启动")
+# ===== 主循环 =====
+logger.info("🚀 Apollo AI Trader v2.7.0 启动完成")
+sub_manager.audit_quota()
 
-    # 启动 Telegram 命令轮询
-    if tg_token and tg_chat_id:
-        listener = TelegramCommandListener(tg_token, tg_chat_id, remote_controller)
-        listener.start()
-    else:
-        print("[Main] 警告：Telegram token/chat_id 未配置，跳过命令轮询")
-
-    # 启动 Webhook 服务器
-    webhook = WebhookServer(host="0.0.0.0", port=cfg.get("webhook_port", 8899))
-    webhook.register_handler(lambda data: {"status": "ok", "time": datetime.now().isoformat()})
-    webhook.start()
-
-    print("[Main] 系统启动完成，进入主循环...")
-
-    try:
-        while True:
-            time.sleep(10)
-    except KeyboardInterrupt:
-        print("[Main] 收到退出信号，关闭引擎...")
-        strategy_engine.stop_all()
-        main_us.close()
-        main_hk.close()
-        try:
-            db.close()
-        except AttributeError:
-            pass
-        webhook.stop()
-        print("[Main] 系统已安全关闭")
-
-
-if __name__ == "__main__":
-    main()
+try:
+    while True:
+        time.sleep(60)
+except KeyboardInterrupt:
+    logger.info("👋 正在关闭...")
+    sub_manager.process_unsub_queue()
+    sub_manager.audit_quota()
+    event_engine.stop()
+    logger.info("✅ 已安全关闭")
