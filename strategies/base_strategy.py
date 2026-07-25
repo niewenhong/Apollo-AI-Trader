@@ -1,193 +1,140 @@
-# -*- coding: utf-8 -*-
 """
-策略基类（组合模式，内部持有 vnpy adapter）
-支持：回测/实盘切换、调试开关、热配置、交易时段判断、风控前置、撤单
+strategies/base_strategy.py - v2.6.0
+策略基类：所有策略继承自此基类
+提供通用功能：数据库参数加载、日志统一格式、PnL计算、风险检查
 """
+from vnpy_ctastrategy import CtaTemplate
+from vnpy.trader.object import BarData, TickData, TradeData
+from vnpy.trader.constant import Direction, Offset
+from abc import abstractmethod
 import json
-import os
-import logging
-from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
 from datetime import datetime
 
-from vnpy.trader.constant import Direction, Offset, OrderType, Status
-from vnpy.trader.object import TickData, BarData, OrderData, TradeData
-from vnpy.trader.utility import extract_vt_symbol
 
-from core.config_loader import ConfigLoader
-from core.risk_manager import RiskManager
-from utils.trading_hours import is_trading_hour
-from utils.logger import get_logger
-from utils.shelly import round_to_lot
-
-logger = get_logger("strategies.base")
-
-
-class BaseStrategy(ABC):
-    """策略基类，所有策略必须继承此类"""
+class ApolloBaseStrategy(CtaTemplate):
+    """Apollo策略基类，所有策略继承此类"""
 
     author = "Apollo"
-    version = "2.2.0"
-    strategy_name = ""  # 子类必须设置，与 config/strategies/ 下 json 对应
 
-    # 默认参数（子类覆盖）
-    fixed_size = 1
-    price_offset = 0.003
-    debug_mode = False
-    dry_run = False
-    backtest_mode = False
+    # 基类参数（所有策略共用）
+    parameters = [
+        "enable_db_params",   # 是否启用数据库参数加载
+        "risk_check_level",   # 风险检查级别: strict/normal/loose
+        "max_daily_loss",     # 每日最大亏损限额
+        "max_position_ratio", # 最大仓位比例（相对于账户权益）
+    ]
 
-    def __init__(self, vnpy_adapter, settings: dict = None):
-        self._adapter = vnpy_adapter
-        self.vt_symbol = getattr(vnpy_adapter, "vt_symbol", "")
-        if self.vt_symbol:
-            self.symbol, self.exchange = extract_vt_symbol(self.vt_symbol)
-        else:
-            self.symbol, self.exchange = "", ""
+    variables = [
+        "pos", "pnl", "daily_pnl", "total_trades",
+        "today_loss", "account_value"
+    ]
 
-        # 风控
-        self.risk_manager = RiskManager()
-
-        # 持仓
+    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
         self.pos = 0
-        self.target_pos = 0
+        self.pnl = 0.0
+        self.daily_pnl = 0.0
+        self.total_trades = 0
+        self.today_loss = 0.0
+        self.account_value = 1000000.0  # 初始模拟权益
 
-        # 热配置
-        self._config_loader = ConfigLoader()
-        self._load_config()
+        # 加载数据库参数（如果启用）
+        if self.enable_db_params:
+            self._load_params_from_db()
 
-        # 交易时段
-        self._in_trading_hour = False
-
-        # 订单管理
-        self.active_orders: Dict[str, OrderData] = {}
-
-        # 应用外部参数
-        if settings:
-            for k, v in settings.items():
-                setattr(self, k, v)
-
-        # 子类初始化
-        self.on_init()
-
-    def _load_config(self):
-        """从 config/strategies/{strategy_name}_config.json 加载"""
-        if not self.strategy_name:
-            return
-        data = self._config_loader.load(self.strategy_name)
-        for k, v in data.items():
-            setattr(self, k, v)
-        if data:
-            logger.info(f"[{self.strategy_name}] 配置已加载")
-
-    # ========== 子类必须实现 ==========
-    @abstractmethod
-    def on_init(self):
-        """策略初始化"""
-        pass
-
-    @abstractmethod
-    def calculate_signals(self, data) -> str:
-        """
-        根据 Tick 或 Bar 计算信号
-        :return: "long" / "short" / "flat" / "hold"
-        """
-        pass
-
-    @abstractmethod
-    def get_target_position(self) -> int:
-        """返回目标持仓（正数多/负数空/0平）"""
-        pass
-
-    # ========== 生命周期 ==========
-    def on_start(self):
-        self._load_config()
-        logger.info(f"[{self.strategy_name}] 策略启动")
-
-    def on_stop(self):
-        self.cancel_all_orders()
-        logger.info(f"[{self.strategy_name}] 策略停止")
-
-    # ========== 行情回调 ==========
-    def on_tick(self, tick: TickData):
-        if not self._check_trading_hour(tick.datetime):
-            return
-        signal = self.calculate_signals(tick)
-        self.target_pos = self.get_target_position()
-        if self.debug_mode:
-            logger.debug(f"[{self.strategy_name}] tick={tick.last_price} sig={signal} target={self.target_pos}")
-        if not self.risk_manager.check(self.symbol, tick.last_price, self.pos, self.target_pos, 100000.0):
-            return
-        self._execute(signal)
-
-    def on_bar(self, bar: BarData):
-        if not self._check_trading_hour(bar.datetime):
-            return
-        signal = self.calculate_signals(bar)
-        self.target_pos = self.get_target_position()
-        if self.debug_mode:
-            logger.info(f"[{self.strategy_name}] bar={bar.close_price} sig={signal} target={self.target_pos}")
-        if not self.risk_manager.check(self.symbol, bar.close_price, self.pos, self.target_pos, 100000.0):
-            return
-        self._execute(signal)
-
-    def on_order(self, order: OrderData):
-        self.active_orders[order.orderid] = order
-        if order.status in (Status.ALLTRADED, Status.CANCELLED, Status.REJECTED):
-            self.active_orders.pop(order.orderid, None)
-        logger.info(f"[{self.strategy_name}] 订单: {order.orderid} status={order.status.value}")
-
-    def on_trade(self, trade: TradeData):
-        self.pos += trade.volume if trade.direction == Direction.LONG else -trade.volume
-        logger.info(f"[{self.strategy_name}] 成交: {trade.direction.value} {trade.volume}手 @ {trade.price:.2f}")
-
-    # ========== 交易执行 ==========
-    def _execute(self, signal: str):
-        if self.dry_run:
-            logger.info(f"[DRY] {self.strategy_name}: signal={signal} pos={self.pos} target={self.target_pos}")
-            return
-        diff = self.target_pos - self.pos
-        if diff == 0:
-            return
-        price = self._get_order_price(diff)
-        size = round_to_lot(abs(diff), self.fixed_size)
-        if size <= 0:
-            return
-        if diff > 0:
-            if self.pos <= 0:
-                self._adapter.buy(price, size)
-            else:
-                self._adapter.sell(price, size)
-        else:
-            if self.pos >= 0:
-                self._adapter.short(price, size)
-            else:
-                self._adapter.cover(price, size)
-
-    def _get_order_price(self, diff: int) -> float:
-        """子类覆盖：根据行情获取下单价格"""
-        return 0.0
-
-    # ========== 辅助方法 ==========
-    def _check_trading_hour(self, dt: datetime) -> bool:
-        if self.backtest_mode:
-            return True
-        if not dt:
-            dt = datetime.now()
-        return is_trading_hour(self.symbol, self.exchange, dt)
-
-    def cancel_all_orders(self):
-        for oid in list(self.active_orders.keys()):
-            try:
-                self._adapter.cancel_order(oid)
-            except Exception as e:
-                logger.error(f"撤单失败 {oid}: {e}")
-        logger.info(f"[{self.strategy_name}] 已撤销所有未成交订单")
-
-    def reload_config(self):
-        self._load_config()
-        logger.info(f"[{self.strategy_name}] 配置已热加载")
+    def _load_params_from_db(self):
+        """从数据库加载AI优化的参数"""
+        try:
+            from core.db_manager import CustomDBManager
+            db = CustomDBManager()
+            ai_params = db.get_latest_params(self.vt_symbol, self.__class__.__name__)
+            if ai_params:
+                for key, value in ai_params.items():
+                    if key in self.parameters:
+                        setattr(self, key, value)
+                self.write_log(f"[DB] 加载AI参数: {json.dumps(ai_params)}")
+        except Exception as e:
+            self.write_log(f"[DB] 加载参数失败: {e}")
 
     def write_log(self, msg: str):
-        """统一日志输出"""
-        logger.info(f"[{self.strategy_name}] {msg}")
+        """统一日志格式"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        super().write_log(f"[{timestamp}] [{self.__class__.__name__}] {msg}")
+
+    def risk_check(self, direction: Direction, price: float, volume: int) -> bool:
+        """风险检查：返回True表示允许交易"""
+        # 每日亏损限额检查
+        if self.today_loss <= -self.max_daily_loss:
+            self.write_log(f"[风险] 今日亏损{self.today_loss:.0f}已达限额{self.max_daily_loss:.0f}，暂停交易")
+            return False
+
+        # 仓位比例检查
+        cost = price * volume * 100  # 假设乘数100
+        if cost > self.account_value * self.max_position_ratio:
+            self.write_log(f"[风险] 仓位{cost:.0f}超过权益{self.account_value:.0f}的{self.max_position_ratio*100:.0f}%")
+            return False
+
+        # 严格模式：检查反向持仓
+        if self.risk_check_level == "strict" and self.pos != 0:
+            if (self.pos > 0 and direction == Direction.SHORT) or \
+               (self.pos < 0 and direction == Direction.LONG):
+                self.write_log("[风险] 严格模式不允许反向下单")
+                return False
+
+        return True
+
+    def buy(self, price: float, volume: int, **kwargs):
+        """重写buy，加入风险检查"""
+        if self.risk_check(Direction.LONG, price, volume):
+            super().buy(price, volume, **kwargs)
+        else:
+            self.write_log(f"[阻止] 买入{volume}手 @ {price} 被风险检查拦截")
+
+    def sell(self, price: float, volume: int, **kwargs):
+        if self.risk_check(Direction.SHORT, price, volume):
+            super().sell(price, volume, **kwargs)
+
+    def short(self, price: float, volume: int, **kwargs):
+        if self.risk_check(Direction.SHORT, price, volume):
+            super().short(price, volume, **kwargs)
+
+    def cover(self, price: float, volume: int, **kwargs):
+        if self.risk_check(Direction.LONG, price, volume):
+            super().cover(price, volume, **kwargs)
+
+    def on_trade(self, trade: TradeData):
+        """成交回调：更新统计"""
+        self.total_trades += 1
+        if trade.direction == Direction.LONG:
+            if trade.offset == Offset.OPEN:
+                self.pos += trade.volume
+            else:
+                self.pos -= trade.volume
+        elif trade.direction == Direction.SHORT:
+            if trade.offset == Offset.OPEN:
+                self.pos -= trade.volume
+            else:
+                self.pos += trade.volume
+
+        # 更新PnL
+        self.write_log(f"成交: {trade.direction.name} {trade.volume}手 @ {trade.price}")
+
+    def on_bar(self, bar: BarData):
+        """子类必须实现"""
+        pass
+
+    def on_tick(self, tick: TickData):
+        """子类必须实现"""
+        pass
+
+    @abstractmethod
+    def on_init(self):
+        pass
+
+    @abstractmethod
+    def on_start(self):
+        pass
+
+    @abstractmethod
+    def on_stop(self):
+        pass

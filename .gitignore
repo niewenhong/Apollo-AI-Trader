@@ -24,3 +24,34 @@ logs/
 # OS
 Thumbs.db
 desktop.ini
+
+
+
+# 根目录下的配置文件
+config.json
+config - 副本.json
+strategy_config.json
+
+# config/ 目录下的敏感文件
+config/accounts_config.json
+config/strategies.json
+config/system_config.json
+config/database_config.json
+config/risk_config.json
+config/alerts_config.json
+config/symbols_config.json
+
+# 数据库
+data/apollo.db
+data/*.db
+
+# 日志
+logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地开发脚本
+fix_local.py
+init_db.py

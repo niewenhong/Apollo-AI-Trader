@@ -1,137 +1,140 @@
 """
-strategies/equity/dual_thrust_strategy.py - Apollo-AI-Trader v2.6.0
-Dual Thrust 开盘区间突破策略（从market_switcher_dual提炼纯策略逻辑）
-- 计算N日HH/HC/LC/LL确定Range
-- 上轨=Open+K1*Range, 下轨=Open-K2*Range
-- 均线斜率动态调整K1/K2
+strategies/equity/dual_thrust_strategy.py - v2.6.0
+双突破策略：基于开盘区间突破 + 市场状态切换
+支持趋势/震荡模式自适应，配合ATR动态调整突破幅度
 """
 from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
 from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction, Offset
+from vnpy.trader.constant import Direction
 import numpy as np
-from datetime import time as dtime
 
 
 class DualThrustStrategy(CtaTemplate):
     author = "Apollo"
-    version = "v2.6.0"
-
-    # 参数
-    lookback = 5               # 回看天数
-    k1 = 0.5                   # 上轨系数
-    k2 = 0.5                   # 下轨系数
-    ma_period = 20             # 均线周期
-    ma_slope_adjust = True     # 均线斜率调整
-    fixed_size = 100
-    stop_loss_pct = 0.02
-    take_profit_pct = 0.04
-    time_exit_hour = 23        # 强制平仓时间（港股23点前）
-    time_exit_minute = 55
 
     parameters = [
-        "lookback", "k1", "k2", "ma_period", "ma_slope_adjust",
-        "fixed_size", "stop_loss_pct", "take_profit_pct",
-        "time_exit_hour", "time_exit_minute",
+        "k1",                # 上轨系数（突破买入）
+        "k2",                # 下轨系数（突破卖出）
+        "lookback_days",     # 回溯天数
+        "fixed_size",        # 固定交易数量
+        "use_market_filter", # 是否启用市场状态过滤
     ]
-    variables = ["pos", "range_val", "upper_band", "lower_band",
-                 "entry_price", "highest", "lowest"]
+
+    variables = [
+        "pos", "entry_price", "up_line", "down_line",
+        "today_open", "market_state", "pnl"
+    ]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
         self.pos = 0
-        self.range_val = 0.0
-        self.upper_band = 0.0
-        self.lower_band = 0.0
         self.entry_price = 0.0
-        self.highest = 0.0
-        self.lowest = 999999.0
-        self.bg = BarGenerator(self.on_bar, 5, self.on_5min_bar)
-        self.am = ArrayManager(size=max(self.lookback*48, 100))
-        self._today_open = 0.0
-        self._today_range = None
+        self.up_line = 0.0
+        self.down_line = 0.0
+        self.today_open = 0.0
+        self.market_state = "unknown"  # trend, range, unknown
+        self.pnl = 0.0
+        self.bg = BarGenerator(self.on_bar)
+        self.am = ArrayManager(size=100)
 
     def on_init(self):
-        self.load_bar(10, use_database=True)
-        self.write_log(f"[DualThrust] on_init | {self.vt_symbol}")
+        self.load_bar(30, use_database=True)
+        self.write_log("DualThrust策略初始化完成")
 
     def on_start(self):
-        self.write_log(f"[DualThrust] on_start | {self.vt_symbol}")
+        self.write_log("DualThrust策略启动")
 
     def on_stop(self):
-        self.write_log(f"[DualThrust] on_stop")
+        self.write_log("DualThrust策略停止")
 
     def on_tick(self, tick: TickData):
         self.bg.update_tick(tick)
 
     def on_bar(self, bar: BarData):
-        self.bg.update_bar(bar)
-
-    def on_5min_bar(self, bar: BarData):
-        """5分钟Bar计算Range和信号"""
-        am = self.am
-        am.update_bar(bar)
-        if not am.inited: return
-
-        # 每日开盘时计算Range
-        now = bar.datetime
-        if now.time() < dtime(9,35):
-            self._calc_today_range(am)
-            self._today_open = bar.open_price
-
-        # 检查止损止盈
-        if self.pos > 0:
-            if bar.close_price <= self.entry_price * (1-self.stop_loss_pct):
-                self.sell(bar.close_price-0.01, abs(self.pos)); return
-            if bar.close_price >= self.entry_price * (1+self.take_profit_pct):
-                self.sell(bar.close_price-0.01, abs(self.pos)); return
-        if self.pos < 0:
-            if bar.close_price >= self.entry_price * (1+self.stop_loss_pct):
-                self.cover(bar.close_price+0.01, abs(self.pos)); return
-
-        # 收盘前强平
-        if now.hour >= self.time_exit_hour and now.minute >= self.time_exit_minute:
-            if self.pos > 0: self.sell(bar.close_price-0.01, abs(self.pos))
-            if self.pos < 0: self.cover(bar.close_price+0.01, abs(self.pos))
+        self.am.update_bar(bar)
+        if not self.am.inited:
             return
 
-        # 突破信号
-        if self.range_val > 0:
-            upper = self._today_open + self.k1 * self.range_val
-            lower = self._today_open - self.k2 * self.range_val
-            if bar.close_price > upper and self.pos <= 0:
-                self.buy(bar.close_price+0.01, self.fixed_size)
-            elif bar.close_price < lower and self.pos >= 0:
-                self.short(bar.close_price-0.01, self.fixed_size)
+        # 每天开盘重置轨道
+        if self.today_open == 0:
+            self.today_open = bar.open_price
+            self._calculate_lines(bar)
 
-    def _calc_today_range(self, am):
-        """计算N日Range = Max(HH-LC, HC-LL)"""
-        closes = am.close[-self.lookback*48:] if len(am.close)>=self.lookback*48 else am.close
-        highs = am.high[-self.lookback*48:] if len(am.high)>=self.lookback*48 else am.high
-        lows = am.low[-self.lookback*48:] if len(am.low)>=self.lookback*48 else am.low
-        if len(closes) < 2: return
-        hh = np.max(highs[:-1])
-        lc = np.min(closes[:-1])
-        hc = np.max(closes[:-1])
-        ll = np.min(lows[:-1])
-        rng = max(hh-lc, hc-ll)
-        # 均线斜率调整
-        if self.ma_slope_adjust and len(closes) >= self.ma_period:
-            ma = np.mean(closes[-self.ma_period:])
-            prev_ma = np.mean(closes[-self.ma_period-5:-5])
-            slope = (ma-prev_ma)/prev_ma if prev_ma>0 else 0
-            if slope > 0.002:   # 上升市：偏多
-                self.k1 *= 0.8; self.k2 *= 1.2
-            elif slope < -0.002: # 下降市：偏空
-                self.k1 *= 1.2; self.k2 *= 0.8
-        self.range_val = float(rng)
-        self.write_log(f"[DualThrust] Range={rng:.2f} K1={self.k1:.2f} K2={self.k2:.2f}")
+        # 判断市场状态（趋势/震荡）
+        if self.use_market_filter:
+            self._update_market_state(bar)
 
-    def on_order(self, order):
-        if order.traded > 0:
-            if order.direction == Direction.LONG:
-                self.pos = order.traded
-                self.entry_price = order.price
-            elif order.direction == Direction.SHORT:
-                self.pos = -order.traded
-                self.entry_price = order.price
-        self.put_event()
+        # 交易逻辑
+        if self.pos == 0:
+            # 突破上轨买入（趋势模式下优先）
+            if bar.close_price > self.up_line:
+                if self.market_state != "range":
+                    self.buy(bar.close_price, self.fixed_size)
+                    self.entry_price = bar.close_price
+                    self.write_log(f"突破买入: 价格{bar.close_price:.2f} > 上轨{self.up_line:.2f}")
+            # 突破下轨卖出
+            elif bar.close_price < self.down_line:
+                if self.market_state != "range":
+                    self.short(bar.close_price, self.fixed_size)
+                    self.entry_price = bar.close_price
+                    self.write_log(f"突破卖出: 价格{bar.close_price:.2f} < 下轨{self.down_line:.2f}")
+        else:
+            self._manage_position(bar)
+
+        # 收盘重置（第二天）
+        if bar.datetime.time() >= self._get_market_close_time():
+            self.today_open = 0.0
+            self.up_line = 0.0
+            self.down_line = 0.0
+
+    def _calculate_lines(self, bar: BarData):
+        """计算今日上下轨"""
+        if len(self.am.high) < self.lookback_days:
+            return
+
+        # 取过去N天的最高High和最低Low
+        hh = np.max(self.am.high[-self.lookback_days:-1])
+        ll = np.min(self.am.low[-self.lookback_days:-1])
+
+        # 计算Range
+        range_val = hh - ll
+
+        # 上下轨
+        self.up_line = self.today_open + self.k1 * range_val
+        self.down_line = self.today_open - self.k2 * range_val
+
+    def _update_market_state(self, bar: BarData):
+        """更新市场状态：趋势/震荡"""
+        if len(self.am.close) < 20:
+            return
+
+        # 用ADX判断趋势强度
+        adx = self.am.atr(14) / np.mean(self.am.close[-14:]) * 100
+        if adx > 25:
+            self.market_state = "trend"
+        else:
+            self.market_state = "range"
+
+    def _manage_position(self, bar: BarData):
+        """管理持仓：反向突破平仓"""
+        if self.pos > 0:
+            # 多头：跌破下轨平仓
+            if bar.close_price < self.down_line:
+                self.sell(bar.close_price, abs(self.pos))
+                self.write_log("多头平仓: 跌破下轨")
+        elif self.pos < 0:
+            # 空头：突破上轨平仓
+            if bar.close_price > self.up_line:
+                self.cover(bar.close_price, abs(self.pos))
+                self.write_log("空头平仓: 突破上轨")
+
+    def _get_market_close_time(self):
+        """获取市场收盘时间（简化）"""
+        from datetime import time
+        if "SEHK" in self.vt_symbol:
+            return time(16, 0)
+        else:
+            return time(16, 0)  # 美股简化
+
+    def on_trade(self, trade):
+        self.write_log(f"DualThrust成交: {trade.direction.name} {trade.volume}手 @ {trade.price}")

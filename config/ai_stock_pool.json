@@ -1,0 +1,16 @@
+{
+    "US": [
+        {"vt_symbol": "US.NVDA", "score": 85.5, "reason": "多头排列+放量+资金流入"},
+        {"vt_symbol": "US.AAPL", "score": 72.0, "reason": "站上MA20+RSI健康"},
+        {"vt_symbol": "US.MSFT", "score": 68.0, "reason": "趋势向上+MACD金叉"},
+        {"vt_symbol": "US.AMZN", "score": 65.5, "reason": "均线多头+温和放量"},
+        {"vt_symbol": "US.TSLA", "score": 58.0, "reason": "波动率高+资金分歧"}
+    ],
+    "HK": [
+        {"vt_symbol": "HK.00700", "score": 78.0, "reason": "多头排列+资金流入"},
+        {"vt_symbol": "HK.09988", "score": 65.0, "reason": "站上MA20+温和放量"},
+        {"vt_symbol": "HK.03690", "score": 62.0, "reason": "MACD金叉+RSI中性"},
+        {"vt_symbol": "HK.00388", "score": 55.0, "reason": "震荡整理"},
+        {"vt_symbol": "HK.00941", "score": 52.0, "reason": "弱势反弹"}
+    ]
+}
