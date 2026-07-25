@@ -1,13 +1,7 @@
 """
-futu_gateway.py — Apollo-AI-Trader v2.4.0
+futu_gateway.py — Apollo-AI-Trader v2.7.0
 富途网关（双 Gateway 架构，每市场独立实例）
-修正：
-  1. send_order 直接把裸码/带前缀码传给 place_order
-     （富途 place_order 两种都接受，关键是 gateway 内部 filter_trdmarket 已定市场）
-  2. send_order 成功后，立即构造 OrderData 并写入 self.orders，
-     保证撤单时本地缓存一定能查到
-  3. on_order 回调也写 self.orders，保持同步
-  4. account 用 cash 字段；frozen = total_assets - cash
+v2.7.0 新增：MultiPeriodKlineHandler 注册，多周期K线统一回调
 """
 import pandas as pd
 from copy import copy
@@ -22,6 +16,7 @@ from futu import (
     RET_ERROR, RET_OK, StockQuoteHandlerBase,
     TradeDealHandlerBase, TradeOrderHandlerBase,
     OpenSecTradeContext, OpenFutureTradeContext,
+    CurKlineHandlerBase, SubType, Session,
 )
 
 from vnpy.event import EventEngine
@@ -88,6 +83,75 @@ PRODUCT_VT2FUTU: Dict = {
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 
+# ========== 多周期K线回调 Handler ==========
+class MultiPeriodKlineHandler(CurKlineHandlerBase):
+    """
+    统一多周期K线回调 v2.7.0
+    接收富途原生 K_1M/K_5M/K_15M/K_60M 推送
+    转换为 vn.py BarData → EventEngine 分发 → MarketDataBus 落库
+    """
+    INTERVAL_MAP = {
+        KLType.K_1M:  (Interval.MINUTE, 1),
+        KLType.K_5M:  (Interval.MINUTE, 5),
+        KLType.K_15M: (Interval.MINUTE, 15),
+        KLType.K_60M: (Interval.HOUR,   1),
+    }
+
+    def __init__(self, gateway, market_bus=None):
+        super().__init__()
+        self.gateway = gateway
+        self.market_bus = market_bus  # 可选注入
+
+    def on_recv_rsp(self, rsp_pb):
+        ret, data = super().on_recv_rsp(rsp_pb)
+        if ret != RET_OK:
+            return ret, data
+
+        ktype = data.get("ktype")
+        info = self.INTERVAL_MAP.get(ktype)
+        if not info:
+            return ret, data
+
+        interval, window = info
+        code = data["code"]
+        exch = Exchange.SEHK if code.startswith("HK.") else Exchange.SMART
+
+        bar = BarData(
+            symbol=code,
+            exchange=exch,
+            interval=interval,
+            window=window,
+            datetime=datetime.strptime(data["time_key"], "%Y-%m-%d %H:%M:%S"),
+            open_price=float(data["open"]),
+            high_price=float(data["high"]),
+            low_price=float(data["low"]),
+            close_price=float(data["close"]),
+            volume=float(data["volume"]),
+            turnover=float(data.get("turnover", 0)),
+            gateway_name=self.gateway.gateway_name,
+        )
+
+        # 直接落库（如果注入了 market_bus 或 db）
+        if self.market_bus and hasattr(self.market_bus, 'db') and self.market_bus.db:
+            try:
+                self.market_bus.db.save_bar(bar)
+            except Exception as e:
+                self.gateway.write_log(f"[KlineHandler] 落库失败: {e}")
+
+        # 事件分发 → MarketDataBus → 策略
+        self.gateway.event_engine.put(self.gateway.event_engine.__class__.__module__)  # placeholder
+        from vnpy.trader.event import Event, EVENT_BAR
+        self.gateway.event_engine.put(Event(EVENT_BAR, bar))
+
+        self.gateway.write_log(
+            f"[BAR] {code} {interval}{window} "
+            f"O={bar.open_price} H={bar.high_price} "
+            f"L={bar.low_price} C={bar.close_price} V={bar.volume}"
+        )
+        return ret, data
+
+
+# ========== 富途网关主体 ==========
 class FutuGateway(BaseGateway):
     """富途网关（双 Gateway 架构，每市场独立实例）"""
 
@@ -105,7 +169,6 @@ class FutuGateway(BaseGateway):
 
     def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
         super().__init__(event_engine, gateway_name)
-        # 兼容 BaseGateway 是否有 put_event
         if not hasattr(self, 'put_event') or self.put_event is None:
             self.put_event = self.event_engine.put
         self.quote_ctx: OpenQuoteContext = None
@@ -116,7 +179,6 @@ class FutuGateway(BaseGateway):
         self.password: str = ""
         self.env: TrdEnv = TrdEnv.SIMULATE
         self.ticks: Dict[str, TickData] = {}
-        # ★ 关键：本地订单缓存，key=vt_orderid，撤单靠它
         self.orders: Dict[str, OrderData] = {}
         self.trades: Set = set()
         self.contracts: Dict[str, ContractData] = {}
@@ -124,6 +186,10 @@ class FutuGateway(BaseGateway):
         self.count: int = 0
         self.interval: int = 3
         self.query_funcs: list = [self.query_account, self.query_position]
+        # v2.7.0: 多周期K线Handler引用
+        self.kline_handler: MultiPeriodKlineHandler = None
+        # v2.7.0: MarketDataBus 引用（外部注入）
+        self.market_bus = None
 
     # ========== 连接 ==========
     def connect(self, setting: dict) -> None:
@@ -178,8 +244,13 @@ class FutuGateway(BaseGateway):
 
         self.quote_ctx.set_handler(QuoteHandler())
         self.quote_ctx.set_handler(OrderBookHandler())
+
+        # v2.7.0: 注册多周期K线Handler
+        self.kline_handler = MultiPeriodKlineHandler(self, market_bus=self.market_bus)
+        self.quote_ctx.set_handler(self.kline_handler)
+
         self.quote_ctx.start()
-        self.write_log(f"[{self.gateway_name}] 行情接口连接成功")
+        self.write_log(f"[{self.gateway_name}] 行情接口连接成功（含多周期K线）")
 
     # ========== 交易 ==========
     def connect_trade(self) -> None:
@@ -210,7 +281,6 @@ class FutuGateway(BaseGateway):
                 self.gateway.process_deal(content)
                 return RET_OK, content
 
-        # 解锁（GUI 版 OpenD 可能屏蔽，try 住）
         try:
             code, data = self.trade_ctx.unlock_trade(self.password)
             if code == RET_OK:
@@ -225,7 +295,7 @@ class FutuGateway(BaseGateway):
         self.trade_ctx.start()
         self.write_log(f"[{self.gateway_name}] 交易接口连接成功")
 
-    # ========== 订阅 ==========
+    # ========== 订阅（全套：K_1M+K_5M+K_15M+K_60M）==========
     def subscribe(self, req: SubscribeRequest) -> None:
         try:
             futu_exchange = EXCHANGE_VT2FUTU[req.exchange]
@@ -233,20 +303,28 @@ class FutuGateway(BaseGateway):
             self.write_log(f"不支持的交易所: {req.exchange}")
             return
         futu_symbol = f"{futu_exchange}.{req.symbol}"
-        for dtype in ["QUOTE", "ORDER_BOOK"]:
-            code, data = self.quote_ctx.subscribe(futu_symbol, dtype, True)
-            if code == RET_OK:
-                self.write_log(f"[{self.gateway_name}] 订阅行情成功: {futu_symbol}")
-            else:
-                self.write_log(f"[{self.gateway_name}] 订阅行情失败: {futu_symbol} | {data}")
 
-    # ========== ★ 下单（核心修正）==========
+        # v2.7.0: 全套订阅（4额度/只）
+        sub_types = [
+            SubType.QUOTE,
+            SubType.ORDER_BOOK,
+            SubType.K_1M,
+            SubType.K_5M,
+            SubType.K_15M,
+            SubType.K_60M,
+        ]
+        session = Session.ALL if futu_exchange == "US" else Session.NONE
+
+        code, data = self.quote_ctx.subscribe(futu_symbol, sub_types, session=session)
+        if code == RET_OK:
+            self.write_log(f"[{self.gateway_name}] ✅ 全套订阅成功: {futu_symbol} (QUOTE+OB+K_1M+5M+15M+60M)")
+        else:
+            self.write_log(f"[{self.gateway_name}] ❌ 订阅失败: {futu_symbol} | {data}")
+
+    # ========== 下单 ==========
     def send_order(self, req: OrderRequest) -> str:
         side = DIRECTION_VT2FUTU[req.direction]
         adj = 0.05 if req.direction is Direction.LONG else -0.05
-
-        # ★ 关键：直接用 req.symbol，不再拼接
-        # 实测证明 "US.AAPL" 和 "AAPL" 富途都接受（市场由 filter_trdmarket 决定）
         futu_symbol = req.symbol
 
         code, data = self.trade_ctx.place_order(
@@ -257,7 +335,6 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] 委托失败: {data}")
             return ""
 
-        # ★ 从富途返回里取 order_id
         orderid = ""
         for _, row in data.iterrows():
             orderid = str(row["order_id"])
@@ -266,12 +343,10 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] 下单返回空 orderid")
             return ""
 
-        # ★ 立即构造 OrderData 并写入 self.orders
-        # 这样撤单时本地缓存一定能查到
         order = OrderData(
-            symbol=req.symbol,           # 保持原样（"US.AAPL" 或 "AAPL"）
+            symbol=req.symbol,
             exchange=req.exchange,
-            orderid=orderid,             # 富途原始 order_id
+            orderid=orderid,
             direction=req.direction,
             offset=req.offset,
             price=req.price,
@@ -281,17 +356,13 @@ class FutuGateway(BaseGateway):
             gateway_name=self.gateway_name,
             datetime=datetime.now(CHINA_TZ),
         )
-        # vt_orderid = gateway_name + "." + orderid
         order.vt_orderid = f"{self.gateway_name}.{orderid}"
         order.reference = req.reference
 
-        # ★ 写入本地缓存（双重 key，兼容不同查找方式）
         self.orders[order.vt_orderid] = order
-        self.orders[orderid] = order  # 也用裸 orderid 存一份
+        self.orders[orderid] = order
 
         self.write_log(f"[{self.gateway_name}] 委托成功: {order.vt_orderid} {req.symbol} {req.volume}@{req.price}")
-
-        # 触发事件
         self.on_order(order)
         return order.vt_orderid
 
@@ -321,7 +392,8 @@ class FutuGateway(BaseGateway):
             ))
             self.write_log(
                 f"[{self.gateway_name}] 账户: 总资产=${total_assets:,.2f} "
-                f"冻结=${frozen:,.2f} 可用=${cash:,.2f}")
+                f"冻结=${frozen:,.2f} 可用=${cash:,.2f}"
+            )
 
     # ========== 持仓 ==========
     def query_position(self) -> None:
@@ -492,7 +564,6 @@ class FutuGateway(BaseGateway):
                 gateway_name=self.gateway_name,
             )
             order.vt_orderid = f"{self.gateway_name}.{orderid}"
-            # ★ 写入本地缓存
             self.orders[order.vt_orderid] = order
             self.orders[orderid] = order
             self.on_order(order)
