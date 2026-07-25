@@ -1,16 +1,17 @@
 """
-multi_period_kline_handler.py — 富途原生多周期K线回调 v2.7.0
-- 接收 K_1M/K_5M/K_15M/K_60M 推送
-- 转换为 vn.py BarData 事件分发
-- 同时通过 MarketDataBus 落库
+multi_period_kline_handler.py — 多周期K线回调 v2.7.0
+功能：接收富途原生K_1M/K_5M/K_15M/K_60M推送，转换为BarData并分发
+版本：v2.7.0
+变更：2026-07-26 适配vnpy 4.4.0 Event路径，去除try/except
 """
 
 from futu import CurKlineHandlerBase, KLType, RET_OK
 from vnpy.trader.object import BarData, Exchange, Interval
-from vnpy.trader.event import Event, EVENT_BAR
+from vnpy.event import Event
 from datetime import datetime
 import logging
 
+EVENT_BAR = "eBar"
 logger = logging.getLogger(__name__)
 
 
@@ -41,34 +42,29 @@ class MultiPeriodKlineHandler(CurKlineHandlerBase):
         code = data["code"]
         exch = Exchange.SEHK if code.startswith("HK.") else Exchange.SMART
 
-        try:
-            dt = datetime.strptime(data["time_key"], "%Y-%m-%d %H:%M:%S")
-        except:
-            dt = datetime.now()
-
         bar = BarData(
             symbol=code, exchange=exch,
             interval=interval, window=window,
-            datetime=dt,
-            open_price=float(data.get("open", 0)),
-            high_price=float(data.get("high", 0)),
-            low_price=float(data.get("low", 0)),
-            close_price=float(data.get("close", 0)),
-            volume=float(data.get("volume", 0)),
+            datetime=datetime.strptime(data["time_key"], "%Y-%m-%d %H:%M:%S"),
+            open_price=float(data["open"]),
+            high_price=float(data["high"]),
+            low_price=float(data["low"]),
+            close_price=float(data["close"]),
+            volume=float(data["volume"]),
             turnover=float(data.get("turnover", 0)),
             gateway_name=self.gateway.gateway_name,
         )
 
-        # 直接落库
-        if self.market_bus:
+        if self.market_bus and hasattr(self.market_bus, 'db') and self.market_bus.db:
             try:
                 self.market_bus.db.save_bar(bar)
             except Exception as e:
-                logger.error(f"K线落库失败: {e}")
+                self.gateway.write_log(f"[KlineHandler] 落库失败: {e}")
 
-        # 事件分发
         self.gateway.event_engine.put(Event(EVENT_BAR, bar))
-        logger.debug(f"[BAR] {code} {interval}{window} "
-                     f"O={bar.open_price} H={bar.high_price} "
-                     f"L={bar.low_price} C={bar.close_price} V={bar.volume}")
+        self.gateway.write_log(
+            f"[BAR] {code} {interval}{window} "
+            f"O={bar.open_price} H={bar.high_price} "
+            f"L={bar.low_price} C={bar.close_price} V={bar.volume}"
+        )
         return ret, data

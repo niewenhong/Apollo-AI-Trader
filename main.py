@@ -1,141 +1,152 @@
 """
-main.py — Apollo AI Trader v2.7.0 入口
-集成: SubscriptionManager + MarketDataBus + MultiPeriodDB + StrategyMatcher
+main.py — Apollo AI Trader v2.7.0 启动入口（精简版）
+功能：双网关(US 8只 + HK 2只) → 选股 → 全套订阅 → 策略匹配 → Telegram远程控制
 """
 
-import time
 import json
+import time
 import logging
 import threading
-from datetime import datetime
 
-# ===== 日志 =====
+from vnpy.event import EventEngine
+from vnpy.trader.engine import MainEngine
+from vnpy_futu import FutuGateway
+
+from core.multi_period_db import MultiPeriodDB
+from core.subscription_manager import SubscriptionManager
+from core.strategy_matcher import StrategyMatcher
+from core.remote_controller import RemoteController
+
+from ai.stock_selector import AIStockSelector
+
+from monitoring.telegram_notifier import TelegramNotifier
+from monitoring.telegram_webhook import TelegramCommandListener
+
+# ========== 日志配置 ==========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.FileHandler("logs/main.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger("Main")
+log = logging.getLogger("Main")
 
-# ===== 导入 =====
-from vnpy.event import EventEngine
-from vnpy.trader.engine import MainEngine
-from vnpy.trader.object import Interval
+# ========== 1. 加载配置 ==========
+with open("config/system_config.json", "r", encoding="utf-8") as f:
+    C = json.load(f)
 
-from core.subscription_manager import SubscriptionManager
-from core.multi_period_db import MultiPeriodDB
-from core.market_data_bus import MarketDataBus
-from core.strategy_matcher import StrategyMatcher
-from vnpy_futu import FutuGateway
+log.info(f"🖥️ 本机标识: [{C.get('opend_host','127.0.0.1')}:{C.get('opend_port',11111)}]")
 
-# ===== 加载配置 =====
-try:
-    with open("config/system_config.json", "r", encoding="utf-8") as f:
-        CONFIG = json.load(f)
-except FileNotFoundError:
-    logger.warning("config/system_config.json 不存在，使用空配置")
-    CONFIG = {}
+# ========== 2. 初始化引擎 + 双网关 ==========
+ev = EventEngine()
+me = MainEngine(ev)
+me.add_gateway(FutuGateway)
 
-# ===== 初始化引擎 =====
-event_engine = EventEngine()
-main_engine = MainEngine(event_engine)
-main_engine.add_gateway(FutuGateway)
-logger.info("✅ MainEngine + EventEngine 初始化完成")
+gw_us = FutuGateway(ev, "FUTU_US")
+gw_hk = FutuGateway(ev, "FUTU_HK")
+me.gateways["FUTU_US"] = gw_us
+me.gateways["FUTU_HK"] = gw_hk
 
-# ===== 数据库 =====
-db = MultiPeriodDB("data/history.db")
-
-# ===== 行情总线 =====
-market_bus = MarketDataBus(db=db, gate_threshold=3.0)
-
-# ===== 订阅管理器 =====
-# 注意：main_engine 单实例，US/HK 通过 symbol 前缀路由
-sub_manager = SubscriptionManager(
-    main_us=main_engine,
-    main_hk=main_engine,
-    max_quota=300,
-)
-sub_manager.db = db
-market_bus.strategy_engine = sub_manager  # 复用引用
-
-# ===== 策略匹配器 =====
+# ========== 3. 核心组件 ==========
+db = MultiPeriodDB(C.get("db_path") or "data/apollo.db")
+sub = SubscriptionManager(max_quota=300)
 matcher = StrategyMatcher(db=db)
 
-# ===== 连接网关 =====
-futu_cfg = CONFIG.get("futu", {})
-us_setting = futu_cfg.get("US", {})
-hk_setting = futu_cfg.get("HK", {})
+# ========== 4. 连接网关 ==========
+host = C["opend_host"]
+port = C["opend_port"]
+env = C["trade_env"]
 
-try:
-    main_engine.connect(us_setting, "FUTU")
-    logger.info("✅ FUTU 网关连接（US配置）")
-except Exception as e:
-    logger.error(f"US连接失败: {e}")
+us_setting = {"地址": host, "端口": port, "市场": "US", "环境": env}
+hk_setting = {"地址": host, "端口": port, "市场": "HK", "环境": env}
 
-# 注册K线回调（需在connect之后）
-try:
-    from vnpy_futu.multi_period_kline_handler import MultiPeriodKlineHandler
-    gateway = main_engine.get_gateway("FUTU")
-    if gateway:
-        handler = MultiPeriodKlineHandler(gateway, market_bus=market_bus)
-        gateway.quote_ctx.set_handler(handler)
-        logger.info("✅ MultiPeriodKlineHandler 已注册")
-except Exception as e:
-    logger.error(f"K线Handler注册失败: {e}")
+gw_us.connect(us_setting)
+log.info("✅ US 网关连接中...")
 
-# 行情总线挂载到事件引擎
-market_bus.attach_to_engine(event_engine)
+gw_hk.connect(hk_setting)
+log.info("✅ HK 网关连接中...")
 
-# ===== AI选股 → 全套订阅 → 策略匹配 =====
-def run_selector_and_subscribe():
-    try:
-        from ai.stock_selector import AIStockSelector
-        selector = AIStockSelector(CONFIG)
-        selected = selector.select()
-        logger.info(f"📋 选股结果: {selected}")
+# ========== 5. 等待行情就绪 ==========
+def wait_ctx(gw, name, timeout=10):
+    for i in range(timeout):
+        if gw.quote_ctx is not None:
+            log.info(f"✅ {name} 行情就绪")
+            return True
+        time.sleep(1)
+    log.error(f"❌ {name} 行情超时")
+    return False
 
-        for sym in selected:
-            sub_manager.subscribe_all(sym)
+wait_ctx(gw_us, "US")
+wait_ctx(gw_hk, "HK")
 
-        for sym in selected:
-            sub_manager.get_daily_bars(sym, "2024-01-01",
-                                       datetime.now().strftime("%Y-%m-%d"))
+sub.set_contexts(gw_us.quote_ctx, gw_hk.quote_ctx)
 
-        matched = matcher.match(selected)
-        for combo in matched:
-            logger.info(f"🎯 {combo['symbol']} → {combo['strategy']} "
-                        f"params={combo['params']} score={combo['score']}")
-        return matched
-    except Exception as e:
-        logger.error(f"选股流程异常: {e}")
-        return []
+# ========== 6. 订阅（8美 + 2港）==========
+universe = {
+    "US": ["US.NVDA", "US.AAPL", "US.MSFT", "US.AMZN",
+           "US.META", "US.GOOGL", "US.AMD", "US.TSLA"],
+    "HK": ["HK.00700", "HK.09988"]
+}
 
-matched = run_selector_and_subscribe()
+for s in universe["US"] + universe["HK"]:
+    sub.subscribe_all(s)
 
-# ===== 定时任务 =====
+# ========== 7. 选股 + 策略匹配 ==========
+selector = AIStockSelector(quote_ctx=gw_us.quote_ctx, db=db, market="US")
+selected = selector.select()
+for m in matcher.match(selected):
+    log.info(f"🎯 {m['symbol']} → {m['strategy']} score={m['score']}")
+
+# ========== 8. Telegram 远程控制 ==========
+token = C.get("telegram_token", "")
+chat_id = C.get("telegram_chat_id", "")
+proxy = C.get("proxy", "") or None
+
+notifier = controller = listener = None
+
+if token and chat_id:
+    notifier = TelegramNotifier(token, chat_id, proxy=proxy)
+    # 测试连接
+    ok = notifier.send_message("🚀 Apollo v2.7.0 启动中...")
+    if ok:
+        log.info("✅ Telegram Bot连接成功")
+    else:
+        log.warning("⚠️ Telegram Bot连接失败（检查token/chat_id/网络）")
+
+    tg_config = {"remote_password": C.get("remote_password", "")}
+    controller = RemoteController(db=db, notifier=notifier, config=tg_config)
+    controller.set_main_engine(me)
+
+    listener = TelegramCommandListener(token, chat_id, controller, poll_interval=3.0)
+    listener.start()
+    log.info("✅ Telegram 远程控制已启动")
+else:
+    log.warning("⚠️ Telegram 未配置（缺少 telegram_token 或 telegram_chat_id）")
+
+# ========== 9. 定时任务 ==========
 def periodic_task():
     while True:
         time.sleep(300)
-        sub_manager.process_unsub_queue()
-        sub_manager.audit_quota()
+        sub.audit_quota()
+        # 5分钟心跳
+        if notifier:
+            notifier.notify("HEARTBEAT", f"运行中 | 订阅{len(sub.subscribed)}只")
 
-t = threading.Thread(target=periodic_task, daemon=True)
-t.start()
-logger.info("⏰ 定时任务已启动（5分钟/次）")
+threading.Thread(target=periodic_task, daemon=True).start()
 
-# ===== 主循环 =====
-logger.info("🚀 Apollo AI Trader v2.7.0 启动完成")
-sub_manager.audit_quota()
+# ========== 10. 主循环（带退出检测）==========
+log.info(f"🚀 启动完成 已订阅{len(sub.subscribed)}只 (美{len(universe['US'])}+港{len(universe['HK'])})")
 
 try:
     while True:
-        time.sleep(60)
+        time.sleep(1)
+        if controller and controller.is_shutdown_requested():
+            log.info("👋 收到关闭信号，退出主循环...")
+            break
 except KeyboardInterrupt:
-    logger.info("👋 正在关闭...")
-    sub_manager.process_unsub_queue()
-    sub_manager.audit_quota()
-    event_engine.stop()
-    logger.info("✅ 已安全关闭")
+    log.info("👋 手动中断 (Ctrl+C)...")
+finally:
+    ev.stop()
+    log.info("✅ 已安全关闭")
