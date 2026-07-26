@@ -1,57 +1,41 @@
-# 数据库
-data/
-*.db
-*.sqlite
-
-# 配置文件（含Token和密码）
-config/system_config.json
-
-# Python
+# Python 编译缓存
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
+*.egg-info/
 
-# IDE
+# 虚拟环境
+venv/
+.env
+
+# IDE 配置
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# 日志
-*.log
-logs/
+# 运行时数据
+data/*.db
+logs/*.log
+logs/.gitkeep
 
-# OS
-Thumbs.db
-desktop.ini
-
-
-
-# 根目录下的配置文件
-config.json
-config - 副本.json
-strategy_config.json
-
-# config/ 目录下的敏感文件
+# 敏感配置文件（必须排除，防止泄露 Token 和密码）
+config/system_config.json
 config/accounts_config.json
 config/strategies.json
-config/system_config.json
-config/database_config.json
-config/risk_config.json
 config/alerts_config.json
+config/risk_config.json
+config/database_config.json
+config/logging_config.json
 config/symbols_config.json
+config/ai_stock_pool.json
 
-# 数据库
-data/apollo.db
-data/*.db
-
-# 日志
-logs/
-
-# Python 缓存
-__pycache__/
-*.pyc
-
-# 本地开发脚本
+# 临时文件
+bfg.jar
+config - 副本.json
 fix_local.py
-init_db.py
+test_validation.py
+
+# OS 文件
+Thumbs.db
+.DS_Store

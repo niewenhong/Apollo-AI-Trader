@@ -1,0 +1,110 @@
+{
+    "_comment": "策略配置文件 v2.6.0 — AI 选股结果会自动写入 ai_stock_pool.json",
+
+    "stock_pool": {
+        "US": [
+            "NVDA", "AAPL", "MSFT", "AMZN", "TSLA",
+            "META", "GOOG", "AMD", "NFLX", "BABA"
+        ],
+        "HK": [
+            "00700", "09988", "03690", "00388", "00941"
+        ]
+    },
+
+    "default_setting": {
+        "fast_ma": 10,
+        "slow_ma": 30,
+        "rsi_period": 14,
+        "rsi_upper": 70,
+        "rsi_lower": 30,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "bb_period": 20,
+        "bb_dev": 2.0,
+        "atr_period": 14,
+        "volume_ma_period": 20,
+        "stoch_k": 14,
+        "stoch_d": 3,
+        "adx_period": 14,
+        "adx_threshold": 25,
+        "cci_period": 20,
+        "cci_threshold": 100,
+        "is_simulate": true,
+        "test_mode": false,
+        "fixed_volume": 100,
+        "stop_loss_pct": 0.02,
+        "take_profit_pct": 0.04,
+        "price_offset": 0.01
+    },
+
+    "per_market_overrides": {
+        "US": {
+            "fixed_volume": 50
+        },
+        "HK": {
+            "fixed_volume": 500
+        }
+    },
+
+    "per_symbol_overrides": {
+        "NVDA": {
+            "fast_ma": 5,
+            "slow_ma": 20,
+            "fixed_volume": 200
+        },
+        "TSLA": {
+            "atr_period": 20
+        },
+        "00700": {
+            "fixed_volume": 200
+        }
+    },
+
+    "option_strategies": {
+        "enabled_markets": ["US"],
+        "default_params": {
+            "target_delta": 0.20,
+            "min_otm_prob": 0.60,
+            "min_days_to_exp": 7,
+            "max_days_to_exp": 45,
+            "min_annual_roi": 0.30,
+            "position_size": 1,
+            "max_position_pct": 0.05
+        },
+        "strategies": {
+            "sell_put": {"enabled": true},
+            "sell_call": {"enabled": true},
+            "covered_call": {"enabled": true},
+            "cash_secured_put": {"enabled": true},
+            "bull_call_spread": {"enabled": false},
+            "bear_put_spread": {"enabled": false},
+            "iron_condor": {"enabled": false},
+            "straddle": {"enabled": false}
+        }
+    },
+
+    "ipo_strategy": {
+        "enabled": true,
+        "min_subscribe_ratio": 50,
+        "max_pe_ratio": 100,
+        "require_greenshoe": true,
+        "first_day_max_hold_min": 240,
+        "profit_take_pct": 0.30,
+        "stop_loss_pct": -0.15
+    },
+
+    "structured_products": {
+        "cbbc": {
+            "enabled": true,
+            "max_leverage": 5,
+            "stop_loss_buffer": 0.02
+        },
+        "warrant": {
+            "enabled": true,
+            "max_leverage": 10,
+            "min_days_to_exp": 30,
+            "max_time_decay_pct": 0.05
+        }
+    }
+}

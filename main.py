@@ -7,6 +7,7 @@ import json
 import time
 import logging
 import threading
+import sys
 
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
@@ -68,18 +69,23 @@ log.info("✅ US 网关连接中...")
 gw_hk.connect(hk_setting)
 log.info("✅ HK 网关连接中...")
 
-# ========== 5. 等待行情就绪 ==========
+# ========== 5. 等待行情就绪（修复：超时则退出）==========
 def wait_ctx(gw, name, timeout=10):
     for i in range(timeout):
         if gw.quote_ctx is not None:
             log.info(f"✅ {name} 行情就绪")
             return True
         time.sleep(1)
-    log.error(f"❌ {name} 行情超时")
+    log.error(f"❌ {name} 行情超时（{timeout}秒内未就绪）")
     return False
 
-wait_ctx(gw_us, "US")
-wait_ctx(gw_hk, "HK")
+if not wait_ctx(gw_us, "US"):
+    log.error("美股行情接口未就绪，无法继续，退出程序")
+    sys.exit(1)
+
+if not wait_ctx(gw_hk, "HK"):
+    log.error("港股行情接口未就绪，无法继续，退出程序")
+    sys.exit(1)
 
 sub.set_contexts(gw_us.quote_ctx, gw_hk.quote_ctx)
 

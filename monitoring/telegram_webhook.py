@@ -2,7 +2,7 @@
 monitoring/telegram_webhook.py — Telegram 命令轮询监听器 v2.7.0
 功能：通过长轮询接收用户命令并转发给 RemoteController
 版本：v2.7.0
-变更：2026-07-26 启动时自动清除历史消息缓存，防止旧命令被执行
+变更：2026-07-26 循环清除所有历史消息；_send_reply 使用 HTML 解析模式
 """
 
 import logging
@@ -29,7 +29,7 @@ class TelegramCommandListener:
             self.session.proxies = {"https": proxy, "http": proxy}
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._offset = 0  # 用于标记已处理的最新消息ID
+        self._offset = 0
 
     def start(self):
         """启动后台轮询线程"""
@@ -37,7 +37,7 @@ class TelegramCommandListener:
             logger.warning("[TelegramWebhook] 已在运行")
             return
         self._running = True
-        self._clear_pending_updates()  # ★ 启动时清除历史缓存
+        self._clear_pending_updates()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True,
                                         name="TelegramPoll")
         self._thread.start()
@@ -51,22 +51,27 @@ class TelegramCommandListener:
             logger.info("[TelegramWebhook] 已停止")
 
     def _clear_pending_updates(self):
-        """清除所有待处理的旧消息，防止启动时执行历史命令"""
+        """彻底清除所有待处理的旧消息（循环拉取直到清空）"""
         try:
             url = f"{self.base_url}/getUpdates"
-            resp = self.session.post(url, json={
-                "offset": -1,       # 获取最新的消息ID
-                "timeout": 1,
-                "allowed_updates": ["message"]
-            }, timeout=5)
-            data = resp.json()
-            if data.get("ok") and data.get("result"):
-                # 取最新消息的 update_id 作为 offset，跳过所有历史
-                max_update_id = max(u["update_id"] for u in data["result"])
-                self._offset = max_update_id + 1
-                logger.info(f"[TelegramWebhook] 已清除历史缓存，跳过 {len(data['result'])} 条旧消息")
+            cleared = 0
+            while True:
+                resp = self.session.post(url, json={
+                    "offset": self._offset,
+                    "timeout": 1,
+                    "allowed_updates": ["message"]
+                }, timeout=5)
+                data = resp.json()
+                if not data.get("ok") or not data.get("result"):
+                    break
+                updates = data["result"]
+                for update in updates:
+                    self._offset = update["update_id"] + 1
+                    cleared += 1
+            if cleared > 0:
+                logger.info(f"[TelegramWebhook] 已清除 {cleared} 条历史消息")
             else:
-                self._offset = 0
+                logger.info("[TelegramWebhook] 无历史消息需清除")
         except Exception as e:
             logger.warning(f"[TelegramWebhook] 清除缓存失败: {e}")
             self._offset = 0
@@ -101,7 +106,7 @@ class TelegramCommandListener:
                 if not message:
                     continue
 
-                # 过滤：只处理来自指定 chat_id 的消息
+                # 只处理指定 chat_id 的消息
                 msg_chat_id = str(message["chat"]["id"])
                 if msg_chat_id != self.chat_id:
                     continue
@@ -112,30 +117,27 @@ class TelegramCommandListener:
 
                 logger.info(f"[TelegramWebhook] 收到消息: {text}")
 
-                # 解析命令和参数
                 parts = text.split(maxsplit=1)
                 command = parts[0].lstrip("/").lower()
                 args = parts[1] if len(parts) > 1 else ""
 
-                # 交给控制器处理
                 reply = self.controller.handle_command(command, args)
                 logger.info(f"[TelegramWebhook] 已回复: {reply[:80]}...")
 
-                # 发送回复
                 self._send_reply(reply)
 
         except requests.exceptions.Timeout:
-            pass  # 超时是正常的
+            pass
         except Exception as e:
             logger.error(f"[TelegramWebhook] 请求失败: {e}")
 
     def _send_reply(self, text: str):
-        """发送回复消息到相同聊天"""
+        """发送回复消息（使用 HTML 解析模式，避免特殊字符问题）"""
         url = f"{self.base_url}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"  # 改为 HTML，支持 <b>、<i> 等标签，且对特殊字符更宽容
         }
         try:
             self.session.post(url, json=payload, timeout=5)

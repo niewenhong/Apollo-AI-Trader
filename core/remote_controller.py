@@ -2,7 +2,7 @@
 core/remote_controller.py — 远程控制器 v2.7.0
 功能：处理 Telegram 命令，密码保护，策略管理
 版本：v2.7.0
-变更：2026-07-26 修复 /shutdown 无法彻底退出（sys.exit → os._exit）
+变更：2026-07-26 修复 /shutdown 无法彻底退出（sys.exit → os._exit）；_help 改为 HTML 格式
 """
 
 import json
@@ -73,23 +73,23 @@ class RemoteController:
     # ========== 信息查询 ==========
     def _help(self) -> str:
         return (
-            "**Apollo AI Trader v2.7.0**\n"
+            "<b>Apollo AI Trader v2.7.0</b>\n"
             "━━━━━━━━━━━━━━\n"
-            "**查询（无需密码）:**\n"
+            "<b>查询（无需密码）:</b>\n"
             "  /status - 策略状态\n"
             "  /list - 策略列表\n"
             "  /pool - 选股池\n"
             "  /positions - 持仓明细\n"
             "  /account - 账户资金\n"
             "  /market - 当前市场\n"
-            "**管理（需密码）:**\n"
-            "  /shutdown <pwd> - 关闭系统\n"
-            "  /restart <pwd> - 重启系统\n"
-            "  /switch <US|HK> <pwd> - 切换市场\n"
-            "  /add_stock <SYM> <pwd> - 加股票\n"
-            "  /add <n> <cls> <sym> <mkt> [json] - 加策略\n"
-            "  /remove <n> <pwd> - 删策略\n"
-            "  /reload <pwd> - 热加载"
+            "<b>管理（需密码）:</b>\n"
+            "  /shutdown &lt;pwd&gt; - 关闭系统\n"
+            "  /restart &lt;pwd&gt; - 重启系统\n"
+            "  /switch &lt;US|HK&gt; &lt;pwd&gt; - 切换市场\n"
+            "  /add_stock &lt;SYM&gt; &lt;pwd&gt; - 加股票\n"
+            "  /add &lt;n&gt; &lt;cls&gt; &lt;sym&gt; &lt;mkt&gt; [json] - 加策略\n"
+            "  /remove &lt;n&gt; &lt;pwd&gt; - 删策略\n"
+            "  /reload &lt;pwd&gt; - 热加载"
         )
 
     def _status(self) -> str:

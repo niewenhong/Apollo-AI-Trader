@@ -1,0 +1,46 @@
+{
+    "db_path": null,
+  
+    "log_level": "DEBUG",
+  
+    "datafeed": {
+      "name": "tushare",
+      "username": "YOUR_TUSHARE_TOKEN",
+      "password": ""
+    },
+  
+    "prelive_gate": {
+      "thresholds": {
+        "min_total_return": -0.1,
+        "min_sharpe": -1.0,
+        "max_drawdown": 0.5,
+        "min_trade_count": 1
+      },
+      "backtest_days": 60,
+      "backtest_interval": "1m",
+      "hot_reload_interval": 60
+    },
+  
+    "optimizer": {
+      "max_workers": 4,
+      "rate": 0.0003,
+      "slippage": 0.001,
+      "size": 100,
+      "pricetick": 0.01,
+      "capital": 1000000
+    },
+  
+    "opend_host": "127.0.0.1",
+    "opend_port": 11111,
+    "futu_account": "YOUR_FUTU_ACCOUNT",
+    "futu_password": "YOUR_FUTU_PASSWORD",
+    "trade_env": "SIMULATE",
+  
+    "ai_top_n": 25,
+    "llm_api_key": "YOUR_ZHIPU_API_KEY",
+  
+    "telegram_token": "8680932955:AAEmADAjN4ihJwfbnFg3Gwt51_-mlizfv7w",
+    "telegram_chat_id": 8313339751,
+  
+    "webhook_port": 8899
+  }
