@@ -3,13 +3,13 @@ ai/param_advisor.py - v2.7.0
 参数建议器：基于历史数据和LLM提供策略参数优化建议
 """
 from typing import Dict, Optional
-from core.db_manager import CustomDBManager
+from core.db_manager import DBManager
 
 
 class ParamAdvisor:
     """参数建议器"""
 
-    def __init__(self, db: CustomDBManager, llm=None):
+    def __init__(self, db: DBManager, llm=None):
         self.db = db
         self.llm = llm  # 可选，用于高级建议
 

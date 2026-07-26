@@ -13,7 +13,7 @@ from vnpy.trader.object import BarData, TickData, OrderData, TradeData
 from vnpy.trader.constant import Direction, Offset, Status
 
 try:
-    from core.db_manager import CustomDBManager
+    from core.db_manager import DBManager
     HAS_DB = True
 except ImportError:
     HAS_DB = False
@@ -103,7 +103,7 @@ class ApolloBaseStrategy(CtaTemplate):
         if not HAS_DB:
             return
         try:
-            db = CustomDBManager()
+            db = DBManager()
             ai_params = db.get_latest_params(self.vt_symbol, self.__class__.__name__)
             if ai_params:
                 for key, value in ai_params.items():

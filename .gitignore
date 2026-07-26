@@ -19,7 +19,7 @@ data/*.db
 logs/*.log
 logs/.gitkeep
 
-# 敏感配置文件（必须排除，防止泄露 Token 和密码）
+# 敏感配置文件（必须排除）
 config/system_config.json
 config/accounts_config.json
 config/strategies.json

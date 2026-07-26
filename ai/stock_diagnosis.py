@@ -11,13 +11,13 @@ try:
 except ImportError:
     RET_OK = 0; KLType = None
 
-from core.db_manager import CustomDBManager
+from core.db_manager import DBManager
 
 
 class StockDiagnosis:
     """单票诊股器"""
 
-    def __init__(self, quote_ctx, db: CustomDBManager):
+    def __init__(self, quote_ctx, db: DBManager):
         self.ctx = quote_ctx
         self.db = db
 

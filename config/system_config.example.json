@@ -1,0 +1,64 @@
+{
+    "opend_host": "127.0.0.1",
+    "opend_port": 11111,
+    "futu_account": "",
+    "futu_password": "",
+    "trade_env": "SIMULATE",
+
+    "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "telegram_chat_id": "YOUR_CHAT_ID_HERE",
+    "proxy": "",
+
+    "llm_api_key": "",
+    "llm_model": "deepseek-chat",
+    "llm_base_url": "https://api.deepseek.com/v1",
+
+    "ai_top_n": 25,
+    "auto_register_from_pool": false,
+    "enable_remote_ai": false,
+
+    "optimizer_jobs": 4,
+    "db_path": "data/apollo.db",
+
+    "heartbeat_interval": 1800,
+    "remote_password": "admin123",
+
+    "connection_timeout": 15,
+    "telegram_poll_interval": 3.0,
+    "max_concurrent_strategies": 20,
+    "score_threshold": 6,
+    "stop_loss_pct": 0.008,
+
+    "universe": {
+        "US": ["US.NVDA", "US.AAPL", "US.MSFT", "US.AMZN", "US.META", "US.GOOGL", "US.AMD", "US.TSLA"],
+        "HK": ["HK.00700", "HK.09988"]
+    },
+
+    "subscription": {
+        "max_quota": 300,
+        "periods": ["K_1M", "K_5M", "K_15M", "K_60M"]
+    },
+
+    "prelive_gate": {
+        "hot_reload_interval": 60,
+        "backtest_days": 60,
+        "backtest_interval": "1m",
+        "thresholds": {
+            "min_total_return": 0.0,
+            "min_sharpe_ratio": 0.0,
+            "max_drawdown": 0.30,
+            "min_trade_count": 5,
+            "min_win_rate": 0.35
+        }
+    },
+
+    "cluster": {
+        "cluster_id": "prod-us-east",
+        "instance_type": "CTA_US",
+        "instance_name": "",
+        "registry_file": "data/machine_registry.json",
+        "heartbeat_interval": 30,
+        "redis_url": "",
+        "heartbeat_api": ""
+    }
+}

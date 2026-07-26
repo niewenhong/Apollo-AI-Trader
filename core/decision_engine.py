@@ -6,14 +6,14 @@ import json
 from datetime import datetime
 from typing import Dict, Optional
 
-from core.db_manager import CustomDBManager
+from core.db_manager import DBManager
 from ai.llm_client import LLMClient
 
 
 class DecisionEngine:
     """AI审核引擎 - 全自动参数治理"""
 
-    def __init__(self, db: CustomDBManager, llm: Optional[LLMClient] = None,
+    def __init__(self, db: DBManager, llm: Optional[LLMClient] = None,
                  config: dict = None):
         self.db = db
         self.llm = llm

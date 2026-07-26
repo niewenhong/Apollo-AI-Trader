@@ -40,7 +40,7 @@ class PreliveGate:
 
     def __init__(self, db, thresholds: Optional[Dict] = None):
         """
-        :param db: CustomDBManager 实例
+        :param db: DBManager 实例
         :param thresholds: 门禁阈值覆盖（可选）
         """
         self.db = db

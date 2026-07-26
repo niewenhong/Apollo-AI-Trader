@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.db_manager import CustomDBManager
+from core.db_manager import DBManager
 
 # ── 默认策略种子数据 ──
 # 根据你的实际选股池和偏好修改
@@ -71,7 +71,7 @@ DEFAULT_STRATEGIES = [
 
 
 def seed(db_path=None):
-    db = CustomDBManager(db_path)
+    db = DBManager(db_path)
     print(f"[Seed] 数据库: {db.db_path}")
 
     count = 0

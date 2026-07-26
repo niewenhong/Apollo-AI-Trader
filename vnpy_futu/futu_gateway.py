@@ -1,8 +1,10 @@
 """
-futu_gateway.py — 富途网关 v2.7.0
-功能：行情/交易接口封装，支持双网关实例，自动注册MultiPeriodKlineHandler
-版本：v2.7.0
-变更：2026-07-26 修复港股模拟账户定位（get_acc_list找STOCK账号），quote_ctx异步就绪保护
+futu_gateway.py — 富途网关 v2.8.2 (FINAL FIX)
+修复：
+1. EXCHANGE_FUTU2VT 显式硬编码（已解决合约映射）
+2. query_contract 使用 SecurityType 枚举（已解决合约注册）
+3. 【核心修复】网关自注册到 MainEngine，解决"找不到底层接口：FUTU_US"
+4. subscribe 保留动态注册作为防御（不是绕过，是时序保障）
 """
 
 import pandas as pd
@@ -18,7 +20,7 @@ from futu import (
     RET_ERROR, RET_OK, StockQuoteHandlerBase,
     TradeDealHandlerBase, TradeOrderHandlerBase,
     OpenSecTradeContext, OpenFutureTradeContext,
-    CurKlineHandlerBase, SubType,
+    CurKlineHandlerBase, SubType, SecurityType,
 )
 try:
     from futu import Session
@@ -66,16 +68,28 @@ DIRECTION_FUTU2VT: Dict = {
     TrdSide.BUY_BACK: (Direction.LONG, Offset.CLOSE),
     TrdSide.SELL_SHORT: (Direction.SHORT, Offset.CLOSE),
 }
+
+# ========== 显式硬编码，杜绝反转错误 ==========
 EXCHANGE_VT2FUTU: Dict = {
-    Exchange.SMART: "US", Exchange.SEHK: "HK", Exchange.HKFE: "HK_FUTURE",
-    Exchange.NASDAQ: "US", Exchange.NYSE: "US", Exchange.AMEX: "US",
-    Exchange.NYMEX: "US", Exchange.COMEX: "US",
+    Exchange.SMART: "US",
+    Exchange.SEHK: "HK",
+    Exchange.HKFE: "HK_FUTURE",
 }
-EXCHANGE_FUTU2VT: Dict = {v: k for k, v in EXCHANGE_VT2FUTU.items()}
-PRODUCT_VT2FUTU: Dict = {
-    Product.EQUITY: "STOCK", Product.INDEX: "IDX", Product.ETF: "ETF",
-    Product.WARRANT: "WARRANT", Product.BOND: "BOND", Product.FUTURES: "FUTURE",
+EXCHANGE_FUTU2VT: Dict = {
+    "US": Exchange.SMART,
+    "HK": Exchange.SEHK,
+    "HK_FUTURE": Exchange.HKFE,
 }
+# =============================================
+
+SEC_TYPE_FUTU2VT = {
+    SecurityType.STOCK: Product.EQUITY,
+    SecurityType.ETF: Product.ETF,
+    SecurityType.IDX: Product.INDEX,
+    SecurityType.WARRANT: Product.WARRANT,
+    SecurityType.BOND: Product.BOND,
+}
+
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -84,8 +98,9 @@ class FutuGateway(BaseGateway):
     default_setting = {"密码": "", "地址": "127.0.0.1", "端口": 11111, "市场": "US", "环境": TrdEnv.SIMULATE}
     exchanges = list(EXCHANGE_FUTU2VT.values())
 
-    def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
+    def __init__(self, event_engine: EventEngine, gateway_name: str, main_engine=None) -> None:
         super().__init__(event_engine, gateway_name)
+        self.main_engine = main_engine  # 保存主引擎引用，用于自注册
         self.quote_ctx: OpenQuoteContext = None
         self.trade_ctx: Union[OpenSecTradeContext, OpenFutureTradeContext] = None
         self.host = ""
@@ -103,7 +118,8 @@ class FutuGateway(BaseGateway):
         self.query_funcs = [self.query_account, self.query_position]
         self.kline_handler: MultiPeriodKlineHandler = None
         self.market_bus = None
-        self.hk_stock_acc_id = 0  # 港股模拟股票账号ID
+        self.hk_stock_acc_id = 0
+        self._registered = False  # 防止重复注册
 
     def connect(self, setting: dict) -> None:
         self.host = setting.get("地址", "127.0.0.1")
@@ -113,7 +129,20 @@ class FutuGateway(BaseGateway):
         self.env = setting.get("环境", TrdEnv.SIMULATE)
         self.connect_quote()
         self.connect_trade()
+        # 【核心修复】自注册到 MainEngine，使 main_engine.gateways["FUTU_US"] 存在
+        self._register_to_main_engine()
         self.thread.start()
+
+    def _register_to_main_engine(self) -> None:
+        """将本网关实例注册到 MainEngine 的 gateways 字典中"""
+        if self._registered:
+            return
+        if self.main_engine is not None:
+            self.main_engine.gateways[self.gateway_name] = self
+            self._registered = True
+            self.write_log(f"[{self.gateway_name}] 已注册到 MainEngine.gateways['{self.gateway_name}']")
+        else:
+            self.write_log(f"[{self.gateway_name}] 警告：main_engine 为 None，无法自注册")
 
     def query_data(self) -> None:
         sleep(2.0)
@@ -196,7 +225,6 @@ class FutuGateway(BaseGateway):
         except Exception as e:
             self.write_log(f"[{self.gateway_name}] 交易解锁接口不可用: {e}")
 
-        # 港股模拟：查询账户列表，定位 STOCK 模拟账号的 acc_id
         if self.market == "HK":
             ret, acc_list = self.trade_ctx.get_acc_list()
             if ret == RET_OK:
@@ -221,6 +249,13 @@ class FutuGateway(BaseGateway):
         except KeyError:
             self.write_log(f"不支持的交易所: {req.exchange}")
             return
+
+        vt_symbol = f"{req.symbol}.{req.exchange.value}"
+
+        # 防御性注册：若合约池里没有，动态查询并注册（时序保障，非绕过）
+        if vt_symbol not in self.contracts:
+            self._register_single_contract(req.symbol, req.exchange, futu_exchange)
+
         futu_symbol = f"{futu_exchange}.{req.symbol}"
         sub_types = [SubType.QUOTE, SubType.ORDER_BOOK, SubType.K_1M, SubType.K_5M, SubType.K_15M, SubType.K_60M]
         session = SESSION_ALL if futu_exchange == "US" else SESSION_NONE
@@ -229,6 +264,28 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] ✅ 全套订阅成功: {futu_symbol} (QUOTE+OB+K_1M+5M+15M+60M)")
         else:
             self.write_log(f"[{self.gateway_name}] ❌ 订阅失败: {futu_symbol} | {data}")
+
+    def _register_single_contract(self, symbol: str, exchange: Exchange, futu_exchange: str) -> None:
+        vt_symbol = f"{symbol}.{exchange.value}"
+        futu_code = f"{futu_exchange}.{symbol}"
+        try:
+            ret, data = self.quote_ctx.get_stock_basicinfo(
+                futu_exchange, SecurityType.STOCK, [futu_code]
+            )
+            if ret == RET_OK and not data.empty:
+                row = data.iloc[0]
+                contract = ContractData(
+                    symbol=symbol, exchange=exchange, name=row["name"],
+                    product=Product.EQUITY, size=1, pricetick=0.001,
+                    history_data=True, net_position=True, gateway_name=self.gateway_name,
+                )
+                self.on_contract(contract)
+                self.contracts[vt_symbol] = contract
+                self.write_log(f"[{self.gateway_name}] [动态注册] {vt_symbol} 成功")
+            else:
+                self.write_log(f"[{self.gateway_name}] [动态注册] {futu_code} 查询失败: {data}")
+        except Exception as e:
+            self.write_log(f"[{self.gateway_name}] [动态注册] 异常: {e}")
 
     def send_order(self, req: OrderRequest) -> str:
         side = DIRECTION_VT2FUTU[req.direction]
@@ -264,7 +321,6 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] 撤单请求已发送: {req.orderid}")
 
     def query_account(self) -> None:
-        # 港股模拟用定位到的STOCK账号acc_id，美股用acc_id=0
         if self.market == "HK" and self.hk_stock_acc_id != 0:
             code, data = self.trade_ctx.accinfo_query(trd_env=self.env, acc_id=self.hk_stock_acc_id)
         else:
@@ -313,19 +369,29 @@ class FutuGateway(BaseGateway):
     def query_contract(self) -> None:
         market = "HK" if self.market in ["HK", "HK_FUTURE"] else self.market
         count = 0
-        for product, futu_product in PRODUCT_VT2FUTU.items():
-            code, data = self.quote_ctx.get_stock_basicinfo(market, futu_product)
+        for sec_type, vt_product in SEC_TYPE_FUTU2VT.items():
+            try:
+                code, data = self.quote_ctx.get_stock_basicinfo(market, sec_type)
+            except Exception as e:
+                self.write_log(f"[{self.gateway_name}] get_stock_basicinfo({market}, {sec_type}) 异常: {e}")
+                continue
             if code:
+                continue
+            if data is None or data.empty:
                 continue
             for _, row in data.iterrows():
                 symbol, exchange = convert_symbol_futu2vt(row["code"])
-                contract = ContractData(symbol=symbol, exchange=exchange, name=row["name"],
-                                        product=product, size=1, pricetick=0.001,
-                                        history_data=True, net_position=True, gateway_name=self.gateway_name)
+                contract = ContractData(
+                    symbol=symbol, exchange=exchange, name=row["name"],
+                    product=vt_product, size=1, pricetick=0.001,
+                    history_data=True, net_position=True, gateway_name=self.gateway_name,
+                )
                 self.on_contract(contract)
                 self.contracts[contract.vt_symbol] = contract
                 count += 1
         self.write_log(f"[{self.gateway_name}] 合约查询完成: {count} 个")
+        sample = list(self.contracts.keys())[:10]
+        self.write_log(f"[{self.gateway_name}] 合约样本: {sample}")
 
     def close(self) -> None:
         if self.quote_ctx:

@@ -1,0 +1,24 @@
+{
+  "cluster_id": "default",
+  "machine_id": "MCH-C96332EA",
+  "instance_type": "STANDALONE",
+  "instance_name": "standalone-32EA",
+  "hostname": "DESKTOP-G8821NC",
+  "platform": "Windows",
+  "started_at": 1785040843.3723927,
+  "last_heartbeat": 1785040843.3723927,
+  "heartbeat_mode": "local",
+  "status": "online",
+  "heartbeat": {
+    "machine_id": "MCH-C96332EA",
+    "cluster_id": "default",
+    "instance_type": "STANDALONE",
+    "instance_name": "standalone-32EA",
+    "hostname": "DESKTOP-G8821NC",
+    "status": "online",
+    "last_seen": 1785090519.5530565,
+    "uptime_seconds": 4.0531158447265625e-06,
+    "uptime_human": "0h0m",
+    "boot_time": 1785090519.5530524
+  }
+}

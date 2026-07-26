@@ -18,7 +18,7 @@ try:
 except ImportError:
     BacktestingEngine = None
 
-from core.db_manager import CustomDBManager
+from core.db_manager import DBManager
 
 @dataclass
 class OptimizationResult:
@@ -34,10 +34,10 @@ class OptimizationResult:
 class ParameterOptimizer:
     """参数优化器"""
 
-    def __init__(self, db: CustomDBManager, n_jobs: int = 4,
+    def __init__(self, db: DBManager, n_jobs: int = 4,
                  backtest_params: dict = None, config: dict = None):
         """
-        :param db: CustomDBManager 实例
+        :param db: DBManager 实例
         :param n_jobs: 并行进程数（默认4，如果提供了 config 则被覆盖）
         :param backtest_params: 回测参数字典（如果提供了 config 则被覆盖）
         :param config: 完整的配置字典，自动提取 optimizer 和 backtest 参数
@@ -66,7 +66,7 @@ class ParameterOptimizer:
             }
 
     @classmethod
-    def from_config(cls, db: CustomDBManager, config: dict) -> "ParameterOptimizer":
+    def from_config(cls, db: DBManager, config: dict) -> "ParameterOptimizer":
         """从配置字典创建 ParameterOptimizer 实例（推荐用法）"""
         return cls(db=db, config=config)
 

@@ -1,1 +1,1 @@
-"""core package — Apollo AI Trader v2.7.0"""
+# core 包标识（空文件，不预导入任何子模块）

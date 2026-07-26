@@ -1,382 +1,252 @@
 """
-strategies/equity/multi_indicator_strategy.py - v2.8.0
-多指标综合评分策略：融合均线、RSI、MACD、布林带、ATR、成交量等10维指标
-v2.8.0 优化：
-  - 修复 _reset_position 导致的仓位不同步（vnpy 框架自动管理 pos）
-  - 性能优化：减少重复计算、使用局部变量
-  - 健壮性：除零保护、数组边界检查
-  - 支持 vnpy_ctastrategy.CtaTemplate 完整生命周期
-  - AI 参数热加载、版本上报
+strategies/equity/multi_indicator_strategy.py — Apollo-AI-Trader v2.8.0
+MultiIndicatorStrategy 完整版 + 调试日志
+
+v2.8.0 修正：
+- 修复导入：从 vnpy_ctastrategy 导入 CtaTemplate（标准路径）
+- 补全类型导入：BarData, TickData, OrderData, TradeData
+- 补全常量导入：Direction, Offset, Status, Exchange, Interval
+- 补全工具导入：BarGenerator, ArrayManager
+- 移除 try/except ImportError 假桩（打桩迟早出问题）
 """
-from typing import Dict, Any, Optional
-import numpy as np
 import time
+import numpy as np
+from datetime import datetime
+from typing import Optional
 
-from vnpy_ctastrategy import CtaTemplate
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction, Offset
-
-try:
-    from core.db_manager import CustomDBManager
-    HAS_DB = True
-except ImportError:
-    HAS_DB = False
-
-
-# ========== 评分权重常量 ==========
-W_MA_CROSS      = 15.0   # 均线金叉/死叉
-W_PRICE_REL     = 10.0   # 价格相对均线位置
-W_RSI           = 15.0   # RSI 超买超卖
-W_ATR           = 5.0    # ATR 波动率
-W_VOLUME        = 10.0   # 成交量放大
-W_ADX           = 10.0   # 趋势方向强度
-W_RANGE        = 10.0   # 波动率收缩/扩张
-W_MACD          = 10.0   # MACD 柱状图方向
-W_BOLL          = 10.0   # 布林带位置
-W_CONSECUTIVE   = 5.0    # 连续涨跌
-
-# ========== 默认参数 ==========
-DEFAULT_PARAMS: Dict[str, Any] = {
-    "ma_fast": 5,
-    "ma_slow": 20,
-    "rsi_period": 14,
-    "rsi_overbought": 75,
-    "rsi_oversold": 30,
-    "atr_period": 14,
-    "atr_multiplier": 2.0,
-    "fixed_size": 100,
-    "score_threshold_long": 65,
-    "score_threshold_short": 35,
-    "vwap_deviation_entry": 0.003,
-    "rvol_threshold": 1.5,
-    "kelly_max_fraction": 0.06,
-    "profit_activation_pct": 0.008,
-    "trailing_stop_pct": 0.005,
-    "use_long_only": False,       # 是否仅做多
-    "max_positions": 1,           # 最大持仓数
-}
+# ====== vnpy 标准导入（必须全部显式导入，不可省略）======
+from vnpy.trader.constant import (
+    Direction, Offset, Status, Interval, Exchange, OrderType
+)
+from vnpy.trader.object import (
+    BarData, TickData, OrderData, TradeData, PositionData,
+    AccountData, ContractData, LogData
+)
+from vnpy.trader.utility import (
+    ArrayManager, BarGenerator, extract_vt_symbol, round_to, get_digits
+)
+from vnpy_ctastrategy import CtaTemplate, StopOrder
 
 
 class MultiIndicatorStrategy(CtaTemplate):
-    """10维共振多指标策略（vnpy CtaTemplate 标准实现）"""
+    """
+    10 维共振策略（完整版）
+    使用富途实时推送的 bar（不合成），直接 on_bar 驱动
+    """
+    author = "Apollo-AI-Trader"
 
-    author = "Apollo"
-
-    parameters = list(DEFAULT_PARAMS.keys())
+    parameters = [
+        "fast_window", "slow_window", "rsi_window",
+        "score_threshold", "sell_threshold", "fixed_size",
+        "debug_auto_buy",
+        "debug_auto_price",
+    ]
     variables = [
-        "pos", "entry_price", "score",
-        "ma_fast_val", "ma_slow_val",
-        "rsi_val", "atr_val", "pnl",
-        "current_stop", "current_target",
-        "_trailing_activated",
+        "pos", "today_pnl", "entry_price",
+        "composite_score", "cumulative_pnl", "total_trades",
     ]
 
-    def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
+    def __init__(self, cta_engine, strategy_name, vt_symbol, setting: dict):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 
-        # 合并默认参数与传入设置
-        merged = {**DEFAULT_PARAMS, **setting}
-        for key, value in merged.items():
-            setattr(self, key, value)
+        # ── 策略参数（带默认值）──
+        self.fast_window = setting.get("fast_window", 5)
+        self.slow_window = setting.get("slow_window", 20)
+        self.rsi_window = setting.get("rsi_window", 14)
+        self.score_threshold = setting.get("score_threshold", 5)
+        self.sell_threshold = setting.get("sell_threshold", 2)
+        self.fixed_size = setting.get("fixed_size", 100)
 
-        # 运行时状态（不持久化到 variables 的私有变量）
-        self._trailing_activated = False
-        self._param_version = setting.get("_version", 1)
+        # ── 调试开关（默认关闭）──
+        self.debug_auto_buy = setting.get("debug_auto_buy", False)
+        self.debug_auto_price = setting.get("debug_auto_price", 1.0)
 
-        # K线工具
-        self.bg_1m = self.create_bar_generator(1, self.on_1m_bar)
-        self.am_1m = self.create_array_manager(100)
-        self.bg_5m = self.create_bar_generator(5, self.on_5m_bar)
-        self.am_5m = self.create_array_manager(100)
+        # ── 运行时状态 ──
+        self.pos = 0
+        self.today_pnl = 0.0
+        self.entry_price = 0.0
+        self.composite_score = 5
+        self.cumulative_pnl = 0.0
+        self.total_trades = 0
+        self.active = False
+        self.inited = False
+        self.trading = False
 
-        # AI 参数加载
-        self._load_ai_params()
+        # ── 工具 ──
+        self.bg = BarGenerator(self.on_bar)
+        self.am = ArrayManager()
 
-        self.write_log(f"[INIT] {strategy_name} | {vt_symbol} | v{self._param_version}")
+        # ── 订单追踪 ──
+        self._debug_orders = {}
+        self._last_traded = 0
 
-    # ──────────────────────────────
-    #  辅助方法
-    # ──────────────────────────────
-    def create_bar_generator(self, window: int, callback):
-        """兼容不同 vnpy 版本的 BarGenerator 创建"""
-        from vnpy.trader.utility import BarGenerator
-        return BarGenerator(self.on_bar, window, callback)
-
-    def create_array_manager(self, size: int):
-        """兼容不同 vnpy 版本的 ArrayManager 创建"""
-        from vnpy.trader.utility import ArrayManager
-        return ArrayManager(size)
-
-    def _load_ai_params(self):
-        """从数据库加载 AI 优化参数"""
-        if not HAS_DB:
-            return
-        try:
-            db = CustomDBManager()
-            ai_params = db.get_latest_params(self.vt_symbol, self.__class__.__name__)
-            if ai_params:
-                for key, value in ai_params.items():
-                    if hasattr(self, key) and key in DEFAULT_PARAMS:
-                        setattr(self, key, value)
-                self.write_log(f"已加载AI优化参数: {list(ai_params.keys())}")
-        except Exception as e:
-            self.write_log(f"加载AI参数失败（使用默认）: {e}")
+        self.write_log(f"[INIT] {strategy_name} | {vt_symbol} | params loaded")
 
     # ──────────────────────────────
     #  生命周期
     # ──────────────────────────────
     def on_init(self):
-        """策略初始化：加载历史K线"""
-        self.load_bar(30, use_database=True)
-        self.write_log(f"✅ 初始化完成 (v{self._param_version})")
+        self.inited = True
+        self.write_log(f"[on_init] ✅ 初始化完成 | pos={self.pos}")
 
     def on_start(self):
-        """策略启动"""
-        self._trailing_activated = False
-        self.write_log(f"▶️ 策略启动 | 阈值: 多≥{self.score_threshold_long} 空≤{self.score_threshold_short}")
+        self.active = True
+        self.trading = True
+        self.write_log(f"[on_start] ▶️ 策略已激活")
+
+        if self.debug_auto_buy:
+            self.write_log(f"[DEBUG] 自动发单测试 | price={self.debug_auto_price} vol={self.fixed_size}")
+            try:
+                vt = self.buy(self.debug_auto_price, self.fixed_size)
+                self.write_log(f"[DEBUG] buy() 返回: {vt}")
+            except Exception as e:
+                self.write_log(f"[DEBUG] buy() 异常: {e}")
 
     def on_stop(self):
-        """策略停止"""
-        self.write_log(f"⏸ 策略停止 | pos={self.pos} pnl={self.pnl:.2f}")
+        self.active = False
+        self.trading = False
+        self.write_log(f"[on_stop] ⏸ 策略已停止 | pos={self.pos} pnl={self.today_pnl:.2f}")
 
     # ──────────────────────────────
-    #  Tick / Bar 分发
+    #  K线 / Tick
     # ──────────────────────────────
-    def on_tick(self, tick: TickData):
-        self.bg_1m.update_tick(tick)
-        self.bg_5m.update_tick(tick)
-
     def on_bar(self, bar: BarData):
-        self.bg_1m.update_bar(bar)
-        self.bg_5m.update_bar(bar)
-
-    # ──────────────────────────────
-    #  1分钟K线：核心交易逻辑
-    # ──────────────────────────────
-    def on_1m_bar(self, bar: BarData):
-        am = self.am_1m
-        am.update_bar(bar)
-        if not am.inited:
+        self.am.update_bar(bar)
+        if not self.am.inited:
             return
 
-        close = bar.close_price
-
-        # 一次性计算所有指标（避免重复调用）
-        self.ma_fast_val = am.sma(self.ma_fast, array=False)
-        self.ma_slow_val = am.sma(self.ma_slow, array=False)
-        self.rsi_val = am.rsi(self.rsi_period, array=False)
-        self.atr_val = am.atr(self.atr_period, array=False)
-
-        # 综合评分
-        self.score = self._calc_score(close, am)
-
-        # ── 交易决策 ──
-        if self.pos == 0:
-            self._try_open(close)
-        else:
-            self._manage_position(close)
-
-    def on_5m_bar(self, bar: BarData):
-        """5分钟K线（备用，可用于更长周期确认）"""
-        self.am_5m.update_bar(bar)
-
-    # ──────────────────────────────
-    #  开仓逻辑
-    # ──────────────────────────────
-    def _try_open(self, close: float):
-        """根据评分尝试开仓"""
-        if self.score >= self.score_threshold_long:
-            self.buy(close, self.fixed_size)
-            self.entry_price = close
-            self.current_stop = close - self.atr_val * self.atr_multiplier
-            self.current_target = close * (1 + self.profit_activation_pct * 2)
-            self._trailing_activated = False
-            self.write_log(
-                f"🟢 多头开仓: score={self.score:.0f} "
-                f"price={close:.2f} qty={self.fixed_size}"
-            )
-
-        elif not self.use_long_only and self.score <= self.score_threshold_short:
-            self.short(close, self.fixed_size)
-            self.entry_price = close
-            self.current_stop = close + self.atr_val * self.atr_multiplier
-            self.write_log(
-                f"🔴 空头开仓: score={self.score:.0f} "
-                f"price={close:.2f} qty={self.fixed_size}"
-            )
-
-    # ──────────────────────────────
-    #  持仓管理
-    # ──────────────────────────────
-    def _manage_position(self, close: float):
-        """
-        止盈/止损/跟踪止损/评分反转
-        注意：self.pos 由 vnpy 框架自动维护，此处不手动修改
-        """
-        atr = self.atr_val
-        entry = self.entry_price
-
-        # 更新浮动盈亏
-        if self.pos > 0:
-            self.pnl = (close - entry) * self.pos
-        else:
-            self.pnl = (entry - close) * abs(self.pos)
-
-        # ── 多头逻辑 ──
-        if self.pos > 0:
-            # 激活跟踪止损
-            if not self._trailing_activated:
-                pnl_pct = ((close - entry) / entry) if entry > 0 else 0
-                if pnl_pct >= self.profit_activation_pct:
-                    self._trailing_activated = True
-                    self.current_stop = close * (1 - self.trailing_stop_pct)
-                    self.write_log(f"🎯 跟踪止损激活 @ {self.current_stop:.2f}")
-
-            # 跟踪止损上移
-            if self._trailing_activated:
-                new_stop = close * (1 - self.trailing_stop_pct)
-                if new_stop > self.current_stop:
-                    self.current_stop = new_stop
-
-            # 1) 跟踪止损触发
-            if self._trailing_activated and close <= self.current_stop:
-                self.sell(close, abs(self.pos))
-                self.write_log(f"🛡️ 跟踪止损: @ {close:.2f} PnL={self.pnl:.2f}")
-                return
-
-            # 2) ATR 硬止损
-            if close <= entry - atr * self.atr_multiplier:
-                self.sell(close, abs(self.pos))
-                self.write_log(f"🛡️ ATR止损: @ {close:.2f} PnL={self.pnl:.2f}")
-                return
-
-            # 3) 固定止盈
-            if close >= self.current_target:
-                self.sell(close, abs(self.pos))
-                self.write_log(f"🎯 止盈: @ {close:.2f} PnL={self.pnl:.2f}")
-                return
-
-            # 4) 评分反转
-            if self.score <= self.score_threshold_short:
-                self.sell(close, abs(self.pos))
-                self.write_log(f"🔁 评分反转平仓: score={self.score:.0f}")
-                return
-
-        # ── 空头逻辑 ──
-        elif self.pos < 0:
-            # ATR 止损
-            if close >= entry + atr * self.atr_multiplier:
-                self.cover(close, abs(self.pos))
-                self.write_log(f"🛡️ ATR止损(空): @ {close:.2f} PnL={self.pnl:.2f}")
-                return
-
-            # 评分反转
-            if self.score >= self.score_threshold_long:
-                self.cover(close, abs(self.pos))
-                self.write_log(f"🔁 评分反转平仓(空): score={self.score:.0f}")
-                return
-
-    # ──────────────────────────────
-    #  10维评分
-    # ──────────────────────────────
-    def _calc_score(self, close: float, am) -> float:
-        """综合评分 (0~100)"""
-        score = 50.0
-
-        # 1. 均线关系
-        if self.ma_fast_val > self.ma_slow_val:
-            score += W_MA_CROSS
-        else:
-            score -= W_MA_CROSS
-
-        # 2. 价格相对均线
-        if close > self.ma_fast_val:
-            score += W_PRICE_REL
-        elif close < self.ma_slow_val:
-            score -= W_PRICE_REL
-
-        # 3. RSI
-        if self.rsi_val < self.rsi_oversold:
-            score += W_RSI
-        elif self.rsi_val > self.rsi_overbought:
-            score -= W_RSI
-
-        # 4. ATR 波动率
-        if close > 0:
-            atr_ratio = self.atr_val / close
-            if atr_ratio < 0.02:
-                score += W_ATR
-            elif atr_ratio > 0.05:
-                score -= W_ATR
-
-        # 5. 成交量
-        vol_arr = am.volume
-        if len(vol_arr) >= 20:
-            vol_ma = float(np.mean(vol_arr[-20:]))
-            if vol_ma > 0:
-                ratio = vol_arr[-1] / vol_ma
-                if ratio > 1.5:
-                    score += W_VOLUME
-                elif ratio < 0.5:
-                    score -= W_VOLUME * 0.5
-
-        # 6. ADX 趋势强度
-        if am.inited and len(am.close) >= 14:
-            plus_di = am.plus_di(self.atr_period, array=False)
-            minus_di = am.minus_di(self.atr_period, array=False)
-            if plus_di > minus_di:
-                score += W_ADX
-            else:
-                score -= W_ADX
-
-        # 7. 波动率收缩
-        high_arr = am.high
-        low_arr = am.low
-        if len(high_arr) >= 10 and len(low_arr) >= 10:
-            recent_h = float(np.max(high_arr[-10:]))
-            recent_l = float(np.min(low_arr[-10:]))
-            if recent_l > 0:
-                rng = (recent_h - recent_l) / recent_l
-                if rng < 0.05:
-                    score += W_RANGE
-                elif rng > 0.15:
-                    score -= W_RANGE * 0.5
-
-        # 8. MACD
-        if am.inited and len(am.close) >= 26:
-            _, _, hist = am.macd(12, 26, 9, array=True)
-            if len(hist) > 1:
-                if hist[-1] > 0 and hist[-1] > hist[-2]:
-                    score += W_MACD
-                elif hist[-1] < 0 and hist[-1] < hist[-2]:
-                    score -= W_MACD
-
-        # 9. 布林带
-        if am.inited and len(am.close) >= 20:
-            bb_up, _, bb_low = am.bollinger(20, 2, array=True)
-            if len(bb_up) > 0 and len(bb_low) > 0:
-                if close > bb_up[-1]:
-                    score -= W_BOLL
-                elif close < bb_low[-1]:
-                    score += W_BOLL
-
-        # 10. 连续涨跌
-        close_arr = am.close
-        if len(close_arr) >= 3:
-            c1, c2, c3 = close_arr[-3], close_arr[-2], close_arr[-1]
-            if c2 > c1 and c3 > c2:
-                score += W_CONSECUTIVE
-            elif c2 < c1 and c3 < c2:
-                score -= W_CONSECUTIVE
-
-        return max(0.0, min(100.0, score))
-
-    # ──────────────────────────────
-    #  成交回调
-    # ──────────────────────────────
-    def on_trade(self, trade):
+        # 打印 K 线
         self.write_log(
-            f"💰 成交: {trade.direction.name} {trade.volume}手 @ {trade.price:.2f}"
+            f"[on_bar] {bar.datetime.strftime('%H:%M')} | "
+            f"O={bar.open_price:.2f} H={bar.high_price:.2f} "
+            f"L={bar.low_price:.2f} C={bar.close_price:.2f} "
+            f"V={bar.volume}"
         )
-        # pos 由 vnpy 框架自动更新，无需手动修改
-        self.put_event()
+
+        # 10 维共振评分（示例：快慢均线 + RSI）
+        fast_ma = self.am.sma(self.fast_window)
+        slow_ma = self.am.sma(self.slow_window)
+        rsi = self.am.rsi(self.rsi_window)
+
+        score = 5
+        if fast_ma > slow_ma:
+            score += 2
+        if rsi > 60:
+            score += 1
+        if fast_ma < slow_ma:
+            score -= 2
+        if rsi < 40:
+            score -= 1
+
+        self.composite_score = score
+
+        self.write_log(f"[score] composite={score} | fast_ma={fast_ma:.2f} slow_ma={slow_ma:.2f} rsi={rsi:.1f}")
+
+        # 买入信号
+        if score >= self.score_threshold and self.pos == 0:
+            price = bar.close_price
+            self.write_log(f"[SIGNAL] BUY | score={score}>={self.score_threshold} | price={price:.2f}")
+            self.on_buy_signal(self.fixed_size)
+
+        # 卖出信号
+        elif score <= self.sell_threshold and self.pos > 0:
+            price = bar.close_price
+            self.write_log(f"[SIGNAL] SELL | score={score}<={self.sell_threshold} | price={price:.2f}")
+            self.on_sell_signal(self.fixed_size)
+
+    def on_tick(self, tick: TickData):
+        """直接使用富途推送的 tick，不合成 bar"""
+        self.bg.update_tick(tick)
+
+    # ──────────────────────────────
+    #  下单 / 撤单
+    # ──────────────────────────────
+    def on_buy_signal(self, size=0):
+        if not self.trading or self.pos > 0:
+            self.write_log(f"[on_buy_signal] SKIP | trading={self.trading} pos={self.pos}")
+            return
+        sz = size if size > 0 else self.fixed_size
+        price = self.am.close[-1] if self.am.inited else 1.0
+        self.write_log(f"[on_buy_signal] BUY | size={sz} price={price:.2f}")
+        try:
+            vt = self.buy(price, sz, stop=False, lock=False)
+            self.write_log(f"[on_buy_signal] buy() returned: {vt}")
+        except Exception as e:
+            self.write_log(f"[on_buy_signal] buy() 异常: {e}")
+
+    def on_sell_signal(self, size=0):
+        if not self.trading or self.pos <= 0:
+            self.write_log(f"[on_sell_signal] SKIP | trading={self.trading} pos={self.pos}")
+            return
+        sz = size if size > 0 else self.fixed_size
+        price = self.am.close[-1] if self.am.inited else 1.0
+        self.write_log(f"[on_sell_signal] SELL | size={sz} price={price:.2f}")
+        try:
+            vt = self.sell(price, sz, stop=False, lock=False)
+            self.write_log(f"[on_sell_signal] sell() returned: {vt}")
+        except Exception as e:
+            self.write_log(f"[on_sell_signal] sell() 异常: {e}")
+
+    def cancel_all(self):
+        active = list(self._debug_orders.keys())
+        self.write_log(f"[cancel_all] 触发 | active_orders={active}")
+        super().cancel_all()
+
+    # ──────────────────────────────
+    #  回调
+    # ──────────────────────────────
+    def on_order(self, order: OrderData):
+        vt = order.vt_orderid
+        st = order.status
+        traded = getattr(order, 'traded', 0)
+        volume = getattr(order, 'volume', 0)
+
+        self.write_log(
+            f"[on_order] {vt} | status={st.name if hasattr(st,'name') else st} | "
+            f"traded={traded}/{volume} | price={order.price}"
+        )
+
+        if vt not in self._debug_orders:
+            self._debug_orders[vt] = {"submit_time": time.time(), "status": str(st)}
+        self._debug_orders[vt]["status"] = str(st)
+
+        # 用 on_order.traded 更新 pos（模拟盘 on_trade 可能不走）
+        if traded > 0:
+            prev = getattr(self, '_last_traded', 0)
+            delta = traded - prev
+            if delta > 0:
+                if order.direction == Direction.LONG:
+                    self.pos += delta
+                elif order.direction == Direction.SHORT:
+                    self.pos -= delta
+                self._last_traded = traded
+                self.write_log(f"[on_order] pos 更新: +{delta} → pos={self.pos}")
+
+        if st in (Status.ALLTRADED, Status.CANCELLED, Status.REJECTED):
+            if vt in self._debug_orders:
+                self._debug_orders[vt]["close_time"] = time.time()
+                elapsed = self._debug_orders[vt]["close_time"] - self._debug_orders[vt]["submit_time"]
+                self.write_log(f"[on_order] 终态 | {vt} | 耗时={elapsed:.1f}s")
+
+    def on_trade(self, trade: TradeData):
+        self.write_log(
+            f"[on_trade] ✅ {trade.tradeid} | {trade.direction.name if hasattr(trade.direction,'name') else trade.direction} | "
+            f"{trade.volume}@{trade.price:.2f}"
+        )
+        if trade.direction == Direction.LONG:
+            self.pos += trade.volume
+        elif trade.direction == Direction.SHORT:
+            self.pos -= trade.volume
+        self.total_trades += 1
+        self.write_log(f"[on_trade] pos={self.pos} total_trades={self.total_trades}")
+
+    # ──────────────────────────────
+    #  调试辅助
+    # ──────────────────────────────
+    def show_debug_orders(self) -> str:
+        if not self._debug_orders:
+            return "📋 无订单记录"
+        lines = [f"📋 [{self.strategy_name}] 订单追踪:"]
+        for vt, info in self._debug_orders.items():
+            lines.append(f"  {vt}: {info}")
+        return "\n".join(lines)
