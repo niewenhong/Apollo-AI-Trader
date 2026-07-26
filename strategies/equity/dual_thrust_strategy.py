@@ -1,140 +1,159 @@
 """
-strategies/equity/dual_thrust_strategy.py - v2.6.0
-双突破策略：基于开盘区间突破 + 市场状态切换
-支持趋势/震荡模式自适应，配合ATR动态调整突破幅度
+strategies/equity/dual_thrust_strategy.py - v2.8.0
+Dual Thrust 开盘区间突破策略
+v2.8.0 优化：继承 ApolloBaseStrategy，统一接口规范
 """
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
 import numpy as np
 
+from vnpy.trader.object import BarData, TickData
+from vnpy.trader.constant import Direction
 
-class DualThrustStrategy(CtaTemplate):
+from strategies.base_strategy import ApolloBaseStrategy
+
+
+class DualThrustStrategy(ApolloBaseStrategy):
+    """Dual Thrust 开盘区间突破策略"""
+
     author = "Apollo"
 
-    parameters = [
-        "k1",                # 上轨系数（突破买入）
-        "k2",                # 下轨系数（突破卖出）
-        "lookback_days",     # 回溯天数
-        "fixed_size",        # 固定交易数量
-        "use_market_filter", # 是否启用市场状态过滤
+    parameters = ApolloBaseStrategy.parameters + [
+        "lookback_period",      # 回看周期（计算区间用）
+        "kshort",               # 上轨系数（做多突破）
+        "klong",                # 下轨系数（做空突破）
+        "atr_period",           # ATR 周期
+        "use_atr_range",        # 用ATR代替固定区间
+        "session_open_hour",    # 开盘时间（小时）
+        "session_open_minute",  # 开盘时间（分钟）
+    ]
+    variables = ApolloBaseStrategy.variables + [
+        "upper_band", "lower_band",
+        "range_val", "open_price",
     ]
 
-    variables = [
-        "pos", "entry_price", "up_line", "down_line",
-        "today_open", "market_state", "pnl"
-    ]
+    DEFAULTS = {
+        **ApolloBaseStrategy.DEFAULTS,
+        "lookback_period": 10,
+        "kshort": 0.5,
+        "klong": 0.5,
+        "atr_period": 14,
+        "use_atr_range": True,
+        "session_open_hour": 9,
+        "session_open_minute": 30,
+    }
 
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+    def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.pos = 0
-        self.entry_price = 0.0
-        self.up_line = 0.0
-        self.down_line = 0.0
-        self.today_open = 0.0
-        self.market_state = "unknown"  # trend, range, unknown
-        self.pnl = 0.0
-        self.bg = BarGenerator(self.on_bar)
-        self.am = ArrayManager(size=100)
+
+        self.upper_band = 0.0
+        self.lower_band = 0.0
+        self.range_val = 0.0
+        self.open_price = 0.0
+        self._session_open = False
+        self._daily_highest = 0.0
+        self._daily_lowest = 0.0
+
+        from vnpy.trader.utility import BarGenerator, ArrayManager
+        self.bg = BarGenerator(self.on_bar, 1, self.on_1m_bar)
+        self.am = ArrayManager(100)
 
     def on_init(self):
-        self.load_bar(30, use_database=True)
-        self.write_log("DualThrust策略初始化完成")
-
-    def on_start(self):
-        self.write_log("DualThrust策略启动")
-
-    def on_stop(self):
-        self.write_log("DualThrust策略停止")
+        super().on_init()
+        self.write_log(f"DualThrust初始化 | 回看={self.lookback_period} kshort={self.kshort} klong={self.klong}")
 
     def on_tick(self, tick: TickData):
         self.bg.update_tick(tick)
 
     def on_bar(self, bar: BarData):
-        self.am.update_bar(bar)
-        if not self.am.inited:
+        self.bg.update_bar(bar)
+
+    def on_1m_bar(self, bar: BarData):
+        """1分钟K线核心逻辑"""
+        am = self.am
+        am.update_bar(bar)
+        if not am.inited:
             return
 
-        # 每天开盘重置轨道
-        if self.today_open == 0:
-            self.today_open = bar.open_price
-            self._calculate_lines(bar)
+        close = bar.close_price
 
-        # 判断市场状态（趋势/震荡）
-        if self.use_market_filter:
-            self._update_market_state(bar)
+        # 每日开盘初始化
+        if self._is_session_open(bar.datetime):
+            if not self._session_open:
+                self._session_open = True
+                self._daily_highest = bar.high_price
+                self._daily_lowest = bar.low_price
+                self.open_price = close
 
-        # 交易逻辑
-        if self.pos == 0:
-            # 突破上轨买入（趋势模式下优先）
-            if bar.close_price > self.up_line:
-                if self.market_state != "range":
-                    self.buy(bar.close_price, self.fixed_size)
-                    self.entry_price = bar.close_price
-                    self.write_log(f"突破买入: 价格{bar.close_price:.2f} > 上轨{self.up_line:.2f}")
-            # 突破下轨卖出
-            elif bar.close_price < self.down_line:
-                if self.market_state != "range":
-                    self.short(bar.close_price, self.fixed_size)
-                    self.entry_price = bar.close_price
-                    self.write_log(f"突破卖出: 价格{bar.close_price:.2f} < 下轨{self.down_line:.2f}")
+                # 计算当日开盘区间
+                self._calc_range(am)
+                self.write_log(
+                    f"📊 开盘区间 | open={self.open_price:.2f} "
+                    f"range={self.range_val:.2f} "
+                    f"upper={self.upper_band:.2f} lower={self.lower_band:.2f}"
+                )
         else:
-            self._manage_position(bar)
+            self._session_open = False
+            self._daily_highest = max(self._daily_highest, bar.high_price)
+            self._daily_lowest = min(self._daily_lowest, bar.low_price)
 
-        # 收盘重置（第二天）
-        if bar.datetime.time() >= self._get_market_close_time():
-            self.today_open = 0.0
-            self.up_line = 0.0
-            self.down_line = 0.0
-
-    def _calculate_lines(self, bar: BarData):
-        """计算今日上下轨"""
-        if len(self.am.high) < self.lookback_days:
+        # 区间未计算则不交易
+        if self.range_val <= 0:
             return
 
-        # 取过去N天的最高High和最低Low
-        hh = np.max(self.am.high[-self.lookback_days:-1])
-        ll = np.min(self.am.low[-self.lookback_days:-1])
-
-        # 计算Range
-        range_val = hh - ll
-
-        # 上下轨
-        self.up_line = self.today_open + self.k1 * range_val
-        self.down_line = self.today_open - self.k2 * range_val
-
-    def _update_market_state(self, bar: BarData):
-        """更新市场状态：趋势/震荡"""
-        if len(self.am.close) < 20:
-            return
-
-        # 用ADX判断趋势强度
-        adx = self.am.atr(14) / np.mean(self.am.close[-14:]) * 100
-        if adx > 25:
-            self.market_state = "trend"
-        else:
-            self.market_state = "range"
-
-    def _manage_position(self, bar: BarData):
-        """管理持仓：反向突破平仓"""
+        # ── 持仓管理 ──
         if self.pos > 0:
-            # 多头：跌破下轨平仓
-            if bar.close_price < self.down_line:
-                self.sell(bar.close_price, abs(self.pos))
-                self.write_log("多头平仓: 跌破下轨")
-        elif self.pos < 0:
-            # 空头：突破上轨平仓
-            if bar.close_price > self.up_line:
-                self.cover(bar.close_price, abs(self.pos))
-                self.write_log("空头平仓: 突破上轨")
+            # 多头止损
+            if close <= self.lower_band:
+                self.sell(close, abs(self.pos))
+                self.write_log(f"🔁 DualThrust反转 | 多→空 @ {close:.2f}")
+                # 反转开空
+                self.short(close, self.fixed_size)
+                return
+            if self.update_trailing_stop(close):
+                self.sell(close, abs(self.pos))
+                self.write_log(f"🛡️ DualThrust止损(多) @ {close:.2f}")
+                return
 
-    def _get_market_close_time(self):
-        """获取市场收盘时间（简化）"""
-        from datetime import time
-        if "SEHK" in self.vt_symbol:
-            return time(16, 0)
+        elif self.pos < 0:
+            if close >= self.upper_band:
+                self.cover(close, abs(self.pos))
+                self.write_log(f"🔁 DualThrust反转 | 空→多 @ {close:.2f}")
+                self.buy(close, self.fixed_size)
+                return
+            if self.update_trailing_stop(close):
+                self.cover(close, abs(self.pos))
+                self.write_log(f"🛡️ DualThrust止损(空) @ {close:.2f}")
+                return
+
+        # ── 开仓 ──
         else:
-            return time(16, 0)  # 美股简化
+            if close > self.upper_band:
+                self.buy(close, self.fixed_size)
+                self.write_log(f"🟢 突破做多 | close={close:.2f} > upper={self.upper_band:.2f}")
+            elif close < self.lower_band:
+                self.short(close, self.fixed_size)
+                self.write_log(f"🔴 突破做空 | close={close:.2f} < lower={self.lower_band:.2f}")
+
+    def _calc_range(self, am):
+        """计算开盘区间（最高-最低 或 ATR）"""
+        if self.use_atr_range and len(am.high) >= self.atr_period:
+            atr = am.atr(self.atr_period, array=False)
+            self.range_val = atr
+        elif len(am.high) >= self.lookback_period:
+            period_high = float(np.max(am.high[-self.lookback_period:]))
+            period_low = float(np.min(am.low[-self.lookback_period:]))
+            self.range_val = period_high - period_low
+        else:
+            self.range_val = 0.0
+
+        self.upper_band = self.open_price + self.range_val * self.kshort
+        self.lower_band = self.open_price - self.range_val * self.klong
+
+    def _is_session_open(self, bar_datetime) -> bool:
+        """判断是否为开盘时刻"""
+        h = bar_datetime.hour if hasattr(bar_datetime, 'hour') else bar_datetime.get('hour', 0)
+        m = bar_datetime.minute if hasattr(bar_datetime, 'minute') else bar_datetime.get('minute', 0)
+        return (h == self.session_open_hour and m >= self.session_open_minute)
 
     def on_trade(self, trade):
-        self.write_log(f"DualThrust成交: {trade.direction.name} {trade.volume}手 @ {trade.price}")
+        super().on_trade(trade)
+        self.write_log(f"💰 DT成交: {trade.direction.name} {trade.volume}@{trade.price:.2f}")

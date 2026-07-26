@@ -1,1 +1,0 @@
-from strategies.equity.multi_indicator_strategy import MultiIndicatorStrategy
