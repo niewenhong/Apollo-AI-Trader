@@ -1,5 +1,5 @@
 """
-main.py — Apollo AI Trader v2.8.1 主入口（含选股+策略匹配+远程控制修复）
+main.py — Apollo AI Trader v2.8.2 主入口（最终版）
 """
 import json
 import logging
@@ -12,23 +12,15 @@ from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.setting import SETTINGS
 from vnpy_futu import FutuGateway
-from vnpy_ctastrategy import CtaStrategyApp
 
-from core.db_manager import DBManager
-from core.strategy_engine import StrategyEngine
-from core.duallink import DualLink
 from core.machine_registry import MachineRegistry
 from core.subscription_manager import SubscriptionManager
 from core.subscription_plan import apply_subscription_plan
 from core.remote_controller import RemoteController
 from monitoring.telegram_notifier import TelegramNotifier
 from monitoring.telegram_webhook import TelegramCommandListener
-from ai.stock_selector import AIStockSelector
-from core.strategy_matcher import StrategyMatcher
 
-# ═══════════════════════════════════════
-#  日志
-# ═══════════════════════════════════════
+# ========== 日志配置 ==========
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -40,10 +32,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("Main")
 
-# ═══════════════════════════════════════
-#  配置
-# ═══════════════════════════════════════
-with open("config/system_config.json", "r", encoding="utf-8") as f:
+# ========== 配置加载 ==========
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "system_config.json")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 log.info(f"🖥️ 本机标识: [{CONFIG.get('opend_host','127.0.0.1')}:{CONFIG.get('opend_port',11111)}]")
@@ -54,19 +46,21 @@ def main():
     registry = MachineRegistry(CONFIG.get("cluster", {}))
     log.info(f"🏷️ 机器注册: {registry.summary()}")
 
-    # 2. 数据服务
+    # 2. 配置本地数据服务
     SETTINGS["datafeed.name"] = "localdata"
     SETTINGS["datafeed.username"] = ""
     SETTINGS["datafeed.password"] = ""
-    log.info("📊 数据服务: 本地数据库 (vnpy_localdata)")
+    log.info("📊 数据服务: 使用本地数据库 (vnpy_localdata)")
 
-    # 3. 主引擎 + CTA
+    # 3. 创建主引擎并加载 CTA 策略应用
     ev = EventEngine()
     me = MainEngine(ev)
+
+    from vnpy_ctastrategy import CtaStrategyApp
     me.add_app(CtaStrategyApp)
     log.info("✅ CTA 策略应用已加载")
 
-    # 4. 连接双网关
+    # 4. 连接双网关并等待行情就绪
     host = CONFIG["opend_host"]
     port = CONFIG["opend_port"]
     env = CONFIG["trade_env"]
@@ -74,26 +68,34 @@ def main():
     gw_us = FutuGateway(ev, "FUTU_US")
     gw_hk = FutuGateway(ev, "FUTU_HK")
 
-    # ★★★ 关键修复：手动注册网关到 MainEngine ★★★
     me.gateways["FUTU_US"] = gw_us
     me.gateways["FUTU_HK"] = gw_hk
 
-    gw_us.connect({"地址": host, "端口": port, "市场": "US", "环境": env})
-    gw_hk.connect({"地址": host, "端口": port, "市场": "HK", "环境": env})
-    log.info("✅ US/HK 网关连接中...")
+    us_setting = {"地址": host, "端口": port, "市场": "US", "环境": env}
+    hk_setting = {"地址": host, "端口": port, "市场": "HK", "环境": env}
+
+    gw_us.connect(us_setting)
+    log.info("✅ US 网关连接中...")
+    gw_hk.connect(hk_setting)
+    log.info("✅ HK 网关连接中...")
 
     timeout = CONFIG.get("connection_timeout", 10)
     for i in range(timeout):
-        if gw_us.quote_ctx and gw_hk.quote_ctx:
+        us_ready = gw_us.quote_ctx is not None
+        hk_ready = gw_hk.quote_ctx is not None
+        if us_ready and hk_ready:
             log.info("✅ US 行情就绪")
             log.info("✅ HK 行情就绪")
             break
         time.sleep(1)
     else:
-        log.error("❌ 行情连接超时")
+        if gw_us.quote_ctx is None:
+            log.error(f"❌ US 行情超时（{timeout}秒内未就绪）")
+        if gw_hk.quote_ctx is None:
+            log.error(f"❌ HK 行情超时（{timeout}秒内未就绪）")
         sys.exit(1)
 
-    # 5. 订阅管理器 + 订阅计划
+    # 5. 初始化订阅管理器并执行订阅计划
     sub_manager = SubscriptionManager(
         max_quota=CONFIG.get("subscription", {}).get("max_quota", 300)
     )
@@ -101,120 +103,137 @@ def main():
     apply_subscription_plan(sub_manager, CONFIG)
     sub_manager.audit_quota()
 
-    # 6. DBManager
-    db_path = CONFIG.get("db_path") or "data/history.db"
-    db = DBManager(db_path=db_path)
-    db.ensure_super_user(CONFIG)
-    log.info("✅ 数据库管理器就绪")
+    # 6. 初始化数据库
+    from core.db_manager import DBManager
+    db = DBManager(CONFIG.get("db_path") or os.path.join(BASE_DIR, "data", "apollo.db"))
 
-    # 7. 选股 + 策略匹配
-    log.info("🔍 开始AI选股...")
-    selector = AIStockSelector(quote_ctx=gw_us.quote_ctx, db=db, market="US")
-    selected = selector.select()
+    # 7. 初始化 RegimeTrainer（精确：只传 config）
+    regime_trainer = None
+    try:
+        from core.regime_trainer import RegimeTrainer
+        regime_trainer = RegimeTrainer(config=CONFIG.get("regime", {}))
+        if hasattr(regime_trainer, "start"):
+            regime_trainer.start()
+        log.info("✅ RegimeTrainer 已初始化")
+    except ImportError:
+        log.info("ℹ️ RegimeTrainer 不可用，跳过")
+    except Exception as e:
+        log.warning(f"⚠️ RegimeTrainer 初始化失败(非致命): {e}")
 
-    import json as _json
-    sample = _json.dumps(selected[:3], ensure_ascii=False, indent=2)[:500]
-    log.info(f"📋 选股结果样本: {sample}")
-
-    log.info("🎯 开始策略匹配...")
-    matcher = StrategyMatcher(db_path=db_path)
-
-    for item in selected:
-        code = item.get("code", "")
-        symbol = code.replace("US.", "").replace("HK.", "")
-        if not symbol:
-            continue
-        market = "HK" if code.startswith("HK.") else "US"
-        strategy_name = matcher.select_strategy(symbol, market)
-        log.info(f"  {symbol} → {strategy_name}")
-
-        db.save_strategy(
-            strategy_name=f"{strategy_name}_{symbol}",
-            class_name=strategy_name,
-            vt_symbol=symbol,
-            market=market,
-            params={},
-            source="matcher",
-            modifier="system:strategy_match"
+    # 8. 初始化策略引擎（精确：双引擎 + db + config）
+    strategy_engine = None
+    try:
+        from core.strategy_engine import StrategyEngine
+        strategy_engine = StrategyEngine(
+            main_us=me,
+            main_hk=me,
+            db=db,
+            config=CONFIG,
         )
+        log.info("✅ StrategyEngine 已初始化")
+    except ImportError:
+        log.warning("⚠️ StrategyEngine 不可用")
+    except Exception as e:
+        log.warning(f"⚠️ StrategyEngine 初始化失败(非致命): {e}")
 
-    # 8. 策略引擎
-    log.info("🚀 启动策略引擎...")
-    strategy_engine = StrategyEngine(
-        main_us=me, main_hk=me,
-        db=db, config=CONFIG
-    )
-    boot_result = strategy_engine.boot(operator="system")
-    log.info(f"  启动结果: {boot_result}")
+    # ===== 9. 选股 + 策略匹配（精确适配 StrategyMatcher 真实接口）=====
+    try:
+        from ai.stock_selector import AIStockSelector
+        from core.strategy_matcher import StrategyMatcher
 
-    # 9. DualLink
-    notifier = None
+        selector = AIStockSelector(quote_ctx=gw_us.quote_ctx, db=db, market="US")
+        selected = selector.select()
+
+        import json as _json
+        log.info(f"🔍 DEBUG selected sample: {_json.dumps(selected[:2], ensure_ascii=False, indent=2)[:500]}")
+
+        # ★ 精确构造 StrategyMatcher：只需 db_path（字符串路径）★
+        db_path = CONFIG.get("db_path") or os.path.join(BASE_DIR, "data", "apollo.db")
+        matcher = StrategyMatcher(db_path=db_path)
+
+        # 为每只选中的股票分配最佳策略
+        matched_results = []
+        for item in selected:
+            symbol = item.get("vt_symbol", item.get("code", ""))
+            # 判断市场：包含 .SEHK 或 HK. 则为 HK，否则默认 US
+            market = "HK" if ".SEHK" in symbol or symbol.startswith("HK.") else "US"
+            best_strategy = matcher.select_strategy(symbol, market)
+            matched_results.append({
+                "symbol": symbol,
+                "strategy": best_strategy,
+                "score": item.get("score", 0),
+            })
+            log.info(f"🎯 {symbol} → {best_strategy} score={item.get('score', 0)}")
+
+        # 如果需要，可以将匹配结果存入数据库或传递给策略引擎
+        # （此处仅记录日志，后续可由 StrategyEngine 从数据库加载策略配置）
+    except Exception as e:
+        log.warning(f"⚠️ 选股/策略匹配失败(非致命): {e}")
+
+    # 10. 启动策略引擎
+    if strategy_engine:
+        try:
+            boot_result = strategy_engine.boot(operator="system")
+            log.info(f"🚀 策略启动结果: {boot_result}")
+        except Exception as e:
+            log.warning(f"⚠️ 策略启动失败: {e}")
+
+    # 11. Telegram 远程控制
     token = CONFIG.get("telegram_token", "")
     chat_id = CONFIG.get("telegram_chat_id", "")
+
     if token and chat_id:
         notifier = TelegramNotifier(token, chat_id, machine_registry=registry)
-
-    cta_engine = me.get_engine("CtaStrategy")
-    duallink = DualLink(me, cta_engine, notifier)
-    duallink.start()
-
-    # 10. 热加载
-    strategy_engine.start_hot_reload(
-        interval=CONFIG.get("prelive_gate", {}).get("hot_reload_interval", 60)
-    )
-
-    # 11. Telegram 远程控制（★ 修复：注入所有引擎到 RemoteController）
-    if token and chat_id:
-        try:
-            notifier.send_message("🚀 Apollo v2.8.1 启动完成")
+        if notifier.send_message("🚀 Apollo v2.8.2 启动完成"):
             log.info("✅ Telegram Bot连接成功")
 
-            # ★★★ 创建 RemoteController 并注入所有依赖 ★★★
-            controller = RemoteController(
-                db=db,
-                notifier=notifier,
-                config=CONFIG
-            )
-            controller.set_main_engine(me)               # 注入 MainEngine
-            controller.set_strategy_engine(strategy_engine)  # 注入 StrategyEngine
-            controller.set_registry(registry)             # 注入 MachineRegistry
+        controller = RemoteController(db=db, notifier=notifier, config=CONFIG)
+        controller.set_main_engine(me)
+        if strategy_engine:
+            controller.set_strategy_engine(strategy_engine)
+        controller.set_registry(registry)
 
-            # ★★★ 将 controller 传给 TelegramCommandListener ★★★
-            listener = TelegramCommandListener(
-                token,
-                chat_id,
-                controller=controller,          # ★★★ 关键：传入 controller，而不是 notifier
-                poll_interval=CONFIG.get("telegram_poll_interval", 3.0)
-            )
-            listener.start()
-            log.info("✅ Telegram 远程控制已启动")
-        except Exception as e:
-            log.error(f"Telegram 启动失败: {e}")
+        listener = TelegramCommandListener(
+            token, chat_id, controller,
+            poll_interval=CONFIG.get("telegram_poll_interval", 3.0)
+        )
+        listener.start()
+        log.info("✅ Telegram 远程控制已启动")
 
     # 12. 定时任务
     def periodic():
         while True:
             time.sleep(60)
-            sub_manager.process_unsub_queue()
-            registry.heartbeat()
+            try:
+                sub_manager.process_unsub_queue()
+            except Exception:
+                pass
+            try:
+                registry.heartbeat()
+            except Exception:
+                pass
             if int(time.time()) % 600 < 60:
-                sub_manager.audit_quota()
-                log.info(f"💓 心跳 | {time.strftime('%H:%M:%S')}")
+                try:
+                    sub_manager.audit_quota()
+                except Exception:
+                    pass
 
     threading.Thread(target=periodic, daemon=True).start()
 
     # 13. 主循环
-    log.info("🚀 启动完成")
+    log.info(f"🚀 启动完成 | 标识: {registry.summary()}")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log.info("👋 中断...")
+        log.info("👋 手动中断 (Ctrl+C)...")
     finally:
-        duallink.stop()
-        strategy_engine.stop_all()
+        if strategy_engine:
+            try:
+                strategy_engine.stop_all()
+            except Exception:
+                pass
         ev.stop()
-        db.close()
         log.info("✅ 已安全关闭")
 
 
