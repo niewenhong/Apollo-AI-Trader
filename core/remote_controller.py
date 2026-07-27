@@ -1,34 +1,63 @@
+# -*- coding: utf-8 -*-
 """
-core/remote_controller.py — Telegram 远程控制 v2.8.2
-修复：/positions 和 /account 直接通过 FutuGateway 内部的 trd_ctx 同步查询
-（与 2.7.0 基线做法一致，绕过 vnpy 事件系统）
+core/remote_controller.py — v2.8.8 双引擎版
+修复：
+  - 导入 convert_symbol_futu2vt（从 futu_gateway 模块）
+  - _cmd_account / _cmd_positions 使用 gw.acc_id 而非硬编码 0
+  - 增加日志输出，便于调试
 """
 import logging
 import time
-from typing import Optional, Dict, Any
+import sys
+import os
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("RemoteController")
 
+# ★ 导入 futu_gateway 中的工具函数 ★
+try:
+    from vnpy_futu import convert_symbol_futu2vt
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from gateway.futu_gateway import convert_symbol_futu2vt
+    except ImportError:
+        # 兜底定义
+        def convert_symbol_futu2vt(code):
+            parts = str(code).split(".")
+            if len(parts) >= 2:
+                return ".".join(parts[1:]), None
+            return code, None
+        logger.warning("convert_symbol_futu2vt 导入失败，使用兜底版本")
+
 
 class RemoteController:
-    """Telegram 远程控制器"""
+    """Telegram 远程控制器（双引擎版 v2.8.8）"""
 
     def __init__(self, db=None, notifier=None, config: dict = None):
         self.db = db
         self.notifier = notifier
         self.config = config or {}
+        self.main_engine_us = None
+        self.main_engine_hk = None
         self.main_engine = None
         self.strategy_engine = None
         self.registry = None
         self._authorized = True
-        # ★ 新增：直接持有网关引用，用于同步查询
         self._gateways = {}
 
+    def set_main_engines(self, me_us, me_hk):
+        self.main_engine_us = me_us
+        self.main_engine_hk = me_hk
+        self.main_engine = me_us
+        self._gateways = {}
+        if me_us:
+            self._gateways.update(getattr(me_us, 'gateways', {}))
+        if me_hk:
+            self._gateways.update(getattr(me_hk, 'gateways', {}))
+
     def set_main_engine(self, me):
-        self.main_engine = me
-        # 从 MainEngine 提取所有网关，缓存起来供查询用
-        if me:
-            self._gateways = me.gateways
+        self.set_main_engines(me, me)
 
     def set_strategy_engine(self, engine):
         self.strategy_engine = engine
@@ -37,10 +66,8 @@ class RemoteController:
         self.registry = registry
 
     def handle_command(self, command: str, args: list) -> str:
-        """命令分发 - 兼容带斜杠/不带斜杠"""
         cmd = (command or "").strip().lower().lstrip("/")
         normalized = "/" + cmd
-
         handlers = {
             "/help": self._cmd_help,
             "/status": self._cmd_status,
@@ -64,37 +91,35 @@ class RemoteController:
                 return f"❌ 命令执行异常: {e}"
         return f"❓ 未知命令: {command}\n输入 /help 查看可用命令"
 
-    # ═════════════════════════════════════════
-    #  命令实现（2.8.0 原始逻辑，未改动）
-    # ═════════════════════════════════════════
+    # ══════════════════════════════════════
+    #  命令实现
+    # ══════════════════════════════════════
     def _cmd_help(self, args) -> str:
         return (
-            "📋 <b>Apollo 命令列表</b>\n"
+            "📋 <b>Apollo 命令列表</b> (v2.8.8 双引擎)\n"
             "/help - 显示帮助\n"
             "/status - 策略状态\n"
             "/boot &lt;pwd&gt; - 全量重启策略\n"
-            "/add &lt;name&gt; &lt;class&gt; &lt;symbol&gt; &lt;market&gt; [params_json] &lt;pwd&gt;\n"
+            "/add &lt;name&gt; &lt;class&gt; &lt;symbol&gt; &lt;market&gt; &lt;params_json&gt; &lt;pwd&gt;\n"
             "/remove &lt;name&gt; &lt;pwd&gt; - 停止并移除策略\n"
             "/rollback &lt;name&gt; &lt;version&gt; &lt;pwd&gt; - 回滚参数\n"
             "/reload &lt;pwd&gt; - 手动热加载\n"
             "/cluster - 集群状态\n"
             "/stop_all &lt;pwd&gt; - 停止所有策略\n"
-            "/positions - 持仓查询\n"
-            "/account - 账户资金\n"
+            "/positions - 持仓查询（双市场）\n"
+            "/account - 账户资金（双市场）\n"
             "/shutdown &lt;pwd&gt; - 安全关闭系统"
         )
 
     def _cmd_status(self, args) -> str:
         if self.strategy_engine:
             return self.strategy_engine.format_status()
-        tag = self.registry.tag() if self.registry else "UNKNOWN"
-        return f"📊 策略状态 ({tag}):\n  无策略引擎接入"
+        return f"📊 策略状态 ({self._registry_tag()}):\n  无策略引擎接入"
 
     def _cmd_boot(self, args) -> str:
         if len(args) < 1:
             return "❌ 用法: /boot &lt;password&gt;"
-        pwd = args[0]
-        if pwd != self.config.get("remote_password", "admin123"):
+        if args[0] != self.config.get("remote_password", "admin123"):
             return "❌ 密码错误"
         if not self.strategy_engine:
             return "❌ 策略引擎未初始化"
@@ -108,7 +133,6 @@ class RemoteController:
         if pwd != self.config.get("remote_password", "admin123"):
             return "❌ 密码错误"
         name, cls, symbol, market = args[0], args[1], args[2], args[3]
-        params = {}
         try:
             import json
             params = json.loads(args[4])
@@ -151,8 +175,7 @@ class RemoteController:
     def _cmd_reload(self, args) -> str:
         if len(args) < 1:
             return "❌ 用法: /reload &lt;pwd&gt;"
-        pwd = args[0]
-        if pwd != self.config.get("remote_password", "admin123"):
+        if args[0] != self.config.get("remote_password", "admin123"):
             return "❌ 密码错误"
         if self.strategy_engine:
             changed = self.strategy_engine.check_and_reload_changed(operator="telegram:reload")
@@ -160,16 +183,25 @@ class RemoteController:
         return "❌ 策略引擎未初始化"
 
     def _cmd_cluster(self, args) -> str:
-        if not self.registry:
-            return "❌ 注册表未初始化"
-        status = self.registry.status()
-        lines = [
-            f"🖥️ 集群 [{status['cluster_id']}] 状态:",
-            f"  🏷️ {status['machine_id']} [{status['instance_type']}]",
-            f"  ⏱️ 运行: {status['uptime']}",
-            f"  💓 模式: {status['heartbeat_mode']}",
-        ]
-        members = self.registry.discover()
+        lines = ["🖥️ <b>集群状态</b>"]
+        tag = self._registry_tag()
+        lines.append(f"  🏷️ 本机: {tag}")
+        mode = "N/A"
+        if self.registry:
+            mode = getattr(self.registry, 'heartbeat_mode', 'local')
+            if mode == 'N/A' and hasattr(self.registry, 'mode'):
+                mode = str(self.registry.mode)
+        lines.append(f"  🔒 模式: {mode}")
+        inst = "N/A"
+        if self.registry:
+            inst = getattr(self.registry, 'instance_type', 'STANDALONE')
+        lines.append(f"  🖥️ 类型: {inst}")
+        members = []
+        if self.registry and hasattr(self.registry, 'discover') and callable(self.registry.discover):
+            try:
+                members = self.registry.discover()
+            except:
+                members = []
         if members:
             lines.append(f"  ── 其他节点 ──")
             for m in members:
@@ -181,17 +213,21 @@ class RemoteController:
     def _cmd_shutdown(self, args) -> str:
         if len(args) < 1:
             return "❌ 用法: /shutdown &lt;pwd&gt;"
-        pwd = args[0]
-        if pwd != self.config.get("remote_password", "admin123"):
+        if args[0] != self.config.get("remote_password", "admin123"):
             return "❌ 密码错误"
         if self.notifier:
-            self.notifier.send_shutdown_notice(reason="Telegram 远程指令")
+            try:
+                self.notifier.send_shutdown_notice(reason="Telegram 远程指令")
+            except:
+                pass
         if self.strategy_engine:
-            self.strategy_engine.stop_all()
-        import threading
+            try:
+                self.strategy_engine.stop_all()
+            except:
+                pass
+        import threading, os
         def _delayed_exit():
             time.sleep(2)
-            import os
             os._exit(0)
         threading.Thread(target=_delayed_exit, daemon=True).start()
         return "🛑 系统正在关闭..."
@@ -199,75 +235,100 @@ class RemoteController:
     def _cmd_stop_all(self, args) -> str:
         if len(args) < 1:
             return "❌ 用法: /stop_all &lt;pwd&gt;"
-        pwd = args[0]
-        if pwd != self.config.get("remote_password", "admin123"):
+        if args[0] != self.config.get("remote_password", "admin123"):
             return "❌ 密码错误"
         if self.strategy_engine:
             self.strategy_engine.stop_all()
             return "⏹️ 所有策略已停止"
         return "❌ 策略引擎未初始化"
 
-    # ═════════════════════════════════════════
-    #  ★★★ 真正的修复：直接通过网关的 trd_ctx 同步查询 ★★★
-    #  （与 2.7.0 基线做法一致）
-    # ═════════════════════════════════════════
+    # ══════════════════════════════════════
+    #  工具函数
+    # ══════════════════════════════════════
+    def _registry_tag(self) -> str:
+        if not self.registry:
+            return "LOCAL"
+        try:
+            if hasattr(self.registry, 'tag'):
+                attr = getattr(self.registry, 'tag')
+                return attr() if callable(attr) else str(attr)
+        except:
+            pass
+        return str(self.registry)
+
     def _get_trd_ctx_from_gateway(self, gw):
-        """
-        从 FutuGateway 实例中提取富途交易上下文
-        2.7.0 基线做法：直接使用 trd_ctx.position_list_query() / accinfo_query()
-        """
-        # 尝试常见属性名
-        for attr in ("trd_ctx", "trade_ctx", "_trd_ctx", "trd_context"):
+        for attr in ("trd_ctx", "trade_ctx", "_trd_ctx", "trd_context", "sec_trade_ctx"):
             ctx = getattr(gw, attr, None)
             if ctx is not None:
                 return ctx
-        # 如果网关暴露了 query 方法，也可以直接用
         return None
 
+    def _get_acc_id_from_gateway(self, gw):
+        """安全获取网关的 acc_id，默认 0"""
+        return getattr(gw, 'acc_id', 0)
+
+    def _get_env_from_gateway(self, gw):
+        """安全获取网关的 trd_env"""
+        env = getattr(gw, 'env', None)
+        if isinstance(env, str):
+            try:
+                from futu import TrdEnv
+                env = getattr(TrdEnv, env, TrdEnv.SIMULATE)
+            except:
+                env = None
+        return env
+
+    # ══════════════════════════════════════
+    #  ★ 持仓查询 ★
+    # ══════════════════════════════════════
     def _cmd_positions(self, args) -> str:
-        """持仓查询 - 直接通过富途 trd_ctx 同步查询（对标 2.7.0）"""
         if not self._gateways:
             return "❌ 网关注入失败，无法查询持仓"
 
         from futu import RET_OK
         all_positions = []
         for gw_name, gw in self._gateways.items():
+            if gw_name == "FUTU":
+                continue
             trd_ctx = self._get_trd_ctx_from_gateway(gw)
             if trd_ctx is None:
-                logger.warning(f"网关 {gw_name} 无 trd_ctx，跳过")
+                logger.warning(f"网关 {gw_name} 无交易上下文，跳过")
                 continue
+            acc_id = self._get_acc_id_from_gateway(gw)
+            env = self._get_env_from_gateway(gw)
             try:
-                # ★ 关键：直接调富途同步 API（这就是 2.7.0 的做法）
-                ret, data = trd_ctx.position_list_query()
-                if ret == RET_OK and data is not None and not data.empty:
-                    for _, row in data.iterrows():
-                        qty = int(row.get("qty", 0))
-                        if qty == 0:
-                            continue
-                        code = row.get("code", "")
-                        cost = float(row.get("cost_price", 0))
-                        pnl = float(row.get("pl_val", 0))
-                        all_positions.append({
-                            "symbol": code,
-                            "qty": qty,
-                            "cost": cost,
-                            "pnl": pnl,
-                            "gateway": gw_name,
-                        })
+                ret, data = trd_ctx.position_list_query(trd_env=env, acc_id=acc_id)
+                if ret != RET_OK or data is None or data.empty:
+                    logger.info(f"网关 {gw_name} 持仓查询返回空 (acc_id={acc_id})")
+                    continue
+                logger.info(f"网关 {gw_name} 持仓列名: {list(data.columns)}")
+                for _, row in data.iterrows():
+                    qty = int(row.get("qty", 0))
+                    if qty == 0:
+                        continue
+                    symbol, exchange = convert_symbol_futu2vt(row["code"])
+                    cost = float(row.get("cost_price", 0))
+                    pnl = float(row.get("pl_val", 0))
+                    all_positions.append({
+                        "symbol": symbol,
+                        "qty": qty,
+                        "cost": cost,
+                        "pnl": pnl,
+                        "gateway": gw_name,
+                    })
             except Exception as e:
-                logger.warning(f"网关 {gw_name} 查询持仓失败: {e}")
+                logger.warning(f"网关 {gw_name} 持仓查询失败: {e}")
 
         if not all_positions:
             return "⚠️ 当前没有任何持仓"
-
-        tag = self.registry.tag() if self.registry else "LOCAL"
-        lines = [f"📈 <b>持仓查询</b> [{tag}]"]
+        tag = self._registry_tag()
+        lines = [f"📈 <b>持仓查询</b> [{tag}] (双市场)"]
         lines.append("─" * 40)
         total_pnl = 0.0
         for pos in all_positions:
             total_pnl += pos["pnl"]
             lines.append(
-                f"· {pos['symbol']} ({pos['gateway']})\n"
+                f"· {pos['symbol']} [{pos['gateway']}]\n"
                 f"  量:{pos['qty']} 成本:{pos['cost']:.2f} 盈亏:{pos['pnl']:+.2f}"
             )
         lines.append("─" * 40)
@@ -275,44 +336,59 @@ class RemoteController:
         return "\n".join(lines)
 
     def _cmd_account(self, args) -> str:
-        """账户资金查询 - 直接通过富途 trd_ctx 同步查询（对标 2.7.0）"""
         if not self._gateways:
             return "❌ 网关注入失败，无法查询资金"
 
-        from futu import RET_OK
         all_accounts = []
         for gw_name, gw in self._gateways.items():
-            trd_ctx = self._get_trd_ctx_from_gateway(gw)
-            if trd_ctx is None:
-                logger.warning(f"网关 {gw_name} 无 trd_ctx，跳过")
+            if gw_name == "FUTU":
                 continue
-            try:
-                # ★ 关键：直接调富途同步 API（这就是 2.7.0 的做法）
-                ret, data = trd_ctx.accinfo_query()
-                if ret == RET_OK and data is not None and not data.empty:
+            # 直接使用网关缓存的 acc_info（由 query_account 填充）
+            acc_info = getattr(gw, 'acc_info', {})
+            if acc_info:
+                all_accounts.append(acc_info)
+            else:
+                # 兜底：直接查询
+                trd_ctx = self._get_trd_ctx_from_gateway(gw)
+                if trd_ctx is None:
+                    continue
+                acc_id = getattr(gw, 'acc_id', 0)
+                env = getattr(gw, 'env', None)
+                if acc_id == 0:
+                    continue
+                try:
+                    from futu import RET_OK
+                    ret, data = trd_ctx.accinfo_query(trd_env=env, acc_id=acc_id)
+                    if ret != RET_OK or data is None or data.empty:
+                        continue
                     for _, row in data.iterrows():
-                        total = float(row.get("total_assets", 0))
-                        cash = float(row.get("cash", total))
                         all_accounts.append({
                             "gateway": gw_name,
-                            "total": total,
-                            "cash": cash,
-                            "frozen": total - cash,
+                            "total_assets": float(row.get("total_assets", 0)),
+                            "cash": float(row.get("cash", 0)),
+                            "market_val": float(row.get("market_val", 0)),
+                            "frozen_cash": float(row.get("frozen_cash", 0)),
+                            "power": float(row.get("power", 0)),
+                            "currency": str(row.get("currency", "?")),
+                            "market": getattr(gw, 'market', '?'),
                         })
-            except Exception as e:
-                logger.warning(f"网关 {gw_name} 查询资金失败: {e}")
+                except Exception as e:
+                    logger.warning(f"网关 {gw_name} 资金查询失败: {e}")
 
         if not all_accounts:
             return "⚠️ 未获取到账户信息"
-
-        tag = self.registry.tag() if self.registry else "LOCAL"
-        lines = [f"💰 <b>账户资金</b> [{tag}]"]
+        
+        tag = self._registry_tag()
+        lines = [f"💰 <b>账户资金</b> [{tag}] (双市场)"]
         lines.append("─" * 40)
         for acc in all_accounts:
+            market_label = "🇺🇸 美股" if acc.get("market") == "US" else "🇭🇰 港股"
             lines.append(
-                f"🏦 {acc['gateway']}\n"
-                f"  总资产: ${acc['total']:,.2f}\n"
-                f"  可用:   ${acc['cash']:,.2f}\n"
-                f"  冻结:   ${acc['frozen']:,.2f}"
+                f"{market_label} {acc['gateway']} ({acc['currency']})\n"
+                f"  总资产: ${acc['total_assets']:,.2f}\n"
+                f"  现金:   ${acc['cash']:,.2f}\n"
+                f"  证券市值: ${acc['market_val']:,.2f}\n"
+                f"  冻结资金: ${acc['frozen_cash']:,.2f}\n"
+                f"  购买力:   ${acc['power']:,.2f}"
             )
         return "\n".join(lines)

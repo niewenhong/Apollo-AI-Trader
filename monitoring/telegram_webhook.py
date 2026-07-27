@@ -1,6 +1,6 @@
 """
-monitoring/telegram_webhook.py - Telegram 命令轮询处理器 v2.8.2
-修复：sendMessage 启用 HTML parse_mode，避免格式化文本被当纯文本
+monitoring/telegram_webhook.py - Telegram 命令轮询处理器 v2.8.3
+修复：args 改为列表，确保密码验证正常
 """
 import threading
 import time
@@ -64,9 +64,10 @@ class TelegramCommandListener:
                         continue
 
                     print(f"[TelegramWebhook] 收到命令: {text}")
-                    parts = text.split(maxsplit=1)
-                    command = parts[0][1:]
-                    args = parts[1] if len(parts) > 1 else ""
+                    # ★★★ 修复：用 split() 拆分成列表，而非 maxsplit=1 ★★★
+                    parts = text.split()
+                    command = parts[0][1:]  # 去掉 '/'
+                    args = parts[1:] if len(parts) > 1 else []
                     try:
                         reply = self.controller.handle_command(command, args)
                     except Exception as e:

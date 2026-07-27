@@ -1,9 +1,12 @@
 """
-core/strategy_engine.py - Apollo Trader v2.8.2
-完整 CTA 策略引擎：回测 → 门禁 → init → prelive → start 全链路自动化
-支持数据库驱动的动态策略管理（增删改查 + 热加载 + 版本回滚）
-
-⚠️ 门禁回测已完全移除，后续由 AI 智能判断替代
+core/strategy_engine.py - Apollo Trader v2.8.4 双引擎版
+变更说明：
+  - __init__ 已接收 main_us + main_hk
+  - main_engine 属性保留为 main_us 的别名
+  - _get_cta_engine() 新增 market 参数
+  - _deploy_to_cta() 按市场路由
+  - _init_cta_engines() 初始化双引擎 CTA 并注册策略类
+  - v2.8.4: 事件驱动首次部署，等待合约就绪后再加载策略
 """
 import importlib
 import json
@@ -27,10 +30,11 @@ logger = logging.getLogger("StrategyEngine")
 
 class StrategyEngine:
     """
-    策略引擎 - 全链路自动化
+    策略引擎 - 全链路自动化（双引擎版 v2.8.4）
+    main_us: 美股 MainEngine（独立 EventEngine）
+    main_hk: 港股 MainEngine（独立 EventEngine）
     """
 
-    # ===== 类名别名映射 =====
     CLASS_NAME_ALIAS = {
         "OrderFlowStrategy": "TickOrderFlowStrategy",
     }
@@ -49,53 +53,141 @@ class StrategyEngine:
                  config: dict = None):
         self.main_us = main_us
         self.main_hk = main_hk
-        self.main_engine = main_us
+        self.main_engine = main_us  # 兼容旧代码
+
         self.db = db
         self.config = config or {}
         self.telegram_bot = None
 
-        self.strategies: Dict[str, Any] = {}
-        self._deployed: Dict[str, str] = {}
+        self.strategies = {}
+        self._deployed = {}
 
         gate_cfg = self.config.get("prelive_gate", {})
         self.prelive_gate = PreliveGate(db, thresholds=gate_cfg.get("thresholds"))
         self.advisor = ParamAdvisor(db)
-        self.hot_reload_interval = gate_cfg.get("hot_reload_interval", 600)  # 临时调大到600秒减少干扰
+        self.hot_reload_interval = gate_cfg.get("hot_reload_interval", 600)
         self.backtest_days = gate_cfg.get("backtest_days", 60)
         self.backtest_interval = gate_cfg.get("backtest_interval", "1m")
 
         self._hot_reload_stop = threading.Event()
 
-        self._init_cta_engine()
-        self._load_strategies_from_db()
+        # 初始化双引擎 CTA
+        self._init_cta_engines()
 
-    def _init_cta_engine(self):
-        cta = self._get_cta_engine()
-        if cta is None:
-            logger.error("[StrategyEngine] 无法获取 CTA 引擎")
-            return
-        try:
-            cta.init_engine()
-            logger.info("[StrategyEngine] ✅ CTA 引擎初始化完成")
-        except Exception as e:
-            logger.error(f"[StrategyEngine] CTA 引擎初始化异常: {e}")
-            return
+        # v2.8.4: 事件驱动首次部署
+        self._contract_ready_flags = {"US": False, "HK": False}
+        self.main_us.event_engine.register("eContractReady", self._make_on_ready("US"))
+        self.main_hk.event_engine.register("eContractReady", self._make_on_ready("HK"))
+        logger.info("[StrategyEngine] 等待合约就绪事件...")
 
-        loaded_classes = []
-        for class_name, module_path in self.CLASS_MODULE_MAP.items():
+    def _init_cta_engines(self):
+        for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
             try:
-                cta.load_strategy_class_from_module(module_path)
-                loaded_classes.append(class_name)
-            except Exception as e:
-                logger.warning(f"[StrategyEngine] 加载 {module_path} 失败: {e}")
-        logger.info(f"[StrategyEngine] 已注册策略类: {loaded_classes}")
+                cta = me.get_engine("CtaStrategy")
+                if cta is None:
+                    cta = me.add_app_from_module("vnpy_ctastrategy")
+                    cta = me.get_engine("CtaStrategy")
+                if cta is None:
+                    logger.error(f"[StrategyEngine] ❌ {label} CTA 引擎获取失败")
+                    continue
 
-    def _get_cta_engine(self) -> Optional[CtaEngine]:
+                cta.init_engine()
+                logger.info(f"[StrategyEngine] ✅ {label} CTA 引擎初始化完成")
+
+                registered = []
+                for class_name, module_path in self.CLASS_MODULE_MAP.items():
+                    try:
+                        mod = importlib.import_module(module_path)
+                        cls = getattr(mod, class_name, None)
+                        if cls is None:
+                            alias = self.CLASS_NAME_ALIAS.get(class_name)
+                            if alias:
+                                cls = getattr(mod, alias, None)
+                        if cls is not None:
+                            cta.classes[class_name] = cls
+                            registered.append(class_name)
+                        else:
+                            logger.warning(f"[StrategyEngine] {label} 未找到类 {class_name} 在 {module_path}")
+                    except Exception as e:
+                        logger.error(f"[StrategyEngine] {label} 注册 {class_name} 失败: {e}")
+
+                logger.info(f"[StrategyEngine] {label} 已注册策略类: {registered}")
+
+            except Exception as e:
+                logger.error(f"[StrategyEngine] {label} CTA 初始化异常: {e}")
+
+    def _make_on_ready(self, market: str):
+        def handler(event):
+            if self._contract_ready_flags.get(market):
+                return
+            self._contract_ready_flags[market] = True
+            logger.info(f"[StrategyEngine] {market} 合约就绪")
+            if all(self._contract_ready_flags.values()):
+                logger.info("[StrategyEngine] 双市场合约就绪，开始部署策略")
+                self._load_strategies_from_db()
+        return handler
+
+    def _get_cta_engine(self, market: str = "US") -> Optional[CtaEngine]:
+        target_me = self.main_hk if market == "HK" else self.main_us
         try:
-            return self.main_engine.get_engine("CtaStrategy")
+            return target_me.get_engine("CtaStrategy")
         except Exception as e:
-            logger.error(f"[StrategyEngine] 获取 CTA 引擎失败: {e}")
+            logger.error(f"[StrategyEngine] 获取 {market} CTA 引擎失败: {e}")
             return None
+
+    def _deploy_to_cta(self, strategy_name: str, class_name: str,
+                       vt_symbol: str, params: dict, market: str) -> bool:
+        cta = self._get_cta_engine(market)
+        if cta is None:
+            logger.error(f"[StrategyEngine] {market} CTA 引擎不可用，无法部署 {strategy_name}")
+            return False
+
+        vt_symbol = self._normalize_vt_symbol(vt_symbol, market)
+        if not vt_symbol:
+            logger.error(f"[StrategyEngine] {strategy_name} vt_symbol 为空")
+            return False
+
+        logger.info(f"[StrategyEngine] 部署 {strategy_name} → {vt_symbol} ({class_name}) [{market}]")
+
+        try:
+            if class_name not in cta.classes:
+                logger.error(f"[StrategyEngine] '{class_name}' 未注册。已注册: {list(cta.classes.keys())}")
+                return False
+
+            if strategy_name in cta.strategies:
+                cta.stop_strategy(strategy_name)
+                cta.remove_strategy(strategy_name)
+                time.sleep(0.5)
+
+            cta.add_strategy(
+                class_name=class_name,
+                strategy_name=strategy_name,
+                vt_symbol=vt_symbol,
+                setting=params,
+            )
+            init_success = cta.init_strategy(strategy_name)
+            if not init_success:
+                logger.error(f"[StrategyEngine] {strategy_name} init 失败")
+                cta.remove_strategy(strategy_name)
+                return False
+
+            for _ in range(10):
+                if strategy_name in cta.strategies:
+                    break
+                time.sleep(0.5)
+            else:
+                logger.error(f"[StrategyEngine] {strategy_name} 初始化超时")
+                cta.remove_strategy(strategy_name)
+                return False
+
+            cta.start_strategy(strategy_name)
+            self.strategies[strategy_name] = cta.strategies.get(strategy_name)
+            logger.info(f"[StrategyEngine] ✅ {strategy_name} add→init→start 完成 [{market}]")
+            return True
+
+        except Exception as e:
+            logger.error(f"[StrategyEngine] {strategy_name} 部署异常: {e}\n{traceback.format_exc()}")
+            return False
 
     def _normalize_vt_symbol(self, vt_symbol: str, market: str) -> str:
         if not vt_symbol or not vt_symbol.strip():
@@ -143,7 +235,6 @@ class StrategyEngine:
         self.boot(operator="system:bootstrap")
 
     def _resolve_class(self, class_name: str):
-        """解析策略类，自动处理别名映射"""
         real_name = self.CLASS_NAME_ALIAS.get(class_name, class_name)
         if real_name != class_name:
             logger.info(f"[StrategyEngine] 类名别名映射: {class_name} -> {real_name}")
@@ -204,15 +295,11 @@ class StrategyEngine:
                 params.update(suggested)
                 logger.info(f"[StrategyEngine] {name} AI参数建议: {suggested}")
 
-            # ===== 门禁已完全移除，直接部署 =====
-            # 不再调用 prelive_gate.validate()
-            # ===================================
-
             if self._deploy_to_cta(name, actual_class_name, vt_symbol, params, market):
                 self.db.mark_deployed(name, version, operator)
                 self.db.log_deploy(name, version, "deploy", operator, "success",
                                    "gate_disabled")
-                logger.info(f"[StrategyEngine] ✅ {name} 全链路部署成功 (v{version})")
+                logger.info(f"[StrategyEngine] ✅ {name} 全链路部署成功 (v{version}) [{market}]")
                 return {"deployed": True, "version": version, "gate": {"pass": True}}
 
             error_msg = "CTA引擎注册失败"
@@ -224,61 +311,8 @@ class StrategyEngine:
             self.db.log_deploy(name, version, "deploy", operator, "failed", str(e))
             return {"deployed": False, "reason": f"异常: {str(e)}"}
 
-    def _deploy_to_cta(self, strategy_name: str, class_name: str,
-                       vt_symbol: str, params: dict, market: str) -> bool:
-        cta = self._get_cta_engine()
-        if cta is None:
-            return False
-
-        vt_symbol = self._normalize_vt_symbol(vt_symbol, market)
-        if not vt_symbol:
-            logger.error(f"[StrategyEngine] {strategy_name} vt_symbol 为空")
-            return False
-
-        logger.info(f"[StrategyEngine] 部署 {strategy_name} → {vt_symbol} ({class_name})")
-
-        try:
-            if class_name not in cta.classes:
-                logger.error(f"[StrategyEngine] '{class_name}' 未注册。已注册: {list(cta.classes.keys())}")
-                return False
-
-            if strategy_name in cta.strategies:
-                cta.stop_strategy(strategy_name)
-                cta.remove_strategy(strategy_name)
-                time.sleep(0.5)
-
-            cta.add_strategy(
-                class_name=class_name,
-                strategy_name=strategy_name,
-                vt_symbol=vt_symbol,
-                setting=params,
-            )
-            init_success = cta.init_strategy(strategy_name)
-            if not init_success:
-                logger.error(f"[StrategyEngine] {strategy_name} init 失败")
-                cta.remove_strategy(strategy_name)
-                return False
-
-            for _ in range(10):
-                if strategy_name in cta.strategies:
-                    break
-                time.sleep(0.5)
-            else:
-                logger.error(f"[StrategyEngine] {strategy_name} 初始化超时")
-                cta.remove_strategy(strategy_name)
-                return False
-
-            cta.start_strategy(strategy_name)
-            self.strategies[strategy_name] = cta.strategies.get(strategy_name)
-            logger.info(f"[StrategyEngine] ✅ {strategy_name} add→init→start 完成")
-            return True
-
-        except Exception as e:
-            logger.error(f"[StrategyEngine] {strategy_name} 部署异常: {e}\n{traceback.format_exc()}")
-            return False
-
     def boot(self, operator: str = "system") -> dict:
-        logger.info("[StrategyEngine] ═══ 开始策略启动流程（门禁已禁用）═══")
+        logger.info(f"[StrategyEngine] ═══ 开始策略启动流程（双引擎模式，门禁已禁用）═══")
         configs = self.db.get_all_strategies(enabled_only=True)
         if not configs:
             logger.warning("[StrategyEngine] 数据库中没有启用策略")
@@ -312,28 +346,30 @@ class StrategyEngine:
         return summary
 
     def start_all(self):
-        cta = self._get_cta_engine()
-        if not cta:
-            return
-        for name in list(cta.strategies.keys()):
-            try:
-                if not cta.strategies[name].trading:
-                    cta.start_strategy(name)
-                    logger.info(f"[StrategyEngine] 启动: {name}")
-            except Exception as e:
-                logger.warning(f"[StrategyEngine] 启动 {name} 失败: {e}")
+        for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
+            cta = self._get_cta_engine(label)
+            if not cta:
+                continue
+            for name in list(cta.strategies.keys()):
+                try:
+                    if not cta.strategies[name].trading:
+                        cta.start_strategy(name)
+                        logger.info(f"[StrategyEngine] 启动: {name} [{label}]")
+                except Exception as e:
+                    logger.warning(f"[StrategyEngine] 启动 {name} 失败: {e}")
 
     def stop_all(self):
-        cta = self._get_cta_engine()
-        if not cta:
-            return
-        for name in list(cta.strategies.keys()):
-            try:
-                cta.stop_strategy(name)
-                cta.remove_strategy(name)
-                logger.info(f"[StrategyEngine] 停止并移除: {name}")
-            except Exception as e:
-                logger.warning(f"[StrategyEngine] 停止 {name} 失败: {e}")
+        for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
+            cta = self._get_cta_engine(label)
+            if not cta:
+                continue
+            for name in list(cta.strategies.keys()):
+                try:
+                    cta.stop_strategy(name)
+                    cta.remove_strategy(name)
+                    logger.info(f"[StrategyEngine] 停止并移除: {name} [{label}]")
+                except Exception as e:
+                    logger.warning(f"[StrategyEngine] 停止 {name} 失败: {e}")
         self._deployed.clear()
         self.strategies.clear()
 
@@ -403,13 +439,17 @@ class StrategyEngine:
         return self._remove_strategy(strategy_name, operator)
 
     def _remove_strategy(self, strategy_name: str, operator: str) -> bool:
-        cta = self._get_cta_engine()
-        if cta and strategy_name in cta.strategies:
-            try:
-                cta.stop_strategy(strategy_name)
-                cta.remove_strategy(strategy_name)
-            except Exception as e:
-                logger.warning(f"[StrategyEngine] 移除 {strategy_name} 异常: {e}")
+        for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
+            cta = self._get_cta_engine(label)
+            if not cta:
+                continue
+            if strategy_name in cta.strategies:
+                try:
+                    cta.stop_strategy(strategy_name)
+                    cta.remove_strategy(strategy_name)
+                except Exception as e:
+                    logger.warning(f"[StrategyEngine] 移除 {strategy_name} 异常: {e}")
+                break
         self.db.disable_strategy(strategy_name)
         self.db.log_deploy(strategy_name, 0, "remove", operator, "success", "")
         self._deployed.pop(strategy_name, None)
@@ -444,27 +484,28 @@ class StrategyEngine:
         return False
 
     def get_status(self) -> dict:
-        cta = self._get_cta_engine()
-        if not cta:
-            return {"total": 0, "running": 0, "stopped": 0, "strategies": []}
+        all_info = []
+        for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
+            cta = self._get_cta_engine(label)
+            if not cta:
+                continue
+            for name, strategy in cta.strategies.items():
+                info = {
+                    "name": name,
+                    "market": label,
+                    "trading": getattr(strategy, 'trading', False),
+                    "pos": getattr(strategy, 'pos', 0),
+                    "score": getattr(strategy, 'score', 0),
+                }
+                all_info.append(info)
 
-        strategies_info = []
-        for name, strategy in cta.strategies.items():
-            info = {
-                "name": name,
-                "trading": getattr(strategy, 'trading', False),
-                "pos": getattr(strategy, 'pos', 0),
-                "score": getattr(strategy, 'score', 0),
-            }
-            strategies_info.append(info)
-
-        total = len(strategies_info)
-        running = sum(1 for s in strategies_info if s["trading"])
+        total = len(all_info)
+        running = sum(1 for s in all_info if s["trading"])
         return {
             "total": total,
             "running": running,
             "stopped": total - running,
-            "strategies": strategies_info,
+            "strategies": all_info,
         }
 
     def list_active(self) -> List[dict]:
@@ -491,7 +532,8 @@ class StrategyEngine:
         lines = [f"📊 策略状态: {status['running']}/{status['total']} 运行中"]
         for s in status["strategies"]:
             icon = "✅" if s["trading"] else "⏸️"
-            lines.append(f"  {icon} {s['name']} (pos={s['pos']}, score={s.get('score',0):.0f})")
+            market_icon = "🇺🇸" if s["market"] == "US" else "🇭🇰"
+            lines.append(f"  {icon} {market_icon} {s['name']} (pos={s['pos']}, score={s.get('score',0):.0f})")
         return "\n".join(lines)
 
     def notify(self, level: str, msg: str, strategy_name: str = ""):
