@@ -1,151 +1,144 @@
 """
-strategies/equity/order_flow_strategy.py — Apollo-AI-Trader v2.8.0
-TickOrderFlowStrategy 完整版
-
-v2.8.0 修正：
-- 补全所有 vnpy 标准导入
-- 修复 pytz 依赖（使用标准库 zoneinfo 替代）
-- 类型注解完整
+strategies/equity/order_flow_strategy.py - v2.9.0
+Tick 订单流策略（依赖 TICKER 订阅，v2.9.0 已修复）
+v2.9.0 优化：
+- 充分利用已订阅的 TICKER + ORDER_BOOK 数据
+- 盘口 imbalance 加权计算（1~5 档，指数衰减权重）
+- Kelly 仓位 + 移动止盈 + 硬止损
+- 时间窗口（US 9:45-15:50, HK 9:45-11:55/13:15-15:50）
+- 尾盘强制清仓
+- 防御：盘口字段缺失时降级到 1 档
+- Regime 感知：强趋势时放大仓位，震荡时缩仓
 """
 import time
 from datetime import datetime, time as dtime
 from typing import Optional, Tuple, Callable
 
-# ====== vnpy 标准导入 ======
 from vnpy.trader.constant import Direction, Offset, Status, Interval, Exchange
 from vnpy.trader.object import BarData, TickData, OrderData, TradeData, PositionData
 from vnpy.trader.utility import ArrayManager, extract_vt_symbol
-from vnpy_ctastrategy import CtaTemplate, StopOrder
 
-# 时区处理：优先用 zoneinfo（Python 3.9+），回退到 pytz
 try:
     from zoneinfo import ZoneInfo
     _US_TZ = ZoneInfo("America/New_York")
     _HK_TZ = ZoneInfo("Asia/Hong_Kong")
 except ImportError:
-    import pytz  # type: ignore
+    import pytz
     _US_TZ = pytz.timezone("America/New_York")
     _HK_TZ = pytz.timezone("Asia/Hong_Kong")
 
+from strategies.base_strategy import ApolloBaseStrategy
 
-class TickOrderFlowStrategy(CtaTemplate):
+
+class TickOrderFlowStrategy(ApolloBaseStrategy):
     """
-    Tick 订单流策略：
-    - 基于买卖盘口 imbalance 判断方向
+    Tick 级订单流策略：
+    - 盘口 imbalance → 方向
     - Kelly 动态仓位
-    - 移动止盈 + 固定止损
+    - 移动止盈 + 硬止损
     - 尾盘强制清仓
     """
     author = "Apollo-AI-Trader"
 
-    # ── 参数 ──
-    bar_window = 1
-    volume_multiplier = 2.5
-    imbalance_threshold = 0.65
-    stop_loss_pct = 0.008
-    ai_score = 0.70
-    backtest_win_loss_ratio = 1.8
-    sentiment_index = 0.50
-
-    profit_activation_pct = 0.020
-    profit_rollback_pct = 0.005
-
-    # ── 变量（供 CTA 引擎显示）──
-    current_trend = 1
-    last_price = 0.0
-    long_pos = 0
-    entry_price = 0.0
-    stop_line = 0.0
-
-    trailing_profit_active = False
-    highest_price_since_entry = 0.0
-    profit_target_line = 0.0
-    is_ordering = False
-
-    today_pnl = 0.0
-    total_trades = 0
-    winning_trades = 0
-
-    parameters = [
-        "bar_window", "volume_multiplier", "imbalance_threshold", "stop_loss_pct",
-        "ai_score", "backtest_win_loss_ratio", "sentiment_index",
-        "profit_activation_pct", "profit_rollback_pct"
+    parameters = ApolloBaseStrategy.parameters + [
+        "volume_multiplier",
+        "imbalance_threshold",
+        "profit_activation_pct",
+        "profit_rollback_pct",
+        "ai_score",
+        "backtest_win_loss_ratio",
+        "sentiment_index",
+        "tick_cooldown_ms",
+        "use_regime_sizing",
     ]
-    variables = [
-        "current_trend", "last_price", "long_pos", "entry_price", "stop_line",
+    variables = ApolloBaseStrategy.variables + [
+        "long_pos", "last_price",
+        "current_trend", "stop_line",
         "trailing_profit_active", "highest_price_since_entry", "profit_target_line",
-        "today_pnl", "total_trades", "is_ordering"
     ]
 
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting: dict):
+    DEFAULTS = {
+        **ApolloBaseStrategy.DEFAULTS,
+        "volume_multiplier": 2.5,
+        "imbalance_threshold": 0.65,
+        "profit_activation_pct": 0.020,
+        "profit_rollback_pct": 0.005,
+        "ai_score": 0.70,
+        "backtest_win_loss_ratio": 1.8,
+        "sentiment_index": 0.50,
+        "tick_cooldown_ms": 500,
+        "use_regime_sizing": True,
+        # 覆盖基类默认值
+        "stop_loss_pct": 0.008,
+        "max_position_pct": 0.08,
+    }
+
+    # 盘口权重（指数衰减）
+    BOOK_WEIGHTS = (0.40, 0.25, 0.15, 0.12, 0.08)
+
+    def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 
-        # 从 setting 加载参数
-        self.load_strategy_setting(setting)
-
-        # 判断市场
-        self.is_us_market = ".SMART" in vt_symbol or ".US." in vt_symbol
-        self.market_tz = _US_TZ if self.is_us_market else _HK_TZ
-
-        # 回调（外部注入通知函数）
-        self.notice_callback: Optional[Callable] = None
-
-        self.write_log(f"[INIT] {strategy_name} | {vt_symbol} | US={self.is_us_market}")
-
-    def load_strategy_setting(self, setting: dict):
-        self.bar_window = setting.get("bar_window", self.bar_window)
-        self.volume_multiplier = setting.get("volume_multiplier", self.volume_multiplier)
-        self.imbalance_threshold = setting.get("imbalance_threshold", self.imbalance_threshold)
-        self.stop_loss_pct = setting.get("stop_loss_pct", self.stop_loss_pct)
-        self.ai_score = setting.get("ai_score", self.ai_score)
-        self.backtest_win_loss_ratio = setting.get("backtest_win_loss_ratio", self.backtest_win_loss_ratio)
-        self.sentiment_index = setting.get("sentiment_index", self.sentiment_index)
-        self.profit_activation_pct = setting.get("profit_activation_pct", self.profit_activation_pct)
-        self.profit_rollback_pct = setting.get("profit_rollback_pct", self.profit_rollback_pct)
-
-    # ──────────────────────────────
-    #  生命周期
-    # ──────────────────────────────
-    def on_init(self):
-        self.inited = True
-        self.write_log(f"[on_init] ✅ 初始化完成")
-
-    def on_start(self):
-        self.is_ordering = False
+        self.long_pos = 0
+        self.last_price = 0.0
+        self.current_trend = 1
+        self.stop_line = 0.0
         self.trailing_profit_active = False
         self.highest_price_since_entry = 0.0
-        self.write_log(f"[on_start] ▶️ 策略已激活")
+        self.profit_target_line = 0.0
 
-    def on_stop(self):
-        self.write_log(f"[on_stop] ⏸ 策略已停止 | pos={self.long_pos} pnl={self.today_pnl:.2f}")
+        self.is_us_market = self.is_us
+        self.market_tz = _US_TZ if self.is_us else _HK_TZ
+
+        self._last_tick_time = 0.0
+        self._last_imbalance = 0.5
+
+        self.write_log(f"[INIT] 订单流策略 | US={self.is_us_market} threshold={self.imbalance_threshold}")
+
+    def on_init(self):
+        super().on_init()
+
+    def on_start(self):
+        super().on_start()
+        self.trailing_profit_active = False
+        self.highest_price_since_entry = 0.0
 
     # ──────────────────────────────
     #  时间窗口
     # ──────────────────────────────
-    def check_time_window(self) -> Tuple[bool, bool]:
-        """返回 (allow_open, must_close)"""
-        now_in_market = datetime.now(self.market_tz).time()
+    def check_time_window(self, now_t: Optional[dtime] = None) -> Tuple[bool, bool]:
+        if now_t is None:
+            now_t = datetime.now(self.market_tz).time()
         if self.is_us_market:
-            allow_open = dtime(9, 45, 0) <= now_in_market < dtime(15, 50, 0)
-            must_close = now_in_market >= dtime(15, 50, 0)
+            allow_open = dtime(9, 45) <= now_t < dtime(15, 50)
+            must_close = now_t >= dtime(15, 50)
         else:
-            allow_am = dtime(9, 45, 0) <= now_in_market < dtime(11, 55, 0)
-            allow_pm = dtime(13, 15, 0) <= now_in_market < dtime(15, 50, 0)
+            allow_am = dtime(9, 45) <= now_t < dtime(11, 55)
+            allow_pm = dtime(13, 15) <= now_t < dtime(15, 50)
             allow_open = allow_am or allow_pm
-            must_close = (dtime(11, 55, 0) <= now_in_market < dtime(12, 0, 0)) or (now_in_market >= dtime(15, 50, 0))
+            must_close = (dtime(11, 55) <= now_t < dtime(12, 0)) or (now_t >= dtime(15, 50))
         return allow_open, must_close
 
     # ──────────────────────────────
-    #  Kelly 仓位
+    #  Kelly 仓位（结合 Regime）
     # ──────────────────────────────
     def calculate_kelly_volume(self, current_price: float) -> int:
         p = self.ai_score
         q = 1.0 - p
-        b = self.backtest_win_loss_ratio
+        b = max(self.backtest_win_loss_ratio, 0.1)
         if b <= 0 or current_price <= 0:
-            return 100
+            return self.fixed_size
+
         f_star = (p - (q / b)) * 0.5
-        f_optimized = min(max(f_star * (0.5 + self.sentiment_index), 0.01), 0.08)
+        f_optimized = min(max(f_star * (0.5 + self.sentiment_index), 0.01), self.max_position_pct)
+
+        # Regime 缩放
+        if self.use_regime_sizing:
+            r = self.get_current_regime()
+            if r in ("strong_bull", "strong_bear"):
+                f_optimized *= 1.3
+            elif r == "unknown":
+                f_optimized *= 0.5
 
         if self.is_us_market:
             available = 50000.0
@@ -158,122 +151,142 @@ class TickOrderFlowStrategy(CtaTemplate):
         return int(max(round(raw) * lot, lot))
 
     # ──────────────────────────────
-    #  K线 / Tick
+    #  on_tick（核心）
     # ──────────────────────────────
-    def on_bar(self, bar: BarData):
-        self.last_price = bar.close_price
-
     def on_tick(self, tick: TickData):
+        """Tick 级微观执行：这是本策略的主战场"""
+        super().on_tick(tick)
+
+        if not tick or tick.last_price <= 0:
+            return
+
         self.last_price = tick.last_price
 
-        if self.is_ordering:
+        # 冷却期（防止同一 tick 风暴重复触发）
+        now_ms = time.time() * 1000
+        if now_ms - self._last_tick_time < self.tick_cooldown_ms:
             return
-        if self.long_pos <= 0 and self.sentiment_index < 0.45:
-            return
+        self._last_tick_time = now_ms
 
-        allow_open, must_close = self.check_time_window()
-
-        # 强制清仓
-        if must_close:
-            if self.long_pos > 0:
-                self.is_ordering = True
-                if self.notice_callback:
-                    self.notice_callback(self.vt_symbol, tick.last_price, "🛑 刚性清仓", "触发尾盘风控强制收兵")
-                self.sell(tick.last_price - 0.05, self.long_pos)
-            return
-
-        # 持仓管理
+        # 持仓管理（优先于开仓）
         if self.long_pos > 0:
-            if tick.last_price > self.highest_price_since_entry:
-                self.highest_price_since_entry = tick.last_price
-
-            # 激活移动止盈
-            if not self.trailing_profit_active:
-                if tick.last_price >= self.entry_price * (1.0 + self.profit_activation_pct):
-                    self.trailing_profit_active = True
-                    self.profit_target_line = round(self.highest_price_since_entry * (1.0 - self.profit_rollback_pct), 3)
-                    if self.notice_callback:
-                        self.notice_callback(self.vt_symbol, tick.last_price, "🎯 移动止盈激活",
-                                             f"保护线: {self.profit_target_line}")
-            else:
-                # 更新保护线
-                new_line = round(tick.last_price * (1.0 - self.profit_rollback_pct), 3)
-                if new_line > self.profit_target_line:
-                    self.profit_target_line = new_line
-
-            # 移动止盈触发
-            if self.trailing_profit_active and tick.last_price <= self.profit_target_line:
-                self.is_ordering = True
-                if self.notice_callback:
-                    self.notice_callback(self.vt_symbol, tick.last_price, "💰 追踪止盈",
-                                         f"跌破保护线 {self.profit_target_line}")
-                self.sell(tick.last_price - 0.05, self.long_pos)
-                return
-
-            # 止损触发
-            if not self.trailing_profit_active and tick.last_price <= self.stop_line:
-                self.is_ordering = True
-                if self.notice_callback:
-                    self.notice_callback(self.vt_symbol, tick.last_price, "🚨 止损",
-                                         f"跌破 {self.stop_line}")
-                self.sell(tick.last_price - 0.05, self.long_pos)
-                return
-
-            # 更新止损线
-            if not self.trailing_profit_active:
-                new_stop = tick.last_price * (1.0 - self.stop_loss_pct)
-                if new_stop > self.stop_line:
-                    self.stop_line = round(new_stop, 3)
+            self._manage_position(tick)
             return
 
-        # 不开仓时段
+        # 空仓：判断是否开仓
+        allow_open, must_close = self.check_time_window()
         if not allow_open:
             return
+        if self.sentiment_index < 0.45 and self.get_current_regime() == "unknown":
+            return
 
-        # ── 计算盘口 imbalance ──
-        try:
-            w1, w2, w3, w4, w5 = 0.40, 0.25, 0.15, 0.12, 0.08
-            total_bid = (tick.bid_volume_1 * w1 + tick.bid_volume_2 * w2 +
-                         tick.bid_volume_3 * w3 + tick.bid_volume_4 * w4 + tick.bid_volume_5 * w5)
-            total_ask = (tick.ask_volume_1 * w1 + tick.ask_volume_2 * w2 +
-                         tick.ask_volume_3 * w3 + tick.ask_volume_4 * w4 + tick.ask_volume_5 * w5)
-            total_book = total_bid + total_ask
-            if total_book == 0:
-                return
-            imbalance = total_bid / total_book
-        except AttributeError:
-            # 降级：只用一档
-            total_book = tick.bid_volume_1 + tick.ask_volume_1
-            if total_book == 0:
-                return
-            imbalance = tick.bid_volume_1 / total_book
+        imbalance = self._calc_imbalance(tick)
+        self._last_imbalance = imbalance
 
-        # 开仓信号
         if imbalance > self.imbalance_threshold:
             self.is_ordering = True
-            order_volume = self.calculate_kelly_volume(tick.last_price)
+            vol = self.calculate_kelly_volume(tick.last_price)
+            self.current_trend = 1
+            self.write_log(f"🟢 AI开仓 | imb={imbalance:.2f} vol={vol} price={tick.last_price:.2f}")
             if self.notice_callback:
-                self.notice_callback(self.vt_symbol, tick.last_price, "🟢 AI 开仓",
-                                     f"imbalance={imbalance:.2f} vol={order_volume}")
-            self.buy(tick.last_price + 0.05, order_volume)
+                self.notice_callback(self.vt_symbol, tick.last_price, "🟢 AI开仓", f"imb={imbalance:.2f}")
+            self.buy(tick.last_price + 0.05, vol)
+
+    # ──────────────────────────────
+    #  盘口 imbalance
+    # ──────────────────────────────
+    def _calc_imbalance(self, tick: TickData) -> float:
+        """加权盘口 imbalance，降级安全"""
+        try:
+            bids = [tick.bid_volume_1, tick.bid_volume_2, tick.bid_volume_3, tick.bid_volume_4, tick.bid_volume_5]
+            asks = [tick.ask_volume_1, tick.ask_volume_2, tick.ask_volume_3, tick.ask_volume_4, tick.ask_volume_5]
+            total_bid = sum(b * w for b, w in zip(bids, self.BOOK_WEIGHTS) if b > 0)
+            total_ask = sum(a * w for a, w in zip(asks, self.BOOK_WEIGHTS) if a > 0)
+            total = total_bid + total_ask
+            if total <= 0:
+                return 0.5
+            return total_bid / total
+        except AttributeError:
+            # 降级：仅 1 档
+            total = tick.bid_volume_1 + tick.ask_volume_1
+            if total <= 0:
+                return 0.5
+            return tick.bid_volume_1 / total
+
+    # ──────────────────────────────
+    #  持仓管理
+    # ──────────────────────────────
+    def _manage_position(self, tick: TickData):
+        price = tick.last_price
+
+        # 更新最高价
+        if price > self.highest_price_since_entry:
+            self.highest_price_since_entry = price
+
+        # 激活移动止盈
+        if not self.trailing_profit_active:
+            if price >= self.entry_price * (1 + self.profit_activation_pct):
+                self.trailing_profit_active = True
+                self.profit_target_line = price * (1 - self.profit_rollback_pct)
+                self.write_log(f"🎯 移动止盈激活 @ {self.profit_target_line:.2f}")
+        else:
+            new_line = price * (1 - self.profit_rollback_pct)
+            if new_line > self.profit_target_line:
+                self.profit_target_line = new_line
+
+        # 移动止盈触发
+        if self.trailing_profit_active and price <= self.profit_target_line:
+            self.is_ordering = True
+            self.write_log(f"💰 追踪止盈 @ {price:.2f} < {self.profit_target_line:.2f}")
+            if self.notice_callback:
+                self.notice_callback(self.vt_symbol, price, "💰 追踪止盈", f"跌破 {self.profit_target_line:.2f}")
+            self.sell(price - 0.05, self.long_pos)
+            return
+
+        # 硬止损
+        if price <= self.stop_line:
+            self.is_ordering = True
+            self.write_log(f"🛡️ 止损 @ {price:.2f} <= {self.stop_line:.2f}")
+            if self.notice_callback:
+                self.notice_callback(self.vt_symbol, price, "🛡️ 止损", f"跌破 {self.stop_line:.2f}")
+            self.sell(price - 0.05, self.long_pos)
+            return
+
+        # 尾盘强制清仓
+        _, must_close = self.check_time_window()
+        if must_close:
+            self.is_ordering = True
+            self.write_log(f"🛑 尾盘清仓")
+            if self.notice_callback:
+                self.notice_callback(self.vt_symbol, price, "🛑 尾盘清仓", "")
+            self.sell(price - 0.05, self.long_pos)
+
+    # ──────────────────────────────
+    #  on_bar（备用，记录 1M 收盘价）
+    # ──────────────────────────────
+    def on_1m_bar(self, bar: BarData):
+        super().on_1m_bar(bar)
+        self.last_price = bar.close_price
 
     # ──────────────────────────────
     #  回调
     # ──────────────────────────────
     def on_order(self, order: OrderData):
-        if order.status in (Status.REJECTED, Status.CANCELLED):
+        super().on_order(order)
+        if order.status in (Status.REJECTED, Status.CANCELLED, Status.ALLTRADED):
             self.is_ordering = False
 
     def on_trade(self, trade: TradeData):
+        super().on_trade(trade)
         if trade.direction == Direction.LONG:
             self.long_pos += trade.volume
             self.entry_price = trade.price
-            self.stop_line = round(trade.price * (1.0 - self.stop_loss_pct), 3)
+            self.stop_line = round(trade.price * (1 - self.stop_loss_pct), 3)
             self.highest_price_since_entry = trade.price
             self.trailing_profit_active = False
-            self.write_log(f"[on_trade] BUY {trade.volume}@{trade.price:.2f} | pos={self.long_pos}")
+            self.write_log(f"[成交] BUY {trade.volume}@{trade.price:.2f} | 持仓={self.long_pos}")
         else:
-            pnl = (trade.price - self.entry_price) * trade.volume if self.entry_price > 0 else 0.0
+            pnl = (trade.price - self.entry_price) * trade.volume if self.entry_price > 0 else 0
             self.today_pnl += pnl
             self.total_trades += 1
             if pnl > 0:
@@ -282,6 +295,6 @@ class TickOrderFlowStrategy(CtaTemplate):
             if self.long_pos == 0:
                 self.entry_price = 0.0
                 self.stop_line = 0.0
-            self.write_log(f"[on_trade] SELL {trade.volume}@{trade.price:.2f} | pnl={pnl:+.2f}")
+            self.write_log(f"[成交] SELL {trade.volume}@{trade.price:.2f} | PnL={pnl:+.2f}")
         self.is_ordering = False
         self.put_event()

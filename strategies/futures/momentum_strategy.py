@@ -1,7 +1,11 @@
 """
-strategies/futures/momentum_strategy.py - v2.6.0
+strategies/futures/momentum_strategy.py - v3.0.0
 期货动量策略（占位/研究用）
 当前仅做框架，待期货数据源就绪后可启用
+
+变更 v3.0.0：
+  - ★ 显式初始化所有 parameters（防止 setting 缺失导致 AttributeError）
+  - 兼容 vnpy CtaTemplate 的 setting 字典注入
 """
 from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
 from vnpy.trader.object import BarData, TickData
@@ -11,10 +15,10 @@ class MomentumStrategy(CtaTemplate):
     author = "Apollo"
 
     parameters = [
-        "momentum_window",    # 动量计算窗口
-        "entry_threshold",    # 入场动量阈值
+        "momentum_window",
+        "entry_threshold",
         "fixed_size",
-        "stop_loss_atr",      # ATR止损倍数
+        "stop_loss_atr",
     ]
 
     variables = [
@@ -23,6 +27,13 @@ class MomentumStrategy(CtaTemplate):
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+
+        # ★ 显式初始化所有参数（防止 setting 缺失导致 AttributeError）
+        self.momentum_window = setting.get("momentum_window", 20)
+        self.entry_threshold = setting.get("entry_threshold", 0.02)
+        self.fixed_size = setting.get("fixed_size", 1)
+        self.stop_loss_atr = setting.get("stop_loss_atr", 2.0)
+
         self.pos = 0
         self.momentum = 0.0
         self.atr_value = 0.0
@@ -48,22 +59,23 @@ class MomentumStrategy(CtaTemplate):
         if not self.am.inited:
             return
 
-        # 计算动量
         if len(self.am.close) > self.momentum_window:
-            self.momentum = (self.am.close[-1] - self.am.close[-self.momentum_window]) / self.am.close[-self.momentum_window]
+            self.momentum = (self.am.close[-1] - self.am.close[-self.momentum_window]) / (
+                self.am.close[-self.momentum_window] + 1e-6
+            )
         self.atr_value = self.am.atr(14, array=False)
 
-        # 交易逻辑（框架）
         if self.pos == 0:
             if self.momentum > self.entry_threshold:
                 self.buy(bar.close_price, self.fixed_size)
-                self.write_log("动量多头入场")
+                self.write_log(f"动量多头入场 | momentum={self.momentum:.4f}")
             elif self.momentum < -self.entry_threshold:
                 self.short(bar.close_price, self.fixed_size)
-                self.write_log("动量空头入场")
+                self.write_log(f"动量空头入场 | momentum={self.momentum:.4f}")
         else:
-            # 止损
             if self.pos > 0 and bar.close_price < self.am.close[-1] - self.atr_value * self.stop_loss_atr:
                 self.sell(bar.close_price, abs(self.pos))
+                self.write_log(f"多头止损出场 | atr={self.atr_value:.2f}")
             elif self.pos < 0 and bar.close_price > self.am.close[-1] + self.atr_value * self.stop_loss_atr:
                 self.cover(bar.close_price, abs(self.pos))
+                self.write_log(f"空头止损出场 | atr={self.atr_value:.2f}")

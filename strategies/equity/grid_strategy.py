@@ -1,9 +1,13 @@
 """
-strategies/equity/grid_strategy.py - v2.8.0
-网格交易策略：震荡市高抛低吸
-v2.8.0 优化：继承 ApolloBaseStrategy，统一接口规范
+strategies/equity/grid_strategy.py - v2.9.0
+网格交易策略 + ATR 动态间距 + 趋势感知 + Regime 过滤
+v2.9.0 优化：
+- 继承 ApolloBaseStrategy
+- ATR 间距替代固定百分比（自适应波动）
+- 趋势过滤：强趋势时不挂逆势网格
+- 中心价随 5M MA 漂移
+- 网格穿越交易 + 超时回收
 """
-from typing import Optional
 import numpy as np
 
 from vnpy.trader.object import BarData, TickData
@@ -13,20 +17,23 @@ from strategies.base_strategy import ApolloBaseStrategy
 
 
 class GridStrategy(ApolloBaseStrategy):
-    """网格交易策略"""
+    """网格交易策略（v2.9.0）"""
 
     author = "Apollo"
 
     parameters = ApolloBaseStrategy.parameters + [
-        "grid_count",           # 网格层数
-        "grid_spacing_pct",     # 每层间距（百分比）
-        "center_price",         # 网格中心价（0=自动使用当前价）
-        "use_atr_spacing",      # 是否用ATR动态调整间距
-        "atr_spacing_multiplier", # ATR倍数作为间距
+        "grid_count",
+        "grid_spacing_pct",
+        "center_price",
+        "use_atr_spacing",
+        "atr_spacing_multiplier",
+        "recenter_threshold_pct",
+        "trend_filter_strength",
     ]
     variables = ApolloBaseStrategy.variables + [
         "grid_upper", "grid_lower",
-        "last_grid_level",
+        "last_grid_level", "atr_val",
+        "_5m_ma_diff",
     ]
 
     DEFAULTS = {
@@ -36,6 +43,9 @@ class GridStrategy(ApolloBaseStrategy):
         "center_price": 0.0,
         "use_atr_spacing": True,
         "atr_spacing_multiplier": 1.0,
+        "recenter_threshold_pct": 2.0,
+        "trend_filter_strength": 0.5,
+        "max_holding_bars": 120,
     }
 
     def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
@@ -44,65 +54,101 @@ class GridStrategy(ApolloBaseStrategy):
         self.grid_upper = 0.0
         self.grid_lower = 0.0
         self.last_grid_level = 0
-        self._grid_levels: list = []
+        self.atr_val = 0.0
+        self._5m_ma_diff = 0.0
+
+        self._grid_levels = []
         self._init_done = False
+
+        from vnpy.trader.utility import ArrayManager
+        self.am_5m = ArrayManager(100)
 
     def on_init(self):
         super().on_init()
-        self.write_log(f"网格策略初始化 | 层数={self.grid_count} 间距={self.grid_spacing_pct*100:.1f}%")
+        self.write_log(f"网格策略初始化 | 层数={self.grid_count} ATR间距={self.use_atr_spacing}")
 
-    def on_bar(self, bar: BarData):
-        """Bar回调：计算网格并交易"""
+    # ── 1M 层：网格执行 ──
+    def on_1m_bar(self, bar: BarData):
+        super().on_1m_bar(bar)
+        if not self.am.inited:
+            return
+
         close = bar.close_price
+        self.atr_val = self.am.atr(self.atr_period if hasattr(self, 'atr_period') else 14, array=False)
 
-        # 首次初始化网格
+        # 初始化网格
         if not self._init_done:
             center = self.center_price if self.center_price > 0 else close
             self._build_grid(center, close)
             self._init_done = True
             return
 
-        # 动态更新网格（中心跟随价格中值）
-        if close > self.grid_upper * 1.02 or close < self.grid_lower * 0.98:
-            center = close
-            self._build_grid(center, close)
+        # 中心漂移（跟随 5M MA）
+        if hasattr(self, '_5m_center'):
+            center = self._5m_center
+        else:
+            center = self.grid_lower + (self.grid_upper - self.grid_lower) / 2
 
-        # 判断当前网格层级
+        # 是否需要重建网格
+        drift_pct = abs(close - center) / center * 100 if center > 0 else 0
+        if drift_pct > self.recenter_threshold_pct:
+            self._build_grid(close, close)
+            self.write_log(f"📊 网格重建(漂移{drift_pct:.1f}%) | 新中心={close:.2f}")
+
+        # 穿越检测
         current_level = self._price_to_level(close)
-
-        # 穿越网格 → 交易
         if current_level != self.last_grid_level and self.last_grid_level != 0:
             direction = "UP" if current_level > self.last_grid_level else "DOWN"
             levels_crossed = abs(current_level - self.last_grid_level)
-
             self.write_log(f"📊 网格穿越: {direction} 层级={current_level} 跨越={levels_crossed}")
 
-            if direction == "UP" and self.pos <= 0:
-                # 价格上行 → 平空 + 开多
-                if self.pos < 0:
-                    self.cover(close, abs(self.pos))
-                self.buy(close, self.fixed_size * levels_crossed)
-            elif direction == "DOWN" and self.pos >= 0:
-                # 价格下行 → 平多 + 开空
-                if self.pos > 0:
-                    self.sell(close, abs(self.pos))
-                if hasattr(self, 'use_short') and self.use_short:
+            # 趋势过滤
+            trend_ok = True
+            if self.trend_filter_strength > 0 and self._5m_ma_diff != 0:
+                if direction == "UP" and self._5m_ma_diff < -self.trend_filter_strength:
+                    trend_ok = False  # 下跌趋势中不接刀
+                elif direction == "DOWN" and self._5m_ma_diff > self.trend_filter_strength:
+                    trend_ok = False  # 上涨趋势中不摸顶
+
+            if trend_ok:
+                if direction == "UP" and self.pos <= 0:
+                    if self.pos < 0:
+                        self.cover(close, abs(self.pos))
+                    self.buy(close, self.fixed_size * levels_crossed)
+                    self.write_log(f"🟢 网格买 | {close:.2f}")
+                elif direction == "DOWN" and self.pos >= 0:
+                    if self.pos > 0:
+                        self.sell(close, abs(self.pos))
                     self.short(close, self.fixed_size * levels_crossed)
+                    self.write_log(f"🔴 网格卖 | {close:.2f}")
 
         self.last_grid_level = current_level
 
-    def on_tick(self, tick: TickData):
-        """Tick回调直接转Bar处理"""
-        pass  # 网格策略用Bar即可
+        # 超时回收
+        if self.pos != 0 and self.bars_held >= self.max_holding_bars:
+            if self.pos > 0:
+                self.sell(close, abs(self.pos))
+            else:
+                self.cover(close, abs(self.pos))
+            self.write_log(f"⏰ 网格超时回收 | bars={self.bars_held}")
 
+    # ── 5M 层：中心参考 + 趋势 ──
+    def on_5m_bar(self, bar: BarData):
+        self.am_5m.update_bar(bar)
+        if not self.am_5m.inited:
+            return
+        ma_fast = self.am_5m.sma(10, array=False)
+        ma_slow = self.am_5m.sma(30, array=False)
+        self._5m_ma_diff = (ma_fast - ma_slow) / ma_slow * 100 if ma_slow > 0 else 0
+        self._5m_center = ma_fast
+
+    # ── 网格构建 ──
     def _build_grid(self, center: float, current_price: float):
-        """构建网格层级"""
-        if self.use_atr_spacing and hasattr(self, 'atr_val'):
+        if self.use_atr_spacing and self.atr_val > 0:
             spacing = self.atr_val * self.atr_spacing_multiplier
         else:
             spacing = center * self.grid_spacing_pct
-
-        spacing = max(spacing, center * 0.003)  # 最小间距 0.3%
+        spacing = max(spacing, center * 0.003)
 
         self._grid_levels = []
         for i in range(-self.grid_count, self.grid_count + 1):
@@ -111,18 +157,13 @@ class GridStrategy(ApolloBaseStrategy):
         self.grid_upper = self._grid_levels[-1]
         self.grid_lower = self._grid_levels[0]
         self.last_grid_level = self._price_to_level(current_price)
-
-        self.write_log(
-            f"📊 网格重建 | 中心={center:.2f} 间距={spacing:.2f} "
-            f"范围=[{self.grid_lower:.2f}, {self.grid_upper:.2f}]"
-        )
+        self.write_log(f"📊 网格 | 中心={center:.2f} 间距={spacing:.2f} [{self.grid_lower:.2f}, {self.grid_upper:.2f}]")
 
     def _price_to_level(self, price: float) -> int:
-        """将价格映射到网格层级索引"""
         if not self._grid_levels:
             return 0
-        for i, level_price in enumerate(self._grid_levels):
-            if price >= level_price:
+        for i, lp in enumerate(self._grid_levels):
+            if price >= lp:
                 return i
         return 0
 

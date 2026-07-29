@@ -1,0 +1,55 @@
+{
+    "tick": {
+        "BABA.SMART": {
+            "symbol": "BABA",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "TSLA.SMART": {
+            "symbol": "TSLA",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "AAPL.SMART": {
+            "symbol": "AAPL",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "NVDA.SMART": {
+            "symbol": "NVDA",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "MSFT.SMART": {
+            "symbol": "MSFT",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "NFLX.SMART": {
+            "symbol": "NFLX",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "META.SMART": {
+            "symbol": "META",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "GOOGL.SMART": {
+            "symbol": "GOOGL",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "AMD.SMART": {
+            "symbol": "AMD",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        },
+        "AMZN.SMART": {
+            "symbol": "AMZN",
+            "exchange": "SMART",
+            "gateway_name": "FUTU_US"
+        }
+    },
+    "bar": {}
+}

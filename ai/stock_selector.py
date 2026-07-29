@@ -1,28 +1,57 @@
 """
-ai/stock_selector.py — AI选股器 v2.7.0
-功能：技术面+资金面评分，排序后写入数据库
-版本：v2.7.0
-变更：2026-07-26 修复 add_to_pool 调用，去除重复写入逻辑
+ai/stock_selector.py — AI选股器 v3.0.0
+==========================================
+变更：
+  v3.0.0 - 接入 KlineProvider，不再自己调 request_history_kline。
+           日K 由 Provider 统一拉取+缓存，本模块零重复请求。
+           三返回值解包统一 ret, data, *_。
+           内置 vt↔futu 符号转换兜底。
+功能：技术面+资金面评分，排序后写入 ai_stock_pool。
 """
 
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import numpy as np
-from futu import RET_OK, KLType
+
+try:
+    from futu import RET_OK
+except ImportError:
+    RET_OK = 0
+
+# 统一K线提供者（同目录下的 kline_provider.py）
+from core.kline_provider import KlineProvider
 
 
 class AIStockSelector:
-    def __init__(self, quote_ctx, db=None, top_n: int = 30, market: str = "US"):
+    """
+    选股器。
+    使用方式（推荐）：
+        kp = KlineProvider(quote_ctx=us_ctx, market="US")
+        sel = AIStockSelector(quote_ctx=us_ctx, db=db,
+                              kline_provider=kp, market="US")
+        selected = sel.select()
+    """
+
+    def __init__(self, quote_ctx, db=None, top_n: int = 30,
+                 market: str = "US", kline_provider: Optional[KlineProvider] = None):
         self.ctx = quote_ctx
         self.db = db
         self.top_n = top_n
         self.market = market
         self.min_score = 55.0
+        self.kp = kline_provider  # 共享K线提供者
+
+    # ==================== 公开 API ====================
 
     def select(self, universe: Optional[List[str]] = None) -> List[Dict]:
         if universe is None:
             universe = self._get_default_universe()
+
+        # 预热：把本批股票的日K一次性拉满缓存
+        if self.kp is not None:
+            self.kp.preload(universe, ktype="K_DAY", days=120)
+
         scored = []
         for code in universe:
             try:
@@ -31,17 +60,18 @@ class AIStockSelector:
                     scored.append(s)
             except Exception as e:
                 print(f"[Selector] {code} 评分失败: {e}")
+            # 快照仍受限频约束，保留间隔
             time.sleep(0.3)
+
         scored.sort(key=lambda x: x["score"], reverse=True)
         selected = scored[:self.top_n]
 
-        # 一次性写入数据库
         if self.db:
             pool = []
             for s in selected:
-                stock_code = s["vt_symbol"]
+                vt = s["vt_symbol"]
                 pool.append({
-                    "stock_code": stock_code,
+                    "stock_code": vt,
                     "market": self.market,
                     "score": s["score"],
                     "reason": s.get("reason", ""),
@@ -49,30 +79,59 @@ class AIStockSelector:
                     "expires_at": (datetime.now() + timedelta(hours=24)).isoformat(),
                     "status": "selected"
                 })
-            self.db.add_to_pool(pool)
+            try:
+                self.db.add_to_pool(pool)
+            except Exception as e:
+                print(f"[Selector] add_to_pool 失败: {e}")
+                # 尝试兼容旧接口
+                try:
+                    if hasattr(self.db, 'save_stock_pool'):
+                        self.db.save_stock_pool(pool)
+                except Exception as e2:
+                    print(f"[Selector] save_stock_pool 也失败: {e2}")
             print(f"[Selector] ✅ {len(selected)} 只写入 ai_stock_pool")
 
         return selected
 
+    # ==================== 内部方法 ====================
+
     def _score(self, code: str) -> Dict:
-        ret, data, *_ = self.ctx.get_market_snapshot([code])
+        """
+        对单只票评分。快照走批量接口（单次1额度），
+        日K 走 KlineProvider（命中缓存即零请求）。
+        """
+        # 1. 快照
+        ret, data = self.ctx.get_market_snapshot([code])
         if ret != RET_OK or data.empty:
             raise RuntimeError(f"snapshot fail for {code}")
+
         row = data.iloc[0]
         last = float(row.get("last_price", 0))
         prev = float(row.get("prev_close_price", last))
-        chg = (last - prev) / prev if prev else 0
+        chg = (last - prev) / prev if prev else 0.0
         turnover = float(row.get("turnover", 0))
 
-        ret, k, *_ = self.ctx.request_history_kline(
-            code, ktype=KLType.K_DAY,
-            start=(datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d"),
-            end=datetime.now().strftime("%Y-%m-%d"), max_count=120)
-        if ret != RET_OK or k.empty:
+        # 2. 日K（统一从 Provider 取）
+        vt = KlineProvider.futu_to_vt(code)
+        if self.kp is not None:
+            k = self.kp.get_daily(vt, days=120)
+        else:
+            # 降级：直接调（不推荐，仅保底）
+            from futu import KLType
+            r2, k, *_ = self.ctx.request_history_kline(
+                code, ktype=KLType.K_DAY,
+                start=(datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
+                end=datetime.now().strftime("%Y-%m-%d"), max_count=120)
+            if r2 != RET_OK:
+                k = None
+
+        if k is None or k.empty:
             raise RuntimeError(f"kline fail for {code}")
+
         c = k["close"].astype(float).values
         v = k["volume"].astype(float).values
 
+        # 3. 指标
         ma5 = self._ma(c, 5)
         ma10 = self._ma(c, 10)
         ma20 = self._ma(c, 20)
@@ -81,10 +140,16 @@ class AIStockSelector:
         vr = float(v[-1]) / (self._ma(v, 20) + 1e-6)
 
         indicators = {
-            "last": last, "chg": chg, "ma5": ma5, "ma20": ma20,
-            "rsi": rsi, "macd_hist": hist, "vr": vr
+            "last": round(last, 4),
+            "chg": round(chg, 6),
+            "ma5": round(ma5, 4),
+            "ma20": round(ma20, 4),
+            "rsi": round(rsi, 2),
+            "macd_hist": round(hist, 6),
+            "vr": round(vr, 3),
         }
 
+        # 4. 打分
         score = 50.0
         reasons = []
         if ma5 > ma10 > ma20:
@@ -104,11 +169,11 @@ class AIStockSelector:
         score = min(score, 100.0)
 
         return {
-            "vt_symbol": self._to_vt(code),
+            "vt_symbol": vt,
             "code": code,
             "score": round(score, 2),
             "reason": ";".join(reasons),
-            "indicators": indicators
+            "indicators": indicators,
         }
 
     def _get_default_universe(self) -> List[str]:
@@ -117,9 +182,7 @@ class AIStockSelector:
                     "US.META", "US.GOOGL", "US.AMD", "US.NFLX", "US.BABA"]
         return ["HK.00700", "HK.09988", "HK.03690", "HK.00388", "HK.00941"]
 
-    @staticmethod
-    def _to_vt(code):
-        return code.replace("US.", "") + ".SMART" if code.startswith("US.") else code.replace("HK.", "") + ".SEHK"
+    # ==================== 静态工具 ====================
 
     @staticmethod
     def _ma(d, n):

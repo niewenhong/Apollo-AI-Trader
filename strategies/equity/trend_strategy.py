@@ -1,34 +1,39 @@
 """
-strategies/equity/trend_strategy.py - v2.8.0
-趋势跟踪策略：均线突破 + ATR 止损 + 趋势确认
-v2.8.0 优化：继承 ApolloBaseStrategy，统一接口规范
+strategies/equity/trend_strategy.py - v2.9.0
+趋势跟踪策略：多周期均线 + ADX 过滤 + ATR 止损 + Regime 感知
+v2.9.0 优化：
+- 分层：on_1m_bar 做执行，on_5m_bar 做趋势确认，on_60m_bar 更新宏观方向
+- 利用已订阅的 5M/15M/60M K线（不再额外占额度）
+- ADX 阈值动态化（根据 regime 调整）
+- 突破确认用 5M 收盘价序列，减少噪音
 """
 import numpy as np
 
 from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
+from vnpy.trader.constant import Direction, Interval
 
 from strategies.base_strategy import ApolloBaseStrategy
 
 
 class TrendStrategy(ApolloBaseStrategy):
-    """趋势跟踪策略：双均线 + 突破确认 + ATR 止损"""
+    """趋势跟踪：双均线 + ADX + ATR 止损，多周期确认"""
 
     author = "Apollo"
 
     parameters = ApolloBaseStrategy.parameters + [
-        "ma_fast",              # 快线周期
-        "ma_slow",              # 慢线周期
-        "breakout_period",      # 突破确认周期
-        "atr_period",           # ATR 周期
-        "atr_stop_multiplier",  # ATR 止损倍数
-        "adx_period",           # ADX 周期
-        "adx_threshold",        # ADX 趋势强度阈值
-        "use_trailing",         # 是否使用移动止盈
+        "ma_fast",
+        "ma_slow",
+        "breakout_period",
+        "atr_period",
+        "atr_stop_multiplier",
+        "adx_period",
+        "adx_threshold",
+        "use_trailing",
+        "regime_boost",
     ]
     variables = ApolloBaseStrategy.variables + [
         "ma_fast_val", "ma_slow_val", "adx_val",
-        "atr_val", "trend_direction",
+        "atr_val", "trend_direction", "confirmed_trend",
     ]
 
     DEFAULTS = {
@@ -41,6 +46,7 @@ class TrendStrategy(ApolloBaseStrategy):
         "adx_period": 14,
         "adx_threshold": 20,
         "use_trailing": True,
+        "regime_boost": True,
     }
 
     def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
@@ -50,111 +56,115 @@ class TrendStrategy(ApolloBaseStrategy):
         self.ma_slow_val = 0.0
         self.adx_val = 0.0
         self.atr_val = 0.0
-        self.trend_direction = 0  # 1=多, -1=空, 0=无
+        self.trend_direction = 0
+        self.confirmed_trend = 0  # 由 5M 确认的 trend
 
-        # K线工具
-        from vnpy.trader.utility import BarGenerator, ArrayManager
-        self.bg = BarGenerator(self.on_bar, 1, self.on_1m_bar)
-        self.am = ArrayManager(100)
+        # 独立的 5M ArrayManager（不占用额外订阅额度，数据由 gateway 推送）
+        from vnpy.trader.utility import ArrayManager
+        self.am_5m = ArrayManager(100)
+        self.am_60m = ArrayManager(100)
 
     def on_init(self):
         super().on_init()
-        self.write_log(f"趋势策略初始化 | 快线={self.ma_fast} 慢线={self.ma_slow}")
+        self.write_log(f"趋势策略初始化 | 快线={self.ma_fast} 慢线={self.ma_slow} ADX={self.adx_threshold}")
 
-    def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
-
-    def on_bar(self, bar: BarData):
-        self.bg.update_bar(bar)
-
+    # ── 1M 层：执行层（快，但噪音大）──
     def on_1m_bar(self, bar: BarData):
-        """1分钟K线核心逻辑"""
-        am = self.am
-        am.update_bar(bar)
-        if not am.inited:
+        super().on_1m_bar(bar)
+        if not self.am.inited:
             return
 
         close = bar.close_price
-
-        # 计算指标
-        self.ma_fast_val = am.sma(self.ma_fast, array=False)
-        self.ma_slow_val = am.sma(self.ma_slow, array=False)
-        self.atr_val = am.atr(self.atr_period, array=False)
-
-        if len(am.close) >= self.adx_period:
-            self.adx_val = am.adx(self.adx_period, array=False)
+        self.ma_fast_val = self.am.sma(self.ma_fast, array=False)
+        self.ma_slow_val = self.am.sma(self.ma_slow, array=False)
+        self.atr_val = self.am.atr(self.atr_period, array=False)
+        if len(self.am.close) >= self.adx_period:
+            self.adx_val = self.am.adx(self.adx_period, array=False)
         else:
             self.adx_val = 0.0
 
-        # 趋势方向判断
-        trend = 0
-        if self.ma_fast_val > self.ma_slow_val and self.adx_val > self.adx_threshold:
-            trend = 1  # 上升趋势
-        elif self.ma_fast_val < self.ma_slow_val and self.adx_val > self.adx_threshold:
-            trend = -1  # 下降趋势
+        # Regime 感知：动态调整 ADX 阈值
+        adx_th = self.adx_threshold
+        if self.regime_boost:
+            r = self.get_current_regime()
+            if r in ("strong_bull", "strong_bear"):
+                adx_th = max(adx_th - 5, 10)
+            elif r == "unknown":
+                adx_th = adx_th + 5
 
-        # 突破确认：连续 N 根K线方向一致
-        breakout_up = self._check_breakout(am.close, self.breakout_period, direction=1)
-        breakout_down = self._check_breakout(am.close, self.breakout_period, direction=-1)
-
-        # ── 交易决策 ──
-        if self.pos == 0:
-            if trend == 1 and breakout_up:
-                self.buy(close, self.fixed_size)
-                self.write_log(f"🟢 趋势做多 | MA金叉+突破 | score=UP adx={self.adx_val:.0f}")
-            elif trend == -1 and breakout_down:
-                self.short(close, self.fixed_size)
-                self.write_log(f"🔴 趋势做空 | MA死叉+突破 | score=DOWN adx={self.adx_val:.0f}")
-
-        elif self.pos > 0:
-            # 多头止损/止盈
+        # 持仓管理（在 1M 层做止损，反应快）
+        if self.pos > 0:
             if self.use_trailing:
                 if self.update_trailing_stop(close):
                     self.sell(close, abs(self.pos))
                     self.write_log(f"🛡️ 趋势多头止损/止盈 @ {close:.2f}")
                     return
             else:
-                hard_stop = self.entry_price - self.atr_val * self.atr_stop_multiplier
-                if close <= hard_stop:
+                hard = self.entry_price - self.atr_val * self.atr_stop_multiplier
+                if close <= hard:
                     self.sell(close, abs(self.pos))
                     self.write_log(f"🛡️ ATR硬止损(多) @ {close:.2f}")
                     return
-
-            # 趋势反转平仓
-            if trend == -1 and breakout_down:
+            # 超时平仓
+            if self.bars_held >= self.max_holding_bars:
                 self.sell(close, abs(self.pos))
-                self.write_log(f"🔁 趋势反转平仓(多)")
+                self.write_log(f"⏰ 超时平仓(多) @ {close:.2f} bars={self.bars_held}")
+                return
 
         elif self.pos < 0:
-            # 空头止损
             if self.use_trailing:
                 if self.update_trailing_stop(close):
                     self.cover(close, abs(self.pos))
                     self.write_log(f"🛡️ 趋势空头止损/止盈 @ {close:.2f}")
                     return
             else:
-                hard_stop = self.entry_price + self.atr_val * self.atr_stop_multiplier
-                if close >= hard_stop:
+                hard = self.entry_price + self.atr_val * self.atr_stop_multiplier
+                if close >= hard:
                     self.cover(close, abs(self.pos))
                     self.write_log(f"🛡️ ATR硬止损(空) @ {close:.2f}")
                     return
-
-            # 趋势反转平仓
-            if trend == 1 and breakout_up:
+            if self.bars_held >= self.max_holding_bars:
                 self.cover(close, abs(self.pos))
-                self.write_log(f"🔁 趋势反转平仓(空)")
+                self.write_log(f"⏰ 超时平仓(空) @ {close:.2f} bars={self.bars_held}")
+                return
 
-        self.trend_direction = trend
+        # 开仓（需 5M 确认 + Regime 过滤）
+        if self.pos == 0 and self.confirmed_trend != 0 and self.is_regime_tradeable():
+            allow_open, _ = self.check_time_window(bar.datetime)
+            if not allow_open:
+                return
+            if self.confirmed_trend == 1 and self.ma_fast_val > self.ma_slow_val:
+                self.buy(close, self.fixed_size)
+                self.write_log(f"🟢 趋势做多 | 5M确认+MA金叉 ADX={self.adx_val:.0f}>{adx_th:.0f}")
+            elif self.confirmed_trend == -1 and self.ma_fast_val < self.ma_slow_val:
+                self.short(close, self.fixed_size)
+                self.write_log(f"🔴 趋势做空 | 5M确认+MA死叉 ADX={self.adx_val:.0f}>{adx_th:.0f}")
 
-    def _check_breakout(self, close_arr, period: int, direction: int) -> bool:
-        """检查连续 period 根K线是否同向"""
-        if len(close_arr) < period + 1:
-            return False
-        recent = close_arr[-period-1:]
-        if direction == 1:
-            return all(recent[i] > recent[i-1] for i in range(1, len(recent)))
+    # ── 5M 层：趋势确认层 ──
+    def on_5m_bar(self, bar: BarData):
+        self.am_5m.update_bar(bar)
+        if not self.am_5m.inited:
+            return
+        fast = self.am_5m.sma(self.ma_fast, array=False)
+        slow = self.am_5m.sma(self.ma_slow, array=False)
+
+        if fast > slow:
+            self.confirmed_trend = 1
+        elif fast < slow:
+            self.confirmed_trend = -1
         else:
-            return all(recent[i] < recent[i-1] for i in range(1, len(recent)))
+            self.confirmed_trend = 0
+
+        self.trend_direction = self.confirmed_trend
+
+    # ── 60M 层：宏观方向 + ADX ──
+    def on_60m_bar(self, bar: BarData):
+        self.am_60m.update_bar(bar)
+        if not self.am_60m.inited:
+            return
+        # 可选：用 60M ADX 判断大趋势强度，写入日志供监控
+        adx60 = self.am_60m.adx(self.adx_period, array=False)
+        self.write_log(f"[60M] close={bar.close_price:.2f} ADX60={adx60:.0f} trend_dir={self.trend_direction}")
 
     def on_trade(self, trade):
         super().on_trade(trade)

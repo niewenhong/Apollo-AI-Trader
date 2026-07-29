@@ -1,8 +1,12 @@
 """
-core/prelive_gate.py - Apollo Trader v2.7.0
+core/prelive_gate.py - v2.8.4 兼容版
 策略启动前回测验证门禁（Pre-live Backtest Gate）
-复用 vnpy_ctabacktester 的 BacktestingEngine，
-对策略参数进行历史回测，判断是否通过门禁阈值。
+
+关键事实：
+  - DBManager.save_prelive_result() 字段：
+    vt_symbol, strategy_class, version, modifier, passed,
+    total_return, sharpe_ratio, max_drawdown, total_trade_count, reason
+  - 回测引擎：优先 vnpy_ctabacktester，不可用时用模拟数据
 """
 import json
 import time
@@ -31,11 +35,11 @@ class PreliveGate:
 
     # 默认门禁阈值
     DEFAULT_THRESHOLDS = {
-        "min_total_return": 0.0,        # 最低总收益率（>0 即盈利）
-        "min_sharpe_ratio": 0.0,       # 最低夏普比率
-        "max_drawdown": 0.30,           # 最大允许回撤 30%
-        "min_trade_count": 5,           # 最少交易次数（避免样本过少误判）
-        "min_win_rate": 0.35,           # 最低胜率
+        "min_total_return": 0.0,
+        "min_sharpe_ratio": 0.0,
+        "max_drawdown": 0.30,
+        "min_trade_count": 5,
+        "min_win_rate": 0.35,
     }
 
     def __init__(self, db, thresholds: Optional[Dict] = None):
@@ -46,9 +50,8 @@ class PreliveGate:
         self.db = db
         self.thresholds = {**self.DEFAULT_THRESHOLDS, **(thresholds or {})}
 
-    # ═══════════════════════════════════════════════════════
-    #  门禁验证（单个策略）
-    # ═══════════════════════════════════════════════════════
+    # ==================== 门禁验证（单个策略） ====================
+
     def validate(
         self,
         strategy_class_name: str,
@@ -65,20 +68,7 @@ class PreliveGate:
         pricetick: float = 0.01,
         capital: int = 1_000_000,
     ) -> Dict[str, Any]:
-        """
-        对单个策略执行回测验证。
-        返回标准结果字典：
-        {
-            'pass': bool,
-            'total_return': float,
-            'sharpe_ratio': float,
-            'max_drawdown': float,
-            'total_trade_count': int,
-            'win_rate': float,
-            'reason': str,
-            'stats': dict,
-        }
-        """
+        """对单个策略执行回测验证，返回标准结果字典"""
         # 确定回测时间范围
         if not end:
             end = datetime.now().strftime("%Y-%m-%d")
@@ -95,11 +85,11 @@ class PreliveGate:
             stats = self._run_mock_backtest(setting)
 
         # 应用门禁阈值
-        total_return = stats.get("total_return", 0.0)
-        sharpe = stats.get("sharpe_ratio", 0.0)
-        max_dd = stats.get("max_drawdown", 1.0)
+        total_return = float(stats.get("total_return", 0.0))
+        sharpe = float(stats.get("sharpe_ratio", 0.0))
+        max_dd = float(stats.get("max_drawdown", 1.0))
         trade_count = int(stats.get("total_trade_count", 0))
-        win_rate = stats.get("win_rate", 0.0)
+        win_rate = float(stats.get("win_rate", 0.0))
 
         t = self.thresholds
         reasons = []
@@ -133,7 +123,7 @@ class PreliveGate:
             self.db.save_prelive_result(
                 vt_symbol=vt_symbol,
                 strategy_class=strategy_class_name,
-                version=setting.get("_version", 0),
+                version=int(setting.get("_version", 0)),
                 modifier=modifier,
                 passed=passed,
                 total_return=total_return,
@@ -151,17 +141,10 @@ class PreliveGate:
         )
         return result
 
-    # ═══════════════════════════════════════════════════════
-    #  批量验证
-    # ═══════════════════════════════════════════════════════
+    # ==================== 批量验证 ====================
+
     def validate_all(self, strategies_config: list) -> Dict[str, Dict]:
-        """
-        批量验证多个策略。
-        :param strategies_config: list of dict，每项包含：
-            strategy_name, class_name, strategy_class(obj), vt_symbol,
-            setting(dict), modifier(可选)
-        返回: {strategy_name: result_dict}
-        """
+        """批量验证多个策略"""
         results = {}
         for cfg in strategies_config:
             name = cfg["strategy_name"]
@@ -184,9 +167,8 @@ class PreliveGate:
                 }
         return results
 
-    # ═══════════════════════════════════════════════════════
-    #  内部：vnpy 回测
-    # ═══════════════════════════════════════════════════════
+    # ==================== 内部：vnpy 回测 ====================
+
     def _run_vnpy_backtest(
         self, strategy_class, vt_symbol, setting,
         start, end, interval, rate, slippage, size, pricetick, capital
@@ -210,7 +192,6 @@ class PreliveGate:
         df = engine.calculate_result()
         stats = engine.calculate_statistics(output=False) or {}
 
-        # 兼容 vnpy 不同版本的统计字段名
         normalized = {
             "total_return": stats.get("total_return", stats.get("total_net_pnl", 0)),
             "sharpe_ratio": stats.get("sharpe_ratio", 0),
@@ -223,7 +204,7 @@ class PreliveGate:
     def _run_mock_backtest(self, setting: dict) -> dict:
         """当 vnpy 回测模块不可用时，生成模拟结果"""
         import random
-        random.seed(hash(json.dumps(setting, sort_keys=True)) % 2**32)
+        random.seed(abs(hash(json.dumps(setting, sort_keys=True))) % (2**32))
         return {
             "total_return": random.uniform(-0.05, 0.15),
             "sharpe_ratio": random.uniform(-0.5, 2.5),
@@ -232,9 +213,8 @@ class PreliveGate:
             "win_rate": random.uniform(0.3, 0.7),
         }
 
-    # ═══════════════════════════════════════════════════════
-    #  阈值管理
-    # ═══════════════════════════════════════════════════════
+    # ==================== 阈值管理 ====================
+
     def set_threshold(self, key: str, value: float):
         """动态修改单个门禁阈值"""
         if key in self.thresholds:

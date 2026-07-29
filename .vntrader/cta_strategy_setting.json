@@ -1,0 +1,436 @@
+{
+    "Trend_US_AAPL": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "fast_window": 10,
+            "slow_window": 30,
+            "rsi_window": 14,
+            "rsi_upper": 70,
+            "rsi_lower": 30,
+            "stop_loss": 0.03,
+            "take_profit": 0.06,
+            "max_pos": 100
+        }
+    },
+    "Trend_US_MSFT": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {
+            "fast_window": 10,
+            "slow_window": 30,
+            "rsi_window": 14,
+            "rsi_upper": 70,
+            "rsi_lower": 30,
+            "stop_loss": 0.03,
+            "take_profit": 0.06,
+            "max_pos": 50
+        }
+    },
+    "Trend_US_BABA": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {
+            "fast_window": 10,
+            "slow_window": 30,
+            "rsi_window": 14,
+            "rsi_upper": 70,
+            "rsi_lower": 30,
+            "stop_loss": 0.03,
+            "take_profit": 0.06,
+            "max_pos": 100
+        }
+    },
+    "Multi_US_AAPL": {
+        "class_name": "MultiIndicatorStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "fast_ma": 5,
+            "slow_ma": 20,
+            "rsi_period": 14,
+            "macd_fast": 12,
+            "macd_slow": 26,
+            "macd_signal": 9,
+            "bb_period": 20,
+            "bb_std": 2.0,
+            "max_pos": 100
+        }
+    },
+    "Multi_US_NVDA": {
+        "class_name": "MultiIndicatorStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {
+            "fast_ma": 5,
+            "slow_ma": 20,
+            "rsi_period": 14,
+            "macd_fast": 12,
+            "macd_slow": 26,
+            "macd_signal": 9,
+            "bb_period": 20,
+            "bb_std": 2.0,
+            "max_pos": 50
+        }
+    },
+    "Multi_US_GOOGL": {
+        "class_name": "MultiIndicatorStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {
+            "fast_ma": 5,
+            "slow_ma": 20,
+            "rsi_period": 14,
+            "macd_fast": 12,
+            "macd_slow": 26,
+            "macd_signal": 9,
+            "bb_period": 20,
+            "bb_std": 2.0,
+            "max_pos": 50
+        }
+    },
+    "VWAP_US_MSFT": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {
+            "vwap_window": 30,
+            "deviation": 0.002,
+            "max_pos": 50
+        }
+    },
+    "DualThrust_US_BABA": {
+        "class_name": "DualThrustStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {
+            "k1": 0.5,
+            "k2": 0.5,
+            "lookback": 20,
+            "max_pos": 100
+        }
+    },
+    "Grid_US_AAPL": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "grid_num": 10,
+            "grid_range": 0.05,
+            "order_volume": 10
+        }
+    },
+    "Momentum_US_NFLX": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {
+            "lookback": 20,
+            "threshold": 0.02,
+            "max_pos": 30
+        }
+    },
+    "TrendStrategy_AAPL": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_MSFT": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_BABA": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_NFLX": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_NVDA": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_META": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_GOOGL": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_AMZN": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_TSLA": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_AMD": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_AAPL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_AMD_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_AMZN_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_BABA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_GOOGL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_META_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_MSFT_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_NFLX_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_NVDA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "TrendStrategy_TSLA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {
+            "trend_window": 24,
+            "entry_atr": 1.5,
+            "fixed_size": 100,
+            "stop_loss_atr": 2.0
+        }
+    },
+    "GridStrategy_AAPL": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_AMD": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_AMZN": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_BABA": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_GOOGL": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_META": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_MSFT": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_NFLX": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_NVDA": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    },
+    "GridStrategy_TSLA": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {
+            "grid_step": 0.5,
+            "grid_levels": 5,
+            "fixed_size": 50,
+            "upper_bound": 0.05,
+            "lower_bound": -0.05
+        }
+    }
+}

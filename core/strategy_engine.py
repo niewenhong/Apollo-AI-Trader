@@ -7,6 +7,7 @@ core/strategy_engine.py - Apollo Trader v2.8.4 双引擎版
   - _deploy_to_cta() 按市场路由
   - _init_cta_engines() 初始化双引擎 CTA 并注册策略类
   - v2.8.4: 事件驱动首次部署，等待合约就绪后再加载策略
+  - 修正热加载：_deployed 存储参数字典，check_and_reload_changed 正确解析 added/removed/updated
 """
 import importlib
 import json
@@ -60,7 +61,7 @@ class StrategyEngine:
         self.telegram_bot = None
 
         self.strategies = {}
-        self._deployed = {}
+        self._deployed = {}  # 格式: {strategy_name: {"params": dict, "updated_at": str}}
 
         gate_cfg = self.config.get("prelive_gate", {})
         self.prelive_gate = PreliveGate(db, thresholds=gate_cfg.get("thresholds"))
@@ -328,7 +329,11 @@ class StrategyEngine:
             results[name] = result
             if result.get("deployed"):
                 deployed.append(name)
-                self._deployed[name] = cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                # 修正：存储参数字典和时间戳
+                self._deployed[name] = {
+                    "params": cfg.get("params", {}),
+                    "updated_at": cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                }
             else:
                 failed.append(name)
 
@@ -374,26 +379,50 @@ class StrategyEngine:
         self.strategies.clear()
 
     def check_and_reload_changed(self, operator: str = "system") -> List[str]:
-        changed = self.db.detect_changed_strategies(self._deployed)
-        if not changed:
-            return []
-
+        """
+        检测数据库变化并热加载
+        返回本次处理的策略名列表
+        """
+        changes = self.db.detect_changed_strategies(self._deployed)
         processed = []
-        for cfg in changed:
-            name = cfg.get("strategy_name")
-            change_type = cfg.get("_change_type", "updated")
 
-            if change_type in ("deleted", "disabled"):
-                self._remove_strategy(name, operator)
-                processed.append(name)
-                continue
-
-            processed.append(name)
+        # 处理新增的策略
+        for cfg in changes.get("added", []):
+            name = cfg["strategy_name"]
+            logger.info(f"[StrategyEngine] 热加载新增: {name}")
             result = self._validate_and_deploy(cfg, operator=operator)
             if result.get("deployed"):
-                self._deployed[name] = cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                self._deployed[name] = {
+                    "params": cfg.get("params", {}),
+                    "updated_at": cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                }
+                processed.append(name)
             else:
-                logger.warning(f"[StrategyEngine] {name} 验证失败，保留旧版本运行")
+                logger.warning(f"[StrategyEngine] 新增策略 {name} 部署失败")
+
+        # 处理更新的策略（参数变化）
+        for cfg in changes.get("updated", []):
+            name = cfg["strategy_name"]
+            logger.info(f"[StrategyEngine] 热加载更新: {name}")
+            # 先移除旧策略（清除状态）
+            self._remove_strategy(name, operator)
+            # 再部署新版本
+            result = self._validate_and_deploy(cfg, operator=operator)
+            if result.get("deployed"):
+                self._deployed[name] = {
+                    "params": cfg.get("params", {}),
+                    "updated_at": cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                }
+                processed.append(name)
+            else:
+                logger.warning(f"[StrategyEngine] 更新策略 {name} 部署失败，旧版本已移除")
+
+        # 处理删除的策略（数据库中被删除或禁用）
+        for name in changes.get("removed", []):
+            logger.info(f"[StrategyEngine] 热加载删除: {name}")
+            self._remove_strategy(name, operator)
+            processed.append(name)
+
         return processed
 
     def start_hot_reload(self, interval: int = None):
@@ -431,7 +460,11 @@ class StrategyEngine:
             return False
         result = self._validate_and_deploy(cfg, operator=modifier)
         if result.get("deployed"):
-            self._deployed[strategy_name] = cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            # 修正：存储参数字典
+            self._deployed[strategy_name] = {
+                "params": cfg.get("params", {}),
+                "updated_at": cfg.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            }
             return True
         return False
 
@@ -477,7 +510,10 @@ class StrategyEngine:
 
         result = self._validate_and_deploy(cfg, operator=f"rollback:{operator}")
         if result.get("deployed"):
-            self._deployed[strategy_name] = cfg["updated_at"]
+            self._deployed[strategy_name] = {
+                "params": cfg.get("params", {}),
+                "updated_at": cfg["updated_at"]
+            }
             self.db.log_deploy(strategy_name, new_version, "rollback", operator,
                                "success", f"回滚到 v{target_version}")
             return True
