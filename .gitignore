@@ -39,3 +39,18 @@ test_validation.py
 # OS 文件
 Thumbs.db
 .DS_Store
+
+# ===================== vnTrader 运行时文件 =====================
+.vntrader/
+.vntrader/*
+!/.vntrader/
+
+# ===================== 数据库与数据文件 =====================
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# ===================== 日志 =====================
+*.log
+logs/
