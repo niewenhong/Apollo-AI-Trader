@@ -1,171 +1,150 @@
 """
-strategies/equity/trend_strategy.py - v2.9.0
-趋势跟踪策略：多周期均线 + ADX 过滤 + ATR 止损 + Regime 感知
-v2.9.0 优化：
-- 分层：on_1m_bar 做执行，on_5m_bar 做趋势确认，on_60m_bar 更新宏观方向
-- 利用已订阅的 5M/15M/60M K线（不再额外占额度）
-- ADX 阈值动态化（根据 regime 调整）
-- 突破确认用 5M 收盘价序列，减少噪音
+strategies/equity/trend_strategy.py - EMA趋势跟踪策略
+v3.1.4：继承 BaseStrategy，启动交易保护
 """
-import numpy as np
+from strategies.base_strategy import BaseStrategy
+from vnpy.trader.object import BarData
+from vnpy.trader.utility import ArrayManager
+import logging
 
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction, Interval
-
-from strategies.base_strategy import ApolloBaseStrategy
+logger = logging.getLogger("TrendStrategy")
 
 
-class TrendStrategy(ApolloBaseStrategy):
-    """趋势跟踪：双均线 + ADX + ATR 止损，多周期确认"""
+class TrendStrategy(BaseStrategy):
+    """EMA趋势跟踪策略（5分钟K线）"""
 
-    author = "Apollo"
+    author = "Apollo Team"
 
-    parameters = ApolloBaseStrategy.parameters + [
-        "ma_fast",
-        "ma_slow",
-        "breakout_period",
-        "atr_period",
-        "atr_stop_multiplier",
-        "adx_period",
-        "adx_threshold",
-        "use_trailing",
-        "regime_boost",
+    # 参数
+    ema_fast = 12
+    ema_slow = 52
+    trading_hours_start = "09:30"
+    trading_hours_end = "16:00"
+    fixed_size = 100
+
+    # 变量
+    last_signal = 0
+    pos = 0
+    _initial_check_done = False
+
+    parameters = BaseStrategy.parameters + [
+        "ema_fast", "ema_slow",
+        "trading_hours_start", "trading_hours_end",
     ]
-    variables = ApolloBaseStrategy.variables + [
-        "ma_fast_val", "ma_slow_val", "adx_val",
-        "atr_val", "trend_direction", "confirmed_trend",
+    variables = BaseStrategy.variables + [
+        "last_signal", "pos",
     ]
 
-    DEFAULTS = {
-        **ApolloBaseStrategy.DEFAULTS,
-        "ma_fast": 10,
-        "ma_slow": 30,
-        "breakout_period": 3,
-        "atr_period": 14,
-        "atr_stop_multiplier": 2.5,
-        "adx_period": 14,
-        "adx_threshold": 20,
-        "use_trailing": True,
-        "regime_boost": True,
-    }
-
-    def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
+    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+        self.am_5m = ArrayManager(size=100)
+        self.last_signal = 0
+        self.pos = 0
+        self._initial_check_done = False
 
-        self.ma_fast_val = 0.0
-        self.ma_slow_val = 0.0
-        self.adx_val = 0.0
-        self.atr_val = 0.0
-        self.trend_direction = 0
-        self.confirmed_trend = 0  # 由 5M 确认的 trend
+        # 解析交易时段
+        self._trading_start = self._parse_time(self.trading_hours_start)
+        self._trading_end = self._parse_time(self.trading_hours_end)
 
-        # 独立的 5M ArrayManager（不占用额外订阅额度，数据由 gateway 推送）
-        from vnpy.trader.utility import ArrayManager
-        self.am_5m = ArrayManager(100)
-        self.am_60m = ArrayManager(100)
+        # 3秒后备定时器
+        self._timer_count = 0
+        self._timer_target = 3
 
     def on_init(self):
+        """初始化——交易锁定"""
+        self.write_log("TrendStrategy 初始化")
         super().on_init()
-        self.write_log(f"趋势策略初始化 | 快线={self.ma_fast} 慢线={self.ma_slow} ADX={self.adx_threshold}")
+        self._timer_count = 0
 
-    # ── 1M 层：执行层（快，但噪音大）──
-    def on_1m_bar(self, bar: BarData):
-        super().on_1m_bar(bar)
-        if not self.am.inited:
-            return
+    def on_start(self):
+        """启动——开放交易，重置首次检查"""
+        self.write_log("TrendStrategy 启动")
+        super().on_start()
+        self._initial_check_done = False
 
-        close = bar.close_price
-        self.ma_fast_val = self.am.sma(self.ma_fast, array=False)
-        self.ma_slow_val = self.am.sma(self.ma_slow, array=False)
-        self.atr_val = self.am.atr(self.atr_period, array=False)
-        if len(self.am.close) >= self.adx_period:
-            self.adx_val = self.am.adx(self.adx_period, array=False)
-        else:
-            self.adx_val = 0.0
+    def on_timer(self):
+        """定时器（每秒触发）"""
+        self._timer_count += 1
+        if self._timer_count == self._timer_target:
+            self._try_open_from_last_bar()
 
-        # Regime 感知：动态调整 ADX 阈值
-        adx_th = self.adx_threshold
-        if self.regime_boost:
-            r = self.get_current_regime()
-            if r in ("strong_bull", "strong_bear"):
-                adx_th = max(adx_th - 5, 10)
-            elif r == "unknown":
-                adx_th = adx_th + 5
-
-        # 持仓管理（在 1M 层做止损，反应快）
-        if self.pos > 0:
-            if self.use_trailing:
-                if self.update_trailing_stop(close):
-                    self.sell(close, abs(self.pos))
-                    self.write_log(f"🛡️ 趋势多头止损/止盈 @ {close:.2f}")
-                    return
-            else:
-                hard = self.entry_price - self.atr_val * self.atr_stop_multiplier
-                if close <= hard:
-                    self.sell(close, abs(self.pos))
-                    self.write_log(f"🛡️ ATR硬止损(多) @ {close:.2f}")
-                    return
-            # 超时平仓
-            if self.bars_held >= self.max_holding_bars:
-                self.sell(close, abs(self.pos))
-                self.write_log(f"⏰ 超时平仓(多) @ {close:.2f} bars={self.bars_held}")
-                return
-
-        elif self.pos < 0:
-            if self.use_trailing:
-                if self.update_trailing_stop(close):
-                    self.cover(close, abs(self.pos))
-                    self.write_log(f"🛡️ 趋势空头止损/止盈 @ {close:.2f}")
-                    return
-            else:
-                hard = self.entry_price + self.atr_val * self.atr_stop_multiplier
-                if close >= hard:
-                    self.cover(close, abs(self.pos))
-                    self.write_log(f"🛡️ ATR硬止损(空) @ {close:.2f}")
-                    return
-            if self.bars_held >= self.max_holding_bars:
-                self.cover(close, abs(self.pos))
-                self.write_log(f"⏰ 超时平仓(空) @ {close:.2f} bars={self.bars_held}")
-                return
-
-        # 开仓（需 5M 确认 + Regime 过滤）
-        if self.pos == 0 and self.confirmed_trend != 0 and self.is_regime_tradeable():
-            allow_open, _ = self.check_time_window(bar.datetime)
-            if not allow_open:
-                return
-            if self.confirmed_trend == 1 and self.ma_fast_val > self.ma_slow_val:
-                self.buy(close, self.fixed_size)
-                self.write_log(f"🟢 趋势做多 | 5M确认+MA金叉 ADX={self.adx_val:.0f}>{adx_th:.0f}")
-            elif self.confirmed_trend == -1 and self.ma_fast_val < self.ma_slow_val:
-                self.short(close, self.fixed_size)
-                self.write_log(f"🔴 趋势做空 | 5M确认+MA死叉 ADX={self.adx_val:.0f}>{adx_th:.0f}")
-
-    # ── 5M 层：趋势确认层 ──
-    def on_5m_bar(self, bar: BarData):
+    def on_5min_bar(self, bar: BarData):
+        """5分钟K线回调"""
         self.am_5m.update_bar(bar)
         if not self.am_5m.inited:
             return
-        fast = self.am_5m.sma(self.ma_fast, array=False)
-        slow = self.am_5m.sma(self.ma_slow, array=False)
 
-        if fast > slow:
-            self.confirmed_trend = 1
-        elif fast < slow:
-            self.confirmed_trend = -1
+        # 计算EMA差值
+        fast = self.am_5m.ema(self.ema_fast, array=False)
+        slow = self.am_5m.ema(self.ema_slow, array=False)
+        diff = fast - slow
+        if diff > 0.001:
+            trend = 1
+        elif diff < -0.001:
+            trend = -1
         else:
-            self.confirmed_trend = 0
+            trend = 0
 
-        self.trend_direction = self.confirmed_trend
+        self.write_log(
+            f"[5m] {bar.datetime.strftime('%H:%M')} "
+            f"C={bar.close_price:.2f} fast={fast:.2f} slow={slow:.2f} "
+            f"diff={diff:.4f} trend={trend}"
+        )
 
-    # ── 60M 层：宏观方向 + ADX ──
-    def on_60m_bar(self, bar: BarData):
-        self.am_60m.update_bar(bar)
-        if not self.am_60m.inited:
+        # 首次检查（实盘第一根K线）
+        if not self._initial_check_done:
+            self._initial_check_done = True
+            self.write_log(f"[CHECK] 首次检查，trend={trend}, last_signal={self.last_signal}")
+            if trend != 0 and trend != self.last_signal:
+                self._open_with_builtin(trend, bar.close_price)
             return
-        # 可选：用 60M ADX 判断大趋势强度，写入日志供监控
-        adx60 = self.am_60m.adx(self.adx_period, array=False)
-        self.write_log(f"[60M] close={bar.close_price:.2f} ADX60={adx60:.0f} trend_dir={self.trend_direction}")
 
-    def on_trade(self, trade):
-        super().on_trade(trade)
-        self.write_log(f"💰 趋势成交: {trade.direction.name} {trade.volume}@{trade.price:.2f}")
+        # 有持仓不开新仓
+        if self.pos != 0:
+            return
+        if trend == self.last_signal or trend == 0:
+            return
+
+        # 检查交易时间
+        t = bar.datetime.time()
+        if not (self._trading_start <= t <= self._trading_end):
+            return
+
+        self._open_with_builtin(trend, bar.close_price)
+
+    def _open_with_builtin(self, trend, price):
+        """使用基类的buy/short（自动受_trading_allowed保护）"""
+        if trend == 1:
+            self.buy(price, self.fixed_size)
+            self.last_signal = 1
+        elif trend == -1:
+            self.short(price, self.fixed_size)
+            self.last_signal = -1
+
+    def _try_open_from_last_bar(self):
+        """后备：3秒后无实盘K线时用最后一根K线开仓"""
+        if self._initial_check_done:
+            return
+        if not self.am_5m.inited:
+            return
+        last_close = self.am_5m.close[-1] if self.am_5m.close.size > 0 else 0
+        if last_close == 0:
+            return
+        fast = self.am_5m.ema(self.ema_fast, array=False)
+        slow = self.am_5m.ema(self.ema_slow, array=False)
+        diff = fast - slow
+        if diff > 0.001:
+            trend = 1
+        elif diff < -0.001:
+            trend = -1
+        else:
+            trend = 0
+        if trend != 0 and trend != self.last_signal:
+            self.write_log(f"[TIMER] 后备开仓，trend={trend}, price={last_close}")
+            self._open_with_builtin(trend, last_close)
+
+    @staticmethod
+    def _parse_time(time_str: str):
+        from datetime import time
+        parts = time_str.split(":")
+        return time(int(parts[0]), int(parts[1]))

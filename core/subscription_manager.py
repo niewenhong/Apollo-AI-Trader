@@ -1,234 +1,173 @@
 """
-core/subscription_manager.py — 按需订阅管理器 v2.8.0
-功能：
-  - 按需订阅：策略声明所需数据类型，管理器按最小集合订阅
-  - 引用计数：同一类型被多个策略使用时只订阅一次
-  - 延迟反订阅（≥60秒），配额审计
-  - 支持从富途查询当前订阅状态
+subscription_manager.py — 按需订阅管理 + 引用计数 + 配额审计
 """
-import time
-from typing import Dict, List, Set, Optional, Any
-from futu import RET_OK, SubType, Session
+import logging
+from typing import Dict, List, Optional, Tuple
+from futu import OpenQuoteContext, SubType, RET_OK, Session
+
+log = logging.getLogger("SubManager")
 
 
 class SubscriptionManager:
-    """按需订阅管理器
-    
-    配额规则（富途官方）：
-    - 每只股票订阅一个类型 = 1 个额度
-    - 取消订阅释放额度
-    - 反订阅需等待至少 60 秒
-    - 所有连接都反订阅后才释放额度
-    """
-    
-    AVAILABLE_TYPES = {
-        "QUOTE": SubType.QUOTE,
-        "TICKER": SubType.TICKER,
-        "K_1M": SubType.K_1M,
-        "K_5M": SubType.K_5M,
-        "K_15M": SubType.K_15M,
-        "K_60M": SubType.K_60M,
-        "K_DAY": SubType.K_DAY,
-        "RT_DATA": SubType.RT_DATA,
-        "ORDER_BOOK": SubType.ORDER_BOOK,
-        "BROKER": SubType.BROKER,
-    }
-    
     def __init__(self, max_quota: int = 300):
         self.max_quota = max_quota
-        self.ctx_us = None
-        self.ctx_hk = None
-        
-        # {symbol: {subtype_str: {"ctx": ctx, "sub_time": float, "users": set()}}}
-        self._subscriptions: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        self._unsub_queue: List[Dict[str, Any]] = []
-        self.total_used = 0
-        
-    def set_contexts(self, ctx_us, ctx_hk):
-        self.ctx_us = ctx_us
-        self.ctx_hk = ctx_hk
-        
-    def _get_ctx(self, symbol: str):
-        if symbol.startswith("HK."):
-            return self.ctx_hk, Session.NONE
-        elif symbol.startswith("US."):
-            return self.ctx_us, Session.ALL
-        else:
-            return self.ctx_us, Session.ALL
-        
-    def subscribe_demand(self, symbol: str, user: str, 
-                         subtypes: List[str]) -> bool:
-        """按需订阅：user 声明对 symbol 需要的 subtypes"""
-        if not self.ctx_us or not self.ctx_hk:
-            print(f"❌ 行情上下文未就绪，无法订阅 {symbol}")
-            return False
-            
-        valid_subtypes = [st for st in subtypes if st in self.AVAILABLE_TYPES]
-        if not valid_subtypes:
-            print(f"⚠️ {symbol} 无有效订阅类型")
-            return False
-                
-        symbol_subs = self._subscriptions.get(symbol, {})
-        to_subscribe = []
-        
-        for st_str in valid_subtypes:
-            if st_str not in symbol_subs:
-                if self.total_used + 1 > self.max_quota:
-                    print(f"⛔ 配额不足！已用 {self.total_used}/{self.max_quota}，"
-                          f"无法订阅 {symbol}.{st_str}")
-                    continue
-                to_subscribe.append(st_str)
-            else:
-                symbol_subs[st_str]["users"].add(user)
-        
-        if not to_subscribe:
-            if symbol not in self._subscriptions:
-                self._subscriptions[symbol] = {}
-            for st_str in valid_subtypes:
-                if st_str not in self._subscriptions[symbol]:
-                    self._subscriptions[symbol][st_str] = {
-                        "users": set(),
-                        "sub_time": time.time()
-                    }
-                self._subscriptions[symbol][st_str]["users"].add(user)
-            return True
-                
-        ctx, session = self._get_ctx(symbol)
-        subtype_enums = [self.AVAILABLE_TYPES[st] for st in to_subscribe]
-        
-        ret, err = ctx.subscribe([symbol], subtype_enums,
-                                 session=session, subscribe_push=False)
-        if ret == RET_OK:
-            now = time.time()
-            if symbol not in self._subscriptions:
-                self._subscriptions[symbol] = {}
-                
-            for st_str in to_subscribe:
-                self._subscriptions[symbol][st_str] = {
-                    "ctx": ctx,
-                    "sub_time": now,
-                    "users": {user}
-                }
-                self.total_used += 1
-                
-            print(f"✅ 订阅成功: {symbol} 类型={to_subscribe} "
-                  f"(已用 {self.total_used}/{self.max_quota})")
-            
-            for st_str in valid_subtypes:
-                if st_str in self._subscriptions[symbol]:
-                    self._subscriptions[symbol][st_str]["users"].add(user)
-                    
-            return True
-        else:
-            print(f"❌ 订阅失败 {symbol}: {err}")
-            return False
-            
-    def unsubscribe_demand(self, symbol: str, user: str,
-                           subtypes: List[str] = None) -> bool:
-        """按需反订阅"""
-        symbol_subs = self._subscriptions.get(symbol)
-        if not symbol_subs:
-            return False
-            
-        if subtypes is None:
-            subtypes = list(symbol_subs.keys())
-            
-        unsub_types = []
-        for st_str in subtypes:
-            if st_str in symbol_subs:
-                users = symbol_subs[st_str]["users"]
-                users.discard(user)
-                if not users:
-                    unsub_types.append(st_str)
-                    
-        if not unsub_types:
-            return False
-            
-        now = time.time()
-        immediate_unsub = []
-        delayed_unsub = []
-        
-        for st_str in unsub_types:
-            sub_info = symbol_subs[st_str]
-            if now - sub_info["sub_time"] >= 60:
-                immediate_unsub.append(st_str)
-            else:
-                delayed_unsub.append({
-                    "subtype": st_str,
-                    "ctx": sub_info["ctx"],
-                    "execute_at": sub_info["sub_time"] + 60
-                })
-                
-        if immediate_unsub:
-            ctx, _ = self._get_ctx(symbol)
-            subtype_enums = [self.AVAILABLE_TYPES[st] for st in immediate_unsub]
-            ret, err = ctx.unsubscribe([symbol], subtype_enums)
-            if ret == RET_OK:
-                for st_str in immediate_unsub:
-                    del symbol_subs[st_str]
-                    self.total_used -= 1
-                print(f"✅ 反订阅: {symbol} 类型={immediate_unsub} "
-                      f"(已用 {self.total_used}/{self.max_quota})")
-            else:
-                print(f"❌ 反订阅失败 {symbol}: {err}")
-                
-        for item in delayed_unsub:
-            self._unsub_queue.append({
-                "symbol": symbol,
-                "subtype": item["subtype"],
-                "ctx": item["ctx"],
-                "execute_at": item["execute_at"]
-            })
-            
-        if not symbol_subs:
-            del self._subscriptions[symbol]
-            
+        self._ref_count: Dict[Tuple[str, str], int] = {}
+        self._user_subs: Dict[str, Dict[str, List[str]]] = {}
+        self._quote_ctx_us: Optional[OpenQuoteContext] = None
+        self._quote_ctx_hk: Optional[OpenQuoteContext] = None
+        self._gateways: Dict[str, object] = {}  # gateway_name -> gateway instance
+
+    def set_contexts(self, us_ctx: OpenQuoteContext, hk_ctx: OpenQuoteContext):
+        """直接设置行情上下文（旧接口）"""
+        self._quote_ctx_us = us_ctx
+        self._quote_ctx_hk = hk_ctx
+
+    def register_gateway(self, gateway_name: str, gateway: object):
+        """注册网关实例（新接口）"""
+        self._gateways[gateway_name] = gateway
+        # 同时从网关中提取 quote_ctx
+        if hasattr(gateway, 'quote_ctx'):
+            if gateway_name == "FUTU_US":
+                self._quote_ctx_us = gateway.quote_ctx
+            elif gateway_name == "FUTU_HK":
+                self._quote_ctx_hk = gateway.quote_ctx
+        log.info(f"✅ 网关已注册: {gateway_name}")
+
+    # ★ FIX: 新增公开的 subscribe 方法，供 StrategyEngine 直接调用
+    def subscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
+        """
+        统一订阅入口：记录引用计数，若为新订阅则调用底层订阅。
+        futu_symbol: 如 "US.AAPL"
+        subtypes: 如 ["QUOTE", "K_1M"]
+        """
+        return self.subscribe_demand(futu_symbol, user, subtypes)
+
+    def subscribe_demand(self, symbol: str, user: str, subtypes: List[str]) -> bool:
+        if user not in self._user_subs:
+            self._user_subs[user] = {}
+        newly_subscribed = []
+        for st in subtypes:
+            key = (symbol, st)
+            is_new = key not in self._ref_count
+            self._ref_count[key] = self._ref_count.get(key, 0) + 1
+            if is_new:
+                newly_subscribed.append(st)
+            if symbol not in self._user_subs[user]:
+                self._user_subs[user][symbol] = []
+            if st not in self._user_subs[user][symbol]:
+                self._user_subs[user][symbol].append(st)
+        if newly_subscribed:
+            ok = self._do_subscribe(symbol, newly_subscribed)
+            if not ok:
+                for st in newly_subscribed:
+                    key = (symbol, st)
+                    self._ref_count[key] -= 1
+                    if self._ref_count[key] <= 0:
+                        del self._ref_count[key]
+                return False
         return True
-        
-    def process_unsub_queue(self):
-        """处理延迟反订阅队列"""
-        now = time.time()
-        remain = []
-        for item in self._unsub_queue:
-            if now >= item["execute_at"]:
-                try:
-                    ret, err = item["ctx"].unsubscribe(
-                        [item["symbol"]], 
-                        [self.AVAILABLE_TYPES[item["subtype"]]]
-                    )
-                    if ret == RET_OK:
-                        symbol_subs = self._subscriptions.get(item["symbol"], {})
-                        if item["subtype"] in symbol_subs:
-                            del symbol_subs[item["subtype"]]
-                            self.total_used -= 1
-                        if not symbol_subs:
-                            self._subscriptions.pop(item["symbol"], None)
-                        print(f"✅ 延迟反订阅: {item['symbol']}.{item['subtype']} "
-                              f"(已用 {self.total_used}/{self.max_quota})")
-                    else:
-                        remain.append(item)
-                except Exception as e:
-                    print(f"❌ 延迟反订阅异常 {item['symbol']}.{item['subtype']}: {e}")
-            else:
-                remain.append(item)
-        self._unsub_queue = remain
-        
+
+    # ★ FIX: 新增公开的 unsubscribe 方法
+    def unsubscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
+        return self.release_demand(futu_symbol, user, subtypes)
+
+    def release_demand(self, symbol: str, user: str, subtypes: List[str]) -> bool:
+        if user not in self._user_subs:
+            return False
+        to_unsub = []
+        for st in subtypes:
+            key = (symbol, st)
+            if key in self._ref_count:
+                self._ref_count[key] -= 1
+                if self._ref_count[key] <= 0:
+                    del self._ref_count[key]
+                    to_unsub.append(st)
+            if symbol in self._user_subs[user]:
+                if st in self._user_subs[user][symbol]:
+                    self._user_subs[user][symbol].remove(st)
+        if to_unsub:
+            self._do_unsubscribe(symbol, to_unsub)
+        if symbol in self._user_subs[user] and not self._user_subs[user][symbol]:
+            del self._user_subs[user][symbol]
+        if not self._user_subs[user]:
+            del self._user_subs[user]
+        return True
+
+    def _do_subscribe(self, symbol: str, subtypes: List[str]) -> bool:
+        ctx = self._get_ctx_for(symbol)
+        if ctx is None:
+            log.error(f"❌ 无行情上下文: {symbol}")
+            return False
+        session = Session.ALL if symbol.startswith("US.") else Session.NONE
+        sub_objs = [self._str_to_subtype(s) for s in subtypes]
+        sub_objs = [s for s in sub_objs if s is not None]
+        code, data = ctx.subscribe(
+            symbol, sub_objs,
+            is_first_push=True, subscribe_push=True, session=session
+        )
+        if code == RET_OK:
+            log.info(f"✅ 订阅成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
+            return True
+        else:
+            log.error(f"❌ 订阅失败: {symbol} {subtypes} | {data}")
+            return False
+
+    def _do_unsubscribe(self, symbol: str, subtypes: List[str]) -> bool:
+        ctx = self._get_ctx_for(symbol)
+        if ctx is None:
+            return False
+        sub_objs = [self._str_to_subtype(s) for s in subtypes]
+        sub_objs = [s for s in sub_objs if s is not None]
+        code, data = ctx.unsubscribe(symbol, sub_objs)
+        if code == RET_OK:
+            log.info(f"✅ 退订成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
+        else:
+            log.warning(f"⚠️ 退订: {symbol} | {data}")
+        return code == RET_OK
+
+    def used(self) -> int:
+        return len(self._ref_count)
+
+    def remaining(self) -> int:
+        return self.max_quota - self.used()
+
     def audit_quota(self):
-        """审计配额"""
-        used = self.total_used
-        remaining = self.max_quota - used
-        print(f"📊 配额审计: 已用 {used}/{self.max_quota}，剩余 {remaining}")
-        print(f"📊 当前订阅股票数: {len(self._subscriptions)}")
-        for sym, subs in self._subscriptions.items():
-            types = list(subs.keys())
-            users = set()
-            for st_info in subs.values():
-                users.update(st_info["users"])
-            print(f"   {sym}: {types} (用户: {users})")
-        return used, remaining
-        
-    def get_subscribed_types(self, symbol: str) -> List[str]:
-        return list(self._subscriptions.get(symbol, {}).keys())
-        
-    def is_subscribed(self, symbol: str, subtype: str) -> bool:
-        return subtype in self._subscriptions.get(symbol, {})
+        print(f"📊 配额审计: 已用 {self.used()}/{self.max_quota}，剩余 {self.remaining()}")
+        stock_map: Dict[str, List[str]] = {}
+        for sym, st in self._ref_count.keys():
+            stock_map.setdefault(sym, []).append(st)
+        print(f"📊 当前订阅股票数: {len(stock_map)}")
+        for sym, sts in sorted(stock_map.items()):
+            users = [u for u, d in self._user_subs.items() if sym in d]
+            print(f"   {sym}: {sts} (用户: {set(users)})")
+
+    def _get_ctx_for(self, symbol: str) -> Optional[OpenQuoteContext]:
+        if symbol.startswith("US."):
+            return self._quote_ctx_us
+        elif symbol.startswith("HK."):
+            return self._quote_ctx_hk
+        return None
+
+    @staticmethod
+    def _str_to_subtype(s: str):
+        mapping = {
+            "QUOTE": SubType.QUOTE,
+            "K_1M": SubType.K_1M,
+            "K_5M": SubType.K_5M,
+            "K_15M": SubType.K_15M,
+            "K_30M": SubType.K_30M,
+            "K_60M": SubType.K_60M,
+            "K_DAY": SubType.K_DAY,
+            "ORDER_BOOK": SubType.ORDER_BOOK,
+            "TICKER": SubType.TICKER,
+        }
+        return mapping.get(s)
+
+    @staticmethod
+    def build_plan(config: dict, deployed_strategies: set = None) -> Dict[str, Dict[str, List[str]]]:
+        from .subscription_plan import build_subscription_plan
+        return build_subscription_plan(config, deployed_strategies)
+
+    def apply_plan(self, config: dict, deployed_strategies: set = None) -> bool:
+        from .subscription_plan import apply_subscription_plan
+        return apply_subscription_plan(self, config, deployed_strategies)

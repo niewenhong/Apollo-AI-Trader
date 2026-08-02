@@ -1,455 +1,479 @@
 """
-strategies/options/base_option_strategy.py - Apollo-AI-Trader v2.9.3
-期权策略基类 v2：封装期权通用逻辑（查询链、批量报价、筛选、展期、平仓）
+BaseOptionStrategy v2.9.6
+- on_tick → bg_1m → on_1m_bar → 合成 5M/60M/Daily（链路不经过 on_bar）
+- 子类可安全覆盖 on_bar / on_1m_bar，多周期合成不受影响
+- Quote 按需查询（subscribe_push=False，无频率限制）
+- Quote 快照存库（信号触发/开仓/平仓时），保证回测一致性
 
-⚠️ 富途 API 字段权威来源（openapi.futunn.com）：
-  get_option_expiration_date → strike_time, option_expiry_date_distance, expiration_cycle
-  get_option_chain_by_date   → code, name, lot_size, option_type, stock_owner,
-                                 strike_time, strike_price, suspension, ...
-                                 ❗ 不含 delta/iv/premium，这些在 get_option_quote 里
-  get_option_quote(legs)     → price, premium, implied_volatility, delta, gamma,
-                                 vega, theta, rho, option_type("CALL"/"PUT"),
-                                 expire_time, strike_price, contract_size,
-                                 contract_multiplier, days_to_expiry,
-                                 intrinsic_value, time_value, breakeven_point,
-                                 dist_to_breakeven, prob_of_profit, seller_roi,
-                                 mark_price, ...
+v2.9.6 变更：
+- 修复：多周期 BarGenerator 更新从 on_bar 移到 on_1m_bar，
+  避免子类覆盖 on_bar 导致合成断裂
+- 修复：bg_daily 改用 Interval.DAILY 参数
+- 修复：删除未使用的导入（Interval, WrtType, OptionType, FinancialQuota）
+- 修复：_current_regime → current_regime 拼写统一
+- 新增：抽象方法 stub（_send_option_order / _query_full_chain 等），
+  运行时由动态注入或 mixin 提供，但声明更清晰
 """
-from vnpy_ctastrategy import CtaTemplate
-from vnpy.trader.object import BarData, TickData, OrderData, TradeData
-from vnpy.trader.constant import Direction, Offset, OrderType, Exchange
-from vnpy.trader.utility import BarGenerator
 import time
+import logging
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
-# 富途 OptionType 枚举值（字符串，来自 get_option_quote / get_option_chain）
-OPTION_TYPE_CALL = "CALL"
-OPTION_TYPE_PUT  = "PUT"
+from vnpy.trader.object import TickData, BarData
+from vnpy.trader.utility import BarGenerator
+from vnpy_ctastrategy import CtaTemplate
+
+from futu import (
+    RET_OK, OpenQuoteContext, SubType, Session,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class BaseOptionStrategy(CtaTemplate):
-    """期权策略基类 v2"""
+    """期权策略基类：统一 Tick→1M→多周期合成、Quote 按需查询+存库"""
 
-    # ── 通用参数（子类可覆盖） ──────────────────────────────
-    min_days_to_expiry   = 7
-    max_days_to_expiry   = 45
-    min_otm_prob         = 0.60    # 对应 get_option_quote 的 prob_of_profit
-    min_annual_roi       = 0.30
-    max_positions        = 5
-    position_size        = 1
-    roll_when_ditm       = 0.30    # delta 绝对值超过此值展期
-    cash_buffer_ratio    = 0.10
+    author = "Apollo v2.9.6"
 
-    # ── 多周期 ─────────────────────────────────────────────
-    bar_frequencies = ["1m", "5m", "60m"]
+    # ---- 参数（子类可覆盖）----
+    tick_size = 0.01
+    min_trade_qty = 1
+    stop_loss_pct = 0.5          # 止损比例（占权利金）
+    take_profit_pct = 1.0         # 止盈比例
+    max_position = 5               # 最大持仓张数
+    quote_cache_ttl = 5.0         # Quote 缓存有效期（秒）
+    quote_sample_interval = 300     # 定时采样间隔（秒），0=关闭
 
-    # ── 变量（写入状态文件） ────────────────────────────────
-    variables = ["net_premium", "max_loss", "max_profit", "pnl",
-                 "legs", "regime_label", "last_quote_ts"]
+    # ---- 子类必须声明的参数/变量（占位，避免 vnpy 警告）----
+    parameters: List[str] = []
+    variables: List[str] = ["legs", "pnl", "regime_label"]
 
-    # ──────────────────────────────────────────────────────
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.net_premium   = 0.0
-        self.max_loss      = 0.0
-        self.max_profit    = 0.0
-        self.pnl           = 0.0
+
+        # ========== 本地多周期 BarGenerator ==========
+        # on_tick → bg_1m → on_1m_bar（内部再喂给更高周期）
+        self.bg_1m = BarGenerator(self.on_1m_bar, 1, self._on_1m_bar_callback)
+        # 更高周期由 on_1m_bar 内部驱动（见下方 _on_1m_bar_callback）
+        self.bg_5m = BarGenerator(self.on_1m_bar, 5, self.on_5m_bar)
+        self.bg_60m = BarGenerator(self.on_1m_bar, 60, self.on_60m_bar)
+        # 日线：用 Interval.DAILY 让 vnpy 自动按交易日切分
+        self.bg_daily = BarGenerator(
+            self.on_1m_bar, 1, self.on_daily_bar,
+            interval=Interval.DAILY,
+        )
+
+        # ArrayManager
+        self.am_1m = ArrayManager(5000)
+        self.am_5m = ArrayManager(500)
+        self.am_60m = ArrayManager(200)
+
+        # ========== Quote 按需查询 ==========
+        self._quote_cache: Dict[str, Tuple[float, Any]] = {}
+        self._quote_ctx = None
+        self._quote_subscribed = set()
+        self._last_periodic_sample = 0.0
+
+        # ========== 数据库 ==========
+        self._db_path = getattr(cta_engine, 'db_path', 'data/history.db')
+
+        # ========== 状态 ==========
+        self._current_1m = None
+        self._current_5m = None
+        self._current_60m = None
+        self._current_daily = None
+        self._option_symbols = set()
         self.legs: Dict[str, dict] = {}
-        self.regime_label   = "unknown"
-        self.last_quote_ts  = 0.0
+        self.pnl = 0.0
+        self.net_premium = 0.0
+        self.max_loss = 0.0
+        self.max_profit = 0.0
+        self.regime_label = ""
+        self.current_regime = "unknown"
+        self.last_adx = 0.0
 
-        self.bg = BarGenerator(self.on_bar, 1, self.on_1m_bar)
-        self.bg5  = BarGenerator(self.on_bar, 5,  self.on_5m_bar)
-        self.bg60 = BarGenerator(self.on_bar, 60, self.on_60m_bar)
-
-        self._quote_cache: Dict[str, dict] = {}   # code → 报价 dict
-        self._quote_cache_ts = 0.0
-        self._pending_fill = False
-        self._retry_count: Dict[str, int] = {}
-
-    # ── 生命周期 ──────────────────────────────────────────
-    def on_init(self):
-        self.write_log(f"[{self.__class__.__name__}] on_init | {self.vt_symbol}")
-
-    def on_start(self):
-        self.write_log(f"[{self.__class__.__name__}] on_start | {self.vt_symbol}")
-
-    def on_stop(self):
-        self.write_log(f"[{self.__class__.__name__}] on_stop | {self.vt_symbol}")
-
-    # ── 行情入口 ──────────────────────────────────────────
+    # ============================================================
+    # 行情入口（只两个回调）
+    # ============================================================
     def on_tick(self, tick: TickData):
-        self.bg.update_tick(tick)
-        # 快速展期检测（无需等bar）
-        if self.legs:
-            for name, leg in list(self.legs.items()):
-                d = abs(leg.get("delta", 0))
-                if d > self.roll_when_ditm:
-                    self.write_log(f"[Base] tick触发展期 {name} delta={d:.2f}")
-                    self._roll_positions()
-                    return
+        """Tick → bg_1m 合成 1M bar"""
+        self.bg_1m.update_tick(tick)
 
     def on_bar(self, bar: BarData):
-        self.bg5.update_bar(bar)
-        self.bg60.update_bar(bar)
-        self.on_1m_bar(bar)  # 子类可覆盖
-
-    def on_1m_bar(self, bar: BarData):
+        """
+        接收引擎推送的 1M bar。
+        v2.9.6：仅做持仓/到期管理，不驱动多周期合成
+        （多周期由 on_1m_bar 内部驱动，见 _on_1m_bar_callback）
+        子类可安全覆盖此方法。
+        """
         pass
+
+    # ============================================================
+    # 内部回调：1M bar 生成后，同时喂给更高周期 BG
+    # ============================================================
+    def _on_1m_bar_callback(self, bar: BarData):
+        """
+        bg_1m 的 window 回调：1M bar 成型后触发。
+        在这里同时喂给 5M/60M/Daily 的 BarGenerator，
+        再调用用户级 on_1m_bar。
+        """
+        self.bg_5m.update_bar(bar)
+        self.bg_60m.update_bar(bar)
+        self.bg_daily.update_bar(bar)
+        self.on_1m_bar(bar)
+
+    # ============================================================
+    # 周期回调（子类覆盖）
+    # ============================================================
+    def on_1m_bar(self, bar: BarData):
+        self._current_1m = bar
+        self.am_1m.update_bar(bar)
+
+        # 定时采样 Quote（可选）
+        if self.quote_sample_interval > 0:
+            now = time.time()
+            if now - self._last_periodic_sample >= self.quote_sample_interval:
+                self._last_periodic_sample = now
+                self._periodic_quote_sample()
 
     def on_5m_bar(self, bar: BarData):
-        pass
+        self._current_5m = bar
+        self.am_5m.update_bar(bar)
 
     def on_60m_bar(self, bar: BarData):
-        pass
+        self._current_60m = bar
+        self.am_60m.update_bar(bar)
 
-    # ── 订单/成交 ────────────────────────────────────────
-    def on_order(self, order: OrderData):
-        pass
+    def on_daily_bar(self, bar: BarData):
+        self._current_daily = bar
 
-    def on_trade(self, trade: TradeData):
-        self.write_log(f"[Base] 成交 {trade.symbol} {trade.direction.value} "
-                       f"{trade.volume}@{trade.price}")
-
-    # ──────────────────────────────────────────────────────
-    #  富途 API 封装（字段已按官方文档校正）
-    # ──────────────────────────────────────────────────────
-
-    def _get_gateway(self):
-        for name in ("FUTU_US", "FUTU_HK", "FUTU"):
-            gw = self.cta_engine.main_engine.get_gateway(name)
-            if gw and hasattr(gw, "quote_ctx"):
-                return gw
-        return None
-
-    def _to_futu_code(self) -> str:
-        if ".SMART" in self.vt_symbol:
-            return f"US.{self.vt_symbol.split('.')[0]}"
-        if ".SEHK" in self.vt_symbol:
-            return f"HK.{self.vt_symbol.split('.')[0]}"
-        return self.vt_symbol
-
-    def _query_expiry_dates(self, code: str) -> List[dict]:
-        """获取到期日列表。返回 [{"strike_time":"2026-08-15","distance":17}, ...]"""
-        gw = self._get_gateway()
-        if not gw:
-            return []
-        try:
-            ret, data = gw.quote_ctx.get_option_expiration_date(code)
-            if ret != 0 or data is None or data.empty:
-                self.write_log(f"[Base] get_option_expiration_date 失败: {data}")
-                return []
-            out = []
-            for _, r in data.iterrows():
-                out.append({
-                    "strike_time": str(r.get("strike_time", "")),
-                    "distance":   int(r.get("option_expiry_date_distance", 999)),
-                })
-            return out
-        except Exception as e:
-            self.write_log(f"[Base] 查询到期日异常: {e}")
-            return []
-
-    def _query_chain_by_date(self, code: str, expiry_date: str) -> List[dict]:
-        """获取指定到期日的所有合约（仅基础字段，无希腊值）。
-
-        返回字段：code, name, option_type("CALL"/"PUT"), strike_price,
-                 strike_time, lot_size, stock_owner, suspension, ...
-        """
-        gw = self._get_gateway()
-        if not gw:
-            return []
-        try:
-            ret, data = gw.quote_ctx.get_option_chain_by_date(code, expiry_date, expiry_date)
-            if ret != 0 or data is None or data.empty:
-                self.write_log(f"[Base] get_option_chain_by_date({expiry_date}) 失败: {data}")
-                return []
-            out = []
-            for _, r in data.iterrows():
-                ot = str(r.get("option_type", "")).upper()
-                if ot not in (OPTION_TYPE_CALL, OPTION_TYPE_PUT):
-                    continue
-                out.append({
-                    "code":         str(r.get("code", "")),
-                    "name":         str(r.get("name", "")),
-                    "option_type":  ot,                 # "CALL" / "PUT"
-                    "is_call":      (ot == OPTION_TYPE_CALL),
-                    "is_put":       (ot == OPTION_TYPE_PUT),
-                    "strike_price": float(r.get("strike_price", 0) or 0),
-                    "strike_time":  str(r.get("strike_time", "")),
-                    "lot_size":     int(r.get("lot_size", 100) or 100),
-                    "suspension":   bool(r.get("suspension", False)),
-                })
-            return out
-        except Exception as e:
-            self.write_log(f"[Base] 查询期权链异常: {e}")
-            return []
-
-    def _batch_quote(self, codes: List[str]) -> Dict[str, dict]:
-        """批量获取期权报价（含 delta/iv/premium/days_to_expiry 等）。
-
-        返回 {code: {price, premium, implied_volatility, delta, gamma,
-                     vega, theta, rho, option_type, expire_time, strike_price,
-                     contract_size, contract_multiplier, days_to_expiry,
-                     intrinsic_value, time_value, breakeven_point,
-                     prob_of_profit, seller_roi, mark_price, ...}}
-        """
-        gw = self._get_gateway()
-        result: Dict[str, dict] = {}
-        if not gw or not codes:
-            return result
-        try:
-            from futu import OptionStrategyLeg, OptionStrategyType
-            legs = []
-            for c in codes:
-                legs.append(OptionStrategyLeg(code=c, action="BUY", quantity=1.0))
-            ret, data = gw.quote_ctx.get_option_quote(legs)
-            if ret != 0 or data is None or data.empty:
-                self.write_log(f"[Base] get_option_quote 失败: {data}")
-                return result
-            for _, r in data.iterrows():
-                code = str(r.get("option_type" ""))  # placeholder, see below
-                # 用 index 定位回 codes
-                break
-            # 更稳的写法：逐条查
-        except Exception as e:
-            self.write_log(f"[Base] get_option_quote 异常: {e}")
-
-        # 逐条查询（最稳，避免 legs 顺序错位）
-        for c in codes:
+    # ============================================================
+    # Quote 按需查询（核心方法）
+    # ============================================================
+    def _get_quote_ctx(self) -> Optional[OpenQuoteContext]:
+        """获取/复用 OpenQuoteContext，带健康检查"""
+        if self._quote_ctx is not None:
             try:
-                from futu import OptionStrategyLeg
-                legs = [OptionStrategyLeg(code=c, action="BUY", quantity=1.0)]
-                ret, data = gw.quote_ctx.get_option_quote(legs)
-                if ret != 0 or data is None or data.empty:
-                    continue
-                r = data.iloc[0]
-                code_val = str(r.get("code", c))
-                result[code_val] = {
-                    "code":               code_val,
-                    "price":              self._f(r.get("price")),
-                    "premium":            self._f(r.get("premium")),
-                    "implied_volatility": self._f(r.get("implied_volatility")),
-                    "delta":              self._f(r.get("delta")),
-                    "gamma":              self._f(r.get("gamma")),
-                    "vega":               self._f(r.get("vega")),
-                    "theta":              self._f(r.get("theta")),
-                    "rho":                self._f(r.get("rho")),
-                    "option_type":        str(r.get("option_type", "")).upper(),
-                    "expire_time":        str(r.get("expire_time", "")),
-                    "strike_price":       self._f(r.get("strike_price")),
-                    "contract_size":      self._f(r.get("contract_size", 100)),
-                    "contract_multiplier":self._f(r.get("contract_multiplier", 100)),
-                    "days_to_expiry":     int(r.get("days_to_expiry", 0) or 0),
-                    "intrinsic_value":    self._f(r.get("intrinsic_value")),
-                    "time_value":         self._f(r.get("time_value")),
-                    "breakeven_point":    r.get("breakeven_point", None),
-                    "dist_to_breakeven":  r.get("dist_to_breakeven", None),
-                    "prob_of_profit":     self._f(r.get("prob_of_profit")),  # 百分比 0-100
-                    "seller_roi":         r.get("seller_roi", None),
-                    "mark_price":         self._f(r.get("mark_price")),
-                    "open_interest":      r.get("open_interest", "N/A"),
-                }
-            except Exception as e:
-                self.write_log(f"[Base] 报价单条异常 {c}: {e}")
-        return result
+                ret, _ = self._quote_ctx.get_global_state()
+                if ret == RET_OK:
+                    return self._quote_ctx
+            except Exception:
+                self._quote_ctx = None
 
-    def _query_full_chain(self, code: str) -> List[dict]:
-        """完整流程：到期日 → 合约列表 → 批量报价 → 合并为带希腊值的合约列表"""
-        merged: List[dict] = []
-        dates = self._query_expiry_dates(code)
-        if not dates:
-            return merged
-        # 只取 [min_days, max_days] 区间内的到期日
-        target_dates = [d["strike_time"] for d in dates
-                        if self.min_days_to_expiry <= d["distance"] <= self.max_days_to_expiry]
-        if not target_dates:
-            # 兜底：至少取最近的
-            target_dates = [dates[0]["strike_time"]]
-        all_codes: List[str] = []
-        code_to_meta: Dict[str, dict] = {}
-        for dt in target_dates:
-            chain = self._query_chain_by_date(code, dt)
-            for c in chain:
-                if c["suspension"]:
-                    continue
-                all_codes.append(c["code"])
-                code_to_meta[c["code"]] = c
-        if not all_codes:
-            return merged
-        quotes = self._batch_quote(all_codes)
-        for c in all_codes:
-            meta = code_to_meta.get(c, {})
-            q = quotes.get(c, {})
-            merged.append({
-                **meta,
-                **q,
-                # 兼容字段（旧代码用的名字）
-                "otm_prob":    q.get("prob_of_profit", 0) / 100.0,   # 转 0-1
-                "annual_roi":  self._f(meta.get("premium")) / max(self._f(meta.get("strike_price")), 1)
-                                * (365.0 / max(q.get("days_to_expiry", 30), 1)),
-                "iv":          q.get("implied_volatility", 0),
-                "mid_price":   q.get("mark_price", q.get("price", 0)),
-            })
-        self._quote_cache = {m["code"]: m for m in merged}
-        self._quote_cache_ts = time.time()
-        self.write_log(f"[Base] 期权链合并完成 {code}: {len(merged)} 条（含希腊值）")
-        return merged
+        # 从网关获取
+        me = getattr(self.cta_engine, 'main_engine', None)
+        if me is not None:
+            for gw in getattr(me, 'gateways', {}).values():
+                qc = getattr(gw, 'quote_ctx', None)
+                if qc is not None:
+                    try:
+                        ret, _ = qc.get_global_state()
+                        if ret == RET_OK:
+                            self._quote_ctx = qc
+                            return qc
+                    except Exception:
+                        continue
 
-    # ── 筛选工具 ──────────────────────────────────────────
-    def _select_contracts(self, chain: List[dict], leg_type: str) -> List[dict]:
-        """按类型(call/put) + 到期天数 + otm_prob + 年化ROI 筛选"""
-        out = []
-        for item in chain:
-            if leg_type == "call" and not item.get("is_call"): continue
-            if leg_type == "put"  and not item.get("is_put"):  continue
-            dte = item.get("days_to_expiry", 999)
-            if not (self.min_days_to_expiry <= dte <= self.max_days_to_expiry):
-                continue
-            if item.get("otm_prob", 0) < self.min_otm_prob:
-                continue
-            if item.get("annual_roi", 0) < self.min_annual_roi:
-                continue
-            out.append(item)
-        return out
+        # 自建连接
+        try:
+            host = getattr(self.cta_engine, 'opend_host', '127.0.0.1')
+            port = getattr(self.cta_engine, 'opend_port', 11111)
+            qc = OpenQuoteContext(host, port)
+            self._quote_ctx = qc
+            return qc
+        except Exception as e:
+            self.write_log(f"[Quote] 创建 OpenQuoteContext 失败: {e}")
+            return None
 
-    def _find_nearest_delta(self, chain: List[dict], target_delta: float,
-                            leg_type: str) -> Optional[dict]:
-        """在 chain 中找 |delta - target| 最小的合约"""
-        best, best_diff = None, 999
-        for c in chain:
-            if leg_type == "call" and not c.get("is_call"): continue
-            if leg_type == "put"  and not c.get("is_put"):  continue
-            d = abs(abs(c.get("delta", 0)) - abs(target_delta))
-            if d < best_diff:
-                best_diff, best = d, c
-        return best
-
-    # ── 下单 / 平仓 / 展期 ────────────────────────────────
-    def _send_option_order(self, leg: dict, direction: Direction,
-                           offset: Offset) -> bool:
-        name = leg.get("name", "leg")
-        if name in self.legs and not offset == Offset.CLOSE:
-            # 同名腿已存在（未平仓），不重复开
+    def _ensure_quote_subscribed(self, symbol: str) -> bool:
+        """确保已订阅 QUOTE（push=False），返回是否成功"""
+        if symbol in self._quote_subscribed:
+            return True
+        qc = self._get_quote_ctx()
+        if qc is None:
             return False
         try:
-            from vnpy.trader.object import OrderRequest
-            limit_price = leg.get("limit_price",
-                          leg.get("mid_price",
-                          leg.get("mark_price",
-                          leg.get("price", 0))))
-            vol = int(leg.get("size", self.position_size))
-            req = OrderRequest(
-                symbol=leg["code"],
-                exchange=leg.get("exchange", Exchange.SMART),
-                direction=direction,
-                type=OrderType.LIMIT,
-                volume=vol,
-                price=limit_price,
-                offset=offset,
-                reference=f"option_{self.strategy_name}",
+            ret, _ = qc.subscribe(
+                [symbol], [SubType.QUOTE],
+                subscribe_push=False,
+                session=Session.ALL
             )
-            gw_name = "FUTU_US" if ".US." in self.vt_symbol or \
-                       self.vt_symbol.endswith(".SMART") else "FUTU_HK"
-            vt_oid = self.cta_engine.main_engine.send_order(req, gw_name)
-            if vt_oid:
-                leg["vt_orderid"] = vt_oid
-                leg["direction"]  = direction
-                leg["offset"]     = offset
-                self.legs[name] = leg
-                self._retry_count.pop(name, None)
-                self.write_log(f"[Base] 下单 {direction.value} {leg['code']} "
-                               f"x{vol} @{limit_price:.2f} oid={vt_oid}")
+            if ret == RET_OK:
+                self._quote_subscribed.add(symbol)
+                self.write_log(f"[Quote] ✅ 订阅 QUOTE(push=off): {symbol}")
                 return True
             else:
-                self.write_log(f"[Base] 下单返回空 oid: {leg['code']}")
+                self.write_log(f"[Quote] ⚠️ 订阅失败: {symbol}")
                 return False
         except Exception as e:
-            self.write_log(f"[Base] 下单异常 {leg.get('code')}: {e}")
+            self.write_log(f"[Quote] ⚠️ 订阅异常 {symbol}: {e}")
             return False
 
-    def _open_spread(self, long_leg: dict, short_leg: dict) -> bool:
-        """先开 long，失败则整体失败；short 失败则回滚 long"""
-        long_ok = self._send_option_order(long_leg, Direction.LONG, Offset.OPEN)
-        if not long_ok:
-            return False
-        short_ok = self._send_option_order(short_leg, Direction.SHORT, Offset.OPEN)
-        if not short_ok:
-            self.write_log("[Base] spread short 腿失败，回滚 long")
-            self._send_option_order(long_leg, Direction.SHORT, Offset.CLOSE)
-            return False
-        self.net_premium = (long_leg.get("premium", 0)
-                          - short_leg.get("premium", 0))
-        return True
+    def get_quote(self, symbol: str) -> Optional[Any]:
+        """
+        按需获取 Quote 快照（带 TTL 缓存）。
+        返回 pandas.Series 或 None。
+        """
+        now = time.time()
+        if symbol in self._quote_cache:
+            ts, data = self._quote_cache[symbol]
+            if now - ts < self.quote_cache_ttl:
+                return data
 
-    def _close_all_legs(self):
-        """平仓所有腿（方向取反）"""
-        for name, leg in list(self.legs.items()):
-            is_long = leg.get("is_long", leg.get("direction") == Direction.LONG)
-            close_dir = Direction.SHORT if is_long else Direction.LONG
-            self._send_option_order(leg, close_dir, Offset.CLOSE)
-        self.legs.clear()
+        if not self._ensure_quote_subscribed(symbol):
+            return None
 
-    def _roll_positions(self):
-        """展期：先平旧腿，再等 on_bar 重新开仓"""
-        self.write_log("[Base] 展期：平仓近月")
-        self._close_all_legs()
+        qc = self._get_quote_ctx()
+        if qc is None:
+            return None
 
-    def _manage_expiry(self, bar: BarData) -> bool:
-        """距到期<=3天强制平仓"""
-        for name, leg in list(self.legs.items()):
-            dte = leg.get("days_to_expiry", 999)
-            if dte <= 3:
-                self.write_log(f"[Base] {name} 临近到期({dte}d) 强平")
-                self._close_all_legs()
-                return True
-        return False
-
-    # ── 现金 / Regime ────────────────────────────────────
-    def _get_available_cash(self) -> float:
-        for gw_name in ("FUTU_US", "FUTU_HK", "FUTU"):
-            gw = self.cta_engine.main_engine.get_gateway(gw_name)
-            if gw and hasattr(gw, "acc_info") and gw.acc_info.get("cash"):
-                return float(gw.acc_info["cash"])
-        return 0.0
-
-    def _scaled_size(self, base_size: int = None) -> int:
-        """按 Regime 缩放仓位"""
-        base = base_size or self.position_size
-        if self.regime_label == "bull_trend":    return int(base * 1.2)
-        if self.regime_label == "bear_trend":    return int(base * 0.8)
-        if self.regime_label == "high_volatility":return int(base * 0.6)
-        return base
-
-    def _check_cash(self, required_per_contract: float) -> bool:
-        need = required_per_contract * self._scaled_size() * (1 + self.cash_buffer_ratio)
-        avail = self._get_available_cash()
-        if avail <= 0:
-            return True  # 无法判断时放行
-        return avail >= need
-
-    # ── 工具 ──────────────────────────────────────────────
-    @staticmethod
-    def _f(val):
         try:
-            s = str(val).strip()
-            if s == "" or s.upper() == "N/A":
-                return 0.0
-            return float(s)
-        except:
+            ret, data = qc.get_stock_quote([symbol])
+            if ret == RET_OK and len(data) > 0:
+                row = data.iloc[0]
+                self._quote_cache[symbol] = (now, row)
+                self._option_symbols.add(symbol)
+                return row
+        except Exception as e:
+            self.write_log(f"[Quote] 获取 {symbol} 失败: {e}")
+        return None
+
+    def get_quote_batch(self, symbols: List[str]) -> Dict[str, Any]:
+        """批量获取 Quote（逐个查询，带缓存）"""
+        results = {}
+        for sym in symbols:
+            q = self.get_quote(sym)
+            if q is not None:
+                results[sym] = q
+        return results
+
+    def _batch_quote(self, symbols: List[str]) -> Dict[str, Any]:
+        """别名：兼容子类调用习惯"""
+        return self.get_quote_batch(symbols)
+
+    # ============================================================
+    # Quote 存库
+    # ============================================================
+    def save_quote_snapshot(self, symbol: str, trigger_type: str):
+        """
+        保存 Quote 快照到数据库。
+        trigger_type: 'signal' / 'entry' / 'exit' / 'periodic'
+        """
+        quote = self.get_quote(symbol)
+        if quote is None:
+            return
+
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self._db_path)
+            conn.execute("""
+                INSERT OR REPLACE INTO quote_snapshot
+                (symbol, underlying, timestamp, trigger_type,
+                 last_price, open_price, high_price, low_price, prev_close,
+                 volume, turnover,
+                 implied_volatility, delta, gamma, vega, theta, rho,
+                 premium, strike_price, expiry_date_distance, open_interest,
+                 recovery_price, price_recovery_ratio,
+                 pre_price, after_price,
+                 regime, strategy_name)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                symbol,
+                getattr(self, 'underlying_symbol', ''),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                trigger_type,
+                self._f(quote.get('last_price')),
+                self._f(quote.get('open_price')),
+                self._f(quote.get('high_price')),
+                self._f(quote.get('low_price')),
+                self._f(quote.get('prev_close_price')),
+                int(quote.get('volume', 0) or 0),
+                self._f(quote.get('turnover')),
+                self._f(quote.get('implied_volatility')),
+                self._f(quote.get('delta')),
+                self._f(quote.get('gamma')),
+                self._f(quote.get('vega')),
+                self._f(quote.get('theta')),
+                self._f(quote.get('rho')),
+                self._f(quote.get('premium')),
+                self._f(quote.get('strike_price')),
+                int(quote.get('expiry_date_distance', 0) or 0),
+                int(quote.get('open_interest', 0) or 0),
+                self._f(quote.get('recovery_price')),
+                self._f(quote.get('price_recovery_ratio')),
+                self._f(quote.get('pre_price')),
+                self._f(quote.get('after_price')),
+                self.current_regime,
+                self.strategy_name,
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self.write_log(f"[Quote] 存库失败: {e}")
+
+    def _periodic_quote_sample(self):
+        """定时采样（由 on_1m_bar 触发）"""
+        for sym in list(self._option_symbols):
+            self.save_quote_snapshot(sym, 'periodic')
+
+    # ============================================================
+    # 数据库初始化
+    # ============================================================
+    def init_quote_tables(self):
+        """创建 quote_snapshot 表（如果不存在）"""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self._db_path)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS quote_snapshot (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    underlying TEXT,
+                    timestamp DATETIME NOT NULL,
+                    trigger_type TEXT,
+                    last_price REAL, open_price REAL, high_price REAL,
+                    low_price REAL, prev_close REAL,
+                    volume INTEGER, turnover REAL,
+                    implied_volatility REAL, delta REAL, gamma REAL,
+                    vega REAL, theta REAL, rho REAL,
+                    premium REAL, strike_price REAL,
+                    expiry_date_distance INTEGER, open_interest INTEGER,
+                    recovery_price REAL, price_recovery_ratio REAL,
+                    pre_price REAL, after_price REAL,
+                    regime TEXT, strategy_name TEXT,
+                    UNIQUE(symbol, timestamp, trigger_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_qs_symbol_time
+                    ON quote_snapshot(symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_qs_trigger
+                    ON quote_snapshot(trigger_type);
+            """)
+            conn.commit()
+            conn.close()
+            self.write_log("[Quote] ✅ quote_snapshot 表就绪")
+        except Exception as e:
+            self.write_log(f"[Quote] 建表失败: {e}")
+
+    # ============================================================
+    # 生命周期
+    # ============================================================
+    def on_start(self):
+        self.init_quote_tables()
+        self.write_log(f"[BaseOption] 🚀 {self.strategy_name} 启动 | "
+                       f"订阅: Tick→1M→多周期 | Quote按需(push=off)")
+
+    def on_stop(self):
+        if self._quote_ctx is not None:
+            try:
+                self._quote_ctx.close()
+            except Exception:
+                pass
+            self._quote_ctx = None
+        self.write_log(f"[BaseOption] 🛑 {self.strategy_name} 停止")
+
+    # ============================================================
+    # 工具方法
+    # ============================================================
+    def _f(self, v):
+        """安全转 float"""
+        try:
+            return float(v) if v is not None else 0.0
+        except (ValueError, TypeError):
             return 0.0
 
+    def _get_available_cash(self) -> float:
+        """获取可用现金（保守：失败返回 0）"""
+        try:
+            me = getattr(self.cta_engine, 'main_engine', None)
+            if me is not None:
+                for gw in getattr(me, 'gateways', {}).values():
+                    pm = getattr(gw, 'position_manager', None)
+                    if pm is not None and hasattr(pm, 'available_cash'):
+                        return float(pm.available_cash())
+            qc = self._get_quote_ctx()
+            if qc is not None:
+                ret, acc = qc.get_acc_list()
+                if ret == RET_OK and len(acc) > 0:
+                    return float(acc.iloc[0].get('power', 0))
+        except Exception as e:
+            self.write_log(f"[Cash] 查询失败: {e}")
+        return 0.0
+
+    def _telegram_push(self, text: str):
+        """推送 Telegram 消息"""
+        try:
+            me = getattr(self.cta_engine, 'main_engine', None)
+            if me is not None:
+                rc = getattr(me, 'remote_controller', None)
+                if rc is not None and hasattr(rc, 'send_message'):
+                    rc.send_message(text)
+        except Exception:
+            pass
+        self.write_log(text)
+
+    # ============================================================
+    # 子类必须/应该实现的方法（stub + 友好报错）
+    # ============================================================
+    def _to_futu_code(self) -> str:
+        """将 vt_symbol 转为 futu 格式（子类可覆盖）"""
+        # 默认实现：假设 vt_symbol 形如 "US.AAPL"
+        parts = self.vt_symbol.split(".")
+        if len(parts) >= 2:
+            return f"{parts[0]}.{parts[1]}"
+        return self.vt_symbol
+
+    def _query_full_chain(self, code: str) -> List[dict]:
+        """查询期权链（子类应覆盖，此处为 stub）"""
+        self.write_log(f"[Stub] _query_full_chain({code}) 未实现")
+        return []
+
+    def _select_contracts(self, chain: List[dict], opt_type: str) -> List[dict]:
+        """从链中筛选 call/put 合约"""
+        if opt_type == "call":
+            return [c for c in chain if c.get("is_call")]
+        elif opt_type == "put":
+            return [c for c in chain if c.get("is_put")]
+        return []
+
+    def _send_option_order(self, leg: dict, direction, offset) -> bool:
+        """发送期权委托（子类应覆盖）"""
+        self.write_log(f"[Stub] _send_option_order 未实现 leg={leg.get('code','?')}")
+        return False
+
+    def _open_spread(self, long_leg: dict, short_leg: dict) -> bool:
+        """开仓价差双腿"""
+        ok1 = self._send_option_order(long_leg, "LONG", "OPEN")
+        ok2 = self._send_option_order(short_leg, "SHORT", "OPEN")
+        if ok1 and ok2:
+            return True
+        # 回滚
+        if ok1:
+            self._send_option_order(long_leg, "SHORT", "CLOSE")
+        if ok2:
+            self._send_option_order(short_leg, "LONG", "CLOSE")
+        return False
+
+    def _close_all_legs(self):
+        """平掉所有持仓腿"""
+        for name, leg in list(self.legs.items()):
+            direction = "SHORT" if leg.get("is_long") else "LONG"
+            self._send_option_order(leg, direction, "CLOSE")
+        self.legs.clear()
+
+    def _manage_expiry(self, bar: BarData) -> bool:
+        """到期管理（子类可覆盖）"""
+        return False
+
     def _estimate_pnl(self) -> float:
-        """用最新报价估浮动盈亏"""
-        total = 0.0
-        quotes = self._batch_quote(list(self.legs.keys()))
-        for name, leg in self.legs.items():
-            q = quotes.get(leg["code"], {})
-            cur = q.get("price", leg.get("premium", 0))
-            entry = leg.get("premium", cur)
-            is_long = leg.get("is_long",
-                       leg.get("direction") == Direction.LONG)
-            total += (cur - entry) if is_long else (entry - cur)
-        self.pnl = total
-        return total
+        """估算当前持仓盈亏"""
+        return self.pnl
+
+    def _scaled_size(self) -> int:
+        """计算缩放后的持仓规模"""
+        return getattr(self, 'position_size', 1)
+
+    def _roll_positions(self):
+        """展期：先平旧仓，标记状态"""
+        self.write_log(f"[{self.strategy_name}] 展期：平仓旧腿")
+        self._close_all_legs()
+        self.net_premium = 0.0

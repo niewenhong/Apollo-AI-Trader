@@ -1,27 +1,19 @@
 """
-strategies/equity/grid_strategy.py - v2.9.0
-网格交易策略 + ATR 动态间距 + 趋势感知 + Regime 过滤
-v2.9.0 优化：
-- 继承 ApolloBaseStrategy
-- ATR 间距替代固定百分比（自适应波动）
-- 趋势过滤：强趋势时不挂逆势网格
-- 中心价随 5M MA 漂移
-- 网格穿越交易 + 超时回收
+strategies/equity/grid_strategy.py - v3.1.4
+网格交易策略 + ATR动态间距 + 趋势感知 + Regime过滤
+继承 BaseStrategy，启动交易保护
 """
-import numpy as np
+from vnpy.trader.object import BarData, TradeData
 
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
-
-from strategies.base_strategy import ApolloBaseStrategy
+from strategies.base_strategy import BaseStrategy
 
 
-class GridStrategy(ApolloBaseStrategy):
-    """网格交易策略（v2.9.0）"""
+class GridStrategy(BaseStrategy):
+    """网格交易策略（v3.1.4）"""
 
     author = "Apollo"
 
-    parameters = ApolloBaseStrategy.parameters + [
+    parameters = BaseStrategy.parameters + [
         "grid_count",
         "grid_spacing_pct",
         "center_price",
@@ -29,15 +21,16 @@ class GridStrategy(ApolloBaseStrategy):
         "atr_spacing_multiplier",
         "recenter_threshold_pct",
         "trend_filter_strength",
+        "atr_period",
     ]
-    variables = ApolloBaseStrategy.variables + [
+    variables = BaseStrategy.variables + [
         "grid_upper", "grid_lower",
         "last_grid_level", "atr_val",
         "_5m_ma_diff",
     ]
 
     DEFAULTS = {
-        **ApolloBaseStrategy.DEFAULTS,
+        **BaseStrategy.DEFAULTS,
         "grid_count": 5,
         "grid_spacing_pct": 0.01,
         "center_price": 0.0,
@@ -45,6 +38,7 @@ class GridStrategy(ApolloBaseStrategy):
         "atr_spacing_multiplier": 1.0,
         "recenter_threshold_pct": 2.0,
         "trend_filter_strength": 0.5,
+        "atr_period": 14,
         "max_holding_bars": 120,
     }
 
@@ -74,7 +68,7 @@ class GridStrategy(ApolloBaseStrategy):
             return
 
         close = bar.close_price
-        self.atr_val = self.am.atr(self.atr_period if hasattr(self, 'atr_period') else 14, array=False)
+        self.atr_val = self.am.atr(self.atr_period, array=False)
 
         # 初始化网格
         if not self._init_done:
@@ -83,13 +77,11 @@ class GridStrategy(ApolloBaseStrategy):
             self._init_done = True
             return
 
-        # 中心漂移（跟随 5M MA）
-        if hasattr(self, '_5m_center'):
-            center = self._5m_center
-        else:
+        # 中心漂移
+        center = getattr(self, '_5m_center', None)
+        if center is None:
             center = self.grid_lower + (self.grid_upper - self.grid_lower) / 2
 
-        # 是否需要重建网格
         drift_pct = abs(close - center) / center * 100 if center > 0 else 0
         if drift_pct > self.recenter_threshold_pct:
             self._build_grid(close, close)
@@ -102,15 +94,14 @@ class GridStrategy(ApolloBaseStrategy):
             levels_crossed = abs(current_level - self.last_grid_level)
             self.write_log(f"📊 网格穿越: {direction} 层级={current_level} 跨越={levels_crossed}")
 
-            # 趋势过滤
             trend_ok = True
             if self.trend_filter_strength > 0 and self._5m_ma_diff != 0:
                 if direction == "UP" and self._5m_ma_diff < -self.trend_filter_strength:
-                    trend_ok = False  # 下跌趋势中不接刀
+                    trend_ok = False
                 elif direction == "DOWN" and self._5m_ma_diff > self.trend_filter_strength:
-                    trend_ok = False  # 上涨趋势中不摸顶
+                    trend_ok = False
 
-            if trend_ok:
+            if trend_ok and getattr(self, '_trading_allowed', False):
                 if direction == "UP" and self.pos <= 0:
                     if self.pos < 0:
                         self.cover(close, abs(self.pos))
@@ -132,7 +123,7 @@ class GridStrategy(ApolloBaseStrategy):
                 self.cover(close, abs(self.pos))
             self.write_log(f"⏰ 网格超时回收 | bars={self.bars_held}")
 
-    # ── 5M 层：中心参考 + 趋势 ──
+    # ── 5M 层 ──
     def on_5m_bar(self, bar: BarData):
         self.am_5m.update_bar(bar)
         if not self.am_5m.inited:
@@ -162,11 +153,14 @@ class GridStrategy(ApolloBaseStrategy):
     def _price_to_level(self, price: float) -> int:
         if not self._grid_levels:
             return 0
+        result = -1
         for i, lp in enumerate(self._grid_levels):
             if price >= lp:
-                return i
-        return 0
+                result = i
+            else:
+                break
+        return result
 
-    def on_trade(self, trade):
+    def on_trade(self, trade: TradeData):
         super().on_trade(trade)
         self.write_log(f"💰 网格成交: {trade.direction.name} {trade.volume}@{trade.price:.2f}")

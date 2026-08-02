@@ -1,53 +1,50 @@
 """
-strategies/equity/vwap_strategy.py - v2.9.0
-VWAP 均值回归策略 + 多周期确认 + Regime 感知
-v2.9.0 优化：
-- 继承 ApolloBaseStrategy
-- 用 1M K线（已订阅）计算 VWAP，不依赖 tick 聚合
-- 加入 5M 趋势过滤（避免逆势接刀）
-- Keltner 通道 + ATR 动态带宽
-- 超时平仓 + 止损
+strategies/equity/vwap_strategy.py - v3.1.4
+VWAP均值回归策略 + 多周期确认 + Regime感知
+继承 BaseStrategy，启动交易保护
 """
 import numpy as np
 
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
+from vnpy.trader.object import BarData, TradeData
 
-from strategies.base_strategy import ApolloBaseStrategy
+from strategies.base_strategy import BaseStrategy
 
 
-class VWAPStrategy(ApolloBaseStrategy):
-    """VWAP 均值回归策略（v2.9.0）"""
+class VWAPStrategy(BaseStrategy):
+    """VWAP均值回归策略（v3.1.4）"""
 
     author = "Apollo"
 
-    parameters = ApolloBaseStrategy.parameters + [
+    parameters = BaseStrategy.parameters + [
         "vwap_period",
         "deviation_entry",
         "deviation_exit",
         "use_keltner",
         "keltner_atr_multiplier",
         "use_5m_filter",
+        "atr_period",
     ]
-    variables = ApolloBaseStrategy.variables + [
+    variables = BaseStrategy.variables + [
         "vwap_val", "deviation_val",
         "upper_band", "lower_band",
         "_5m_trend",
     ]
 
     DEFAULTS = {
-        **ApolloBaseStrategy.DEFAULTS,
+        **BaseStrategy.DEFAULTS,
         "vwap_period": 20,
         "deviation_entry": 2.0,
         "deviation_exit": 0.5,
         "use_keltner": True,
         "keltner_atr_multiplier": 1.5,
         "use_5m_filter": True,
+        "atr_period": 14,
         "max_holding_bars": 30,
     }
 
     def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+        self.need_tick = True
 
         self.vwap_val = 0.0
         self.deviation_val = 0.0
@@ -82,8 +79,10 @@ class VWAPStrategy(ApolloBaseStrategy):
             std = 0.0
         self.deviation_val = (close - self.vwap_val) / std if std > 0 else 0.0
 
+        # ATR
+        atr = am.atr(self.atr_period, array=False)
+
         # 通道
-        atr = am.atr(self.atr_period if hasattr(self, 'atr_period') else 14, array=False)
         if self.use_keltner:
             self.upper_band = self.vwap_val + atr * self.keltner_atr_multiplier
             self.lower_band = self.vwap_val - atr * self.keltner_atr_multiplier
@@ -114,7 +113,6 @@ class VWAPStrategy(ApolloBaseStrategy):
 
         # ── 开仓 ──
         else:
-            # 5M 过滤
             if self.use_5m_filter and self._5m_trend == -1 and close <= self.lower_band:
                 self.write_log(f"⏸ 5M趋势向下，跳过做多信号")
                 return
@@ -122,8 +120,10 @@ class VWAPStrategy(ApolloBaseStrategy):
                 self.write_log(f"⏸ 5M趋势向上，跳过做空信号")
                 return
 
-            # Regime 过滤
             if not self.is_regime_tradeable():
+                return
+
+            if not getattr(self, '_trading_allowed', False):
                 return
 
             if close <= self.lower_band:
@@ -153,7 +153,7 @@ class VWAPStrategy(ApolloBaseStrategy):
         if period < 2:
             return float(am.close[-1]) if len(am.close) > 0 else 0.0
         closes = am.close[-period:]
-        volumes = am.volume[-period:]
+        volumes = am.volume[-period:] if hasattr(am, 'volume') else np.ones(period)
         total_pv = 0.0
         total_v = 0.0
         for i in range(period):
@@ -164,6 +164,6 @@ class VWAPStrategy(ApolloBaseStrategy):
                 total_v += v
         return total_pv / total_v if total_v > 0 else float(closes[-1])
 
-    def on_trade(self, trade):
+    def on_trade(self, trade: TradeData):
         super().on_trade(trade)
         self.write_log(f"💰 VWAP成交: {trade.direction.name} {trade.volume}@{trade.price:.2f}")

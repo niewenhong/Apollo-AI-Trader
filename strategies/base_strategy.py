@@ -1,20 +1,18 @@
 """
-strategies/base_strategy.py - v2.9.4
+strategies/base_strategy.py - v3.1.4
 策略基类：所有策略的公共父类
+含启动交易保护 + 智能路由
 
-v2.9.4 更新：
-- 5个 BarGenerator（1M/5M/15M/60M/日）
-- on_1m/5m/15m/60m/daily_bar 完整钩子
-- regime 感知（get_current_regime / is_regime_tradeable）
-- bars_held 超时强平
-- close_position() 通用平仓
-- 统一移动止盈/硬止损
-- _safe_float / _safe_int 防御工具
+v3.1.4 更新：
+- 类名 ApolloBaseStrategy → BaseStrategy（统一命名）
+- 新增 _trading_allowed 启动保护
+- on_init 禁止交易，on_start 开放交易
+- buy/sell/short/cover 增加 _check_trading_allowed 守卫
+- order_manager 智能路由保持不变
 """
 import time
 import logging
 from typing import Optional, Dict, Any, Callable, Tuple
-from datetime import datetime, time as dtime
 
 from vnpy_ctastrategy import CtaTemplate
 from vnpy.trader.object import BarData, TickData, OrderData, TradeData
@@ -30,7 +28,7 @@ except ImportError:
 logger = logging.getLogger("BaseStrategy")
 
 
-class ApolloBaseStrategy(CtaTemplate):
+class BaseStrategy(CtaTemplate):
     """
     所有 Apollo 策略的公共基类。
 
@@ -43,14 +41,10 @@ class ApolloBaseStrategy(CtaTemplate):
     - on_60m_bar(bar)      → 中观 Regime 更新
     - on_daily_bar(bar)    → 宏观 Regime + 仓位上限
 
-    通用功能：
-    - 数据库驱动的 AI 参数加载
-    - 统一的交易时段判断（US/HK）
-    - 统一的 Kelly 仓位计算
-    - 统一的移动止盈/硬止损
-    - 统一的交易统计
-    - 通知回调接口
-    - Regime 感知（从 RegimeEngine 注入）
+    交易保护：
+    - on_init 阶段 _trading_allowed = False，禁止所有下单
+    - on_start 阶段 _trading_allowed = True，开放交易
+    - buy/sell/short/cover 自动检查 _trading_allowed
     """
 
     parameters = [
@@ -114,10 +108,9 @@ class ApolloBaseStrategy(CtaTemplate):
         self.bg_5m = BarGenerator(self.on_bar, 5, self.on_5m_bar)
         self.bg_15m = BarGenerator(self.on_bar, 15, self.on_15m_bar)
         self.bg_60m = BarGenerator(self.on_bar, 60, self.on_60m_bar)
-        # 日线：1440 分钟 = 1 天（美股常规 6.5 小时 = 390 分钟，用 390）
         self.bg_daily = BarGenerator(self.on_bar, 390, self.on_daily_bar)
 
-        # ArrayManager（默认 5000 根 1M bar ≈ 8 个交易日，足够所有指标）
+        # ArrayManager（默认 5000 根 1M bar ≈ 8 个交易日）
         self.am = ArrayManager(5000)
 
         # 通知回调
@@ -133,14 +126,21 @@ class ApolloBaseStrategy(CtaTemplate):
         # 参数版本
         self._param_version = setting.get("_version", 1)
 
+        # OrderManager（外部注入）
+        self.order_manager = None
+        self.use_smart_routing = True
+
+        # ---- 交易许可标志（核心保护）----
+        self._trading_allowed = False
+
         # AI 参数加载
         self._load_ai_params()
 
         self.write_log(f"[INIT] {strategy_name} | {vt_symbol} | US={self.is_us} HK={self.is_hk} v{self._param_version}")
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  AI 参数加载
-    # ─────────────────────────────
+    # ────────────────────────────
     def _load_ai_params(self):
         if not HAS_DB:
             return
@@ -155,30 +155,39 @@ class ApolloBaseStrategy(CtaTemplate):
         except Exception as e:
             self.write_log(f"AI参数加载失败: {e}")
 
-    # ─────────────────────────────
-    #  生命周期
-    # ─────────────────────────────
+    # ────────────────────────────
+    #  生命周期（交易保护核心）
+    # ────────────────────────────
     def on_init(self):
-        self.write_log(f"✅ {self.strategy_name} 初始化完成 (v{self._param_version})")
+        """初始化完成（回放阶段）—— 禁止交易"""
+        self._trading_allowed = False
+        self.write_log(f"✅ {self.strategy_name} 初始化完成 (v{self._param_version}) | 交易已锁定")
 
     def on_start(self):
+        """策略启动（实盘阶段）—— 开放交易"""
+        self._trading_allowed = True
         self.is_ordering = False
         self.trailing_active = False
         self.bars_held = 0
-        self.write_log(f"▶️ {self.strategy_name} 启动")
+        self.write_log(f"▶ {self.strategy_name} 启动 | 交易已开放")
 
     def on_stop(self):
+        """策略停止"""
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
         self.write_log(
             f"⏸ {self.strategy_name} 停止 | "
             f"PnL={self.today_pnl:.2f} 交易={self.total_trades} 胜率={win_rate:.0f}%"
         )
 
-    # ─────────────────────────────
+    def is_trading_allowed(self) -> bool:
+        """供子类或定时器检查是否允许交易"""
+        return self._trading_allowed
+
+    # ────────────────────────────
     #  数据入口（统一转发）
-    # ─────────────────────────────
+    # ────────────────────────────
     def on_tick(self, tick: TickData):
-        """微观层：默认将 tick 喂给所有 BarGenerator"""
+        """微观层：将 tick 喂给所有 BarGenerator"""
         self.bg_1m.update_tick(tick)
         self.bg_5m.update_tick(tick)
         self.bg_15m.update_tick(tick)
@@ -193,9 +202,9 @@ class ApolloBaseStrategy(CtaTemplate):
         self.bg_60m.update_bar(bar)
         self.bg_daily.update_bar(bar)
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  周期钩子（子类按需覆盖）
-    # ─────────────────────────────
+    # ────────────────────────────
     def on_1m_bar(self, bar: BarData):
         """短期信号层"""
         self.am.update_bar(bar)
@@ -222,9 +231,9 @@ class ApolloBaseStrategy(CtaTemplate):
         """宏观 Regime + 仓位上限（子类覆盖）"""
         pass
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  订单/成交处理
-    # ─────────────────────────────
+    # ────────────────────────────
     def on_order(self, order: OrderData):
         if order.status in (Status.REJECTED, Status.CANCELLED):
             self.is_ordering = False
@@ -247,12 +256,95 @@ class ApolloBaseStrategy(CtaTemplate):
             self.total_trades += 1
             if pnl > 0:
                 self.winning_trades += 1
-            self.write_log(f"💰 卖出: {trade.volume}@{trade.price:.2f} PnL={pnl:.2f}")
+            self.write_log(f"💰 卖出: {trade.volume}@{trade.price:.2f} PnL={pnl:+.2f}")
         self.put_event()
 
-    # ─────────────────────────────
+    # ────────────────────────────
+    #  交易保护 + 智能路由（核心）
+    # ────────────────────────────
+    def _check_trading_allowed(self) -> bool:
+        """检查是否允许交易，不允许则记录警告"""
+        if not self._trading_allowed:
+            self.write_log("交易未开放，忽略本次下单请求（回放阶段）")
+            return False
+        return True
+
+    def buy(self, price, volume, stop=False, lock=False, net=False):
+        if not self._check_trading_allowed():
+            return []
+        if self._should_route():
+            symbol = self.vt_symbol.split('.')[0]
+            self.order_manager.submit_signal(
+                symbol=symbol,
+                direction='LONG',
+                price=float(price),
+                volume=int(volume),
+                offset='OPEN',
+                strategy_name=self.strategy_name,
+                auto_size=(int(volume) <= 0)
+            )
+            return [f"SMART_{self.strategy_name}_{symbol}"]
+        return super().buy(price, volume, stop=stop, lock=lock, net=net)
+
+    def sell(self, price, volume, stop=False, lock=False, net=False):
+        if not self._check_trading_allowed():
+            return []
+        if self._should_route():
+            symbol = self.vt_symbol.split('.')[0]
+            self.order_manager.submit_signal(
+                symbol=symbol,
+                direction='SHORT',
+                price=float(price),
+                volume=int(volume),
+                offset='CLOSE',
+                strategy_name=self.strategy_name,
+                auto_size=False
+            )
+            return [f"SMART_{self.strategy_name}_{symbol}"]
+        return super().sell(price, volume, stop=stop, lock=lock, net=net)
+
+    def short(self, price, volume, stop=False, lock=False, net=False):
+        if not self._check_trading_allowed():
+            return []
+        if self._should_route():
+            symbol = self.vt_symbol.split('.')[0]
+            self.order_manager.submit_signal(
+                symbol=symbol,
+                direction='SHORT',
+                price=float(price),
+                volume=int(volume),
+                offset='OPEN',
+                strategy_name=self.strategy_name,
+                auto_size=(int(volume) <= 0)
+            )
+            return [f"SMART_{self.strategy_name}_{symbol}"]
+        return super().short(price, volume, stop=stop, lock=lock, net=net)
+
+    def cover(self, price, volume, stop=False, lock=False, net=False):
+        if not self._check_trading_allowed():
+            return []
+        if self._should_route():
+            symbol = self.vt_symbol.split('.')[0]
+            self.order_manager.submit_signal(
+                symbol=symbol,
+                direction='LONG',
+                price=float(price),
+                volume=int(volume),
+                offset='CLOSE',
+                strategy_name=self.strategy_name,
+                auto_size=False
+            )
+            return [f"SMART_{self.strategy_name}_{symbol}"]
+        return super().cover(price, volume, stop=stop, lock=lock, net=net)
+
+    def _should_route(self):
+        return (self.use_smart_routing
+                and self.order_manager is not None
+                and hasattr(self.order_manager, 'submit_signal'))
+
+    # ────────────────────────────
     #  仓位管理
-    # ─────────────────────────────
+    # ────────────────────────────
     def update_trailing_stop(self, price: float) -> bool:
         """返回 True 表示触发止损/止盈"""
         if self.pos == 0 or price <= 0:
@@ -301,17 +393,18 @@ class ApolloBaseStrategy(CtaTemplate):
         """通用平仓：平掉当前所有持仓"""
         if self.pos == 0:
             return
+        last_price = getattr(self, 'last_price', 0.0)
         if self.pos > 0:
-            self.sell(self.pos, self.tick.last_price if hasattr(self, 'tick') else 0)
+            self.sell(last_price if last_price > 0 else self.entry_price, abs(self.pos))
         else:
-            self.cover(abs(self.pos), self.tick.last_price if hasattr(self, 'tick') else 0)
+            self.cover(last_price if last_price > 0 else self.entry_price, abs(self.pos))
         self.write_log(f"🔴 平仓指令发出: pos={self.pos}")
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  Regime 感知
-    # ─────────────────────────────
+    # ────────────────────────────
     def get_current_regime(self) -> str:
-        """从 RegimeEngine 获取当前 regime；无引擎时返回 'unknown'"""
+        """从 RegimeEngine 获取当前 regime"""
         if self.regime_engine is not None:
             try:
                 regime = self.regime_engine.get_regime(self.vt_symbol)
@@ -329,16 +422,20 @@ class ApolloBaseStrategy(CtaTemplate):
         r = self.get_current_regime()
         return r in ("bull_trend", "bear_trend", "strong_bull", "strong_bear")
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  时间窗口
-    # ─────────────────────────────
+    # ────────────────────────────
     def check_time_window(self, bar_dt=None) -> Tuple[bool, bool]:
         """返回 (allow_open, must_close)"""
         if bar_dt is not None:
             now_t = bar_dt.time() if hasattr(bar_dt, 'time') else dtime(bar_dt.hour, bar_dt.minute)
         else:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo("America/New_York") if self.is_us else ZoneInfo("Asia/Hong_Kong")
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo("America/New_York") if self.is_us else ZoneInfo("Asia/Hong_Kong")
+            except ImportError:
+                import pytz
+                tz = pytz.timezone("America/New_York") if self.is_us else pytz.timezone("Asia/Hong_Kong")
             now_t = datetime.now(tz).time()
 
         open_t = dtime(self.session_open_hour, self.session_open_minute)
@@ -347,9 +444,9 @@ class ApolloBaseStrategy(CtaTemplate):
         must_close = now_t >= close_t
         return allow_open, must_close
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  防御工具
-    # ─────────────────────────────
+    # ────────────────────────────
     @staticmethod
     def _safe_float(val, default=0.0) -> float:
         if val is None:
@@ -372,13 +469,13 @@ class ApolloBaseStrategy(CtaTemplate):
     @staticmethod
     def _safe_int(val, default=0) -> int:
         try:
-            return int(ApolloBaseStrategy._safe_float(val, default))
+            return int(BaseStrategy._safe_float(val, default))
         except (ValueError, OverflowError):
             return default
 
-    # ─────────────────────────────
+    # ────────────────────────────
     #  通知 / 统计
-    # ─────────────────────────────
+    # ────────────────────────────
     def notify(self, title: str, message: str, level: str = "info"):
         if self.notice_callback:
             try:
@@ -391,5 +488,13 @@ class ApolloBaseStrategy(CtaTemplate):
             return 0.0
         return (current_price - self.entry_price) * self.pos if self.pos > 0 else (self.entry_price - current_price) * abs(self.pos)
 
-    def win_rate(self) -> float:
-        return (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
+    def get_smart_position(self):
+        if self.order_manager is not None:
+            symbol = self.vt_symbol.split('.')[0]
+            return self.order_manager.get_net_qty(symbol)
+        return self.pos
+
+    def register_fill_callback(self, callback):
+        if self.order_manager is not None:
+            symbol = self.vt_symbol.split('.')[0]
+            self.order_manager.register_fill_callback(symbol, callback)

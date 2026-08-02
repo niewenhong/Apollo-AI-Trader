@@ -1,16 +1,10 @@
 """
-futu_gateway.py — 富途网关 v2.9.6 (稳定版)
-- 订阅全套：QUOTE + ORDER_BOOK + TICKER + K_1M/5M/15M/60M
-- 美股 Tick 落盘到 data/history.db（容错版，单行脏数据不崩溃）
-- 自动重连 + 每100条 WAL checkpoint
-- 港股完全不受影响（market!=US 时跳过所有落盘）
-
-修正记录：
-v2.9.6 - 修复 process_ticker 覆盖 tick.volume 导致累计量丢失 + numpy 类型传给 SQLite
-         - 修复 close() 中 quote_ctx/trade_ctx 可能为 None 的崩溃
-         - 落盘前统一把所有值转 Python 原生类型（numpy scalar 兼容）
-         - 表结构增加 UNIQUE INDEX 防止重复写入
-         - 数据库连接失败时不阻塞主流程
+futu_gateway.py — 富途网关 v3.0.1
+v3.0.1 修复：
+  - subscribe() 美股 K_1M 改用 SESSION_NONE：
+    只在交易时段(09:30-16:00 美东)推送，避免盘前盘后稀疏报价
+    污染 ArrayManager，导致均线/ADX 算出垃圾值。
+  - 其余逻辑（按需订阅、Tick 引用计数、落盘、close 等）原样保留。
 """
 import sqlite3
 import os
@@ -31,15 +25,15 @@ from futu import (
     TradeDealHandlerBase, TradeOrderHandlerBase,
     OpenSecTradeContext, OpenFutureTradeContext,
     TickerHandlerBase,
-    SubType, SecurityType,
+    SubType, SecurityType, SecurityFirm,
 )
 try:
     from futu import Session
     SESSION_NONE = Session.NONE
-    SESSION_ALL = Session.ALL
+    SESSION_ALL  = Session.ALL
 except ImportError:
     SESSION_NONE = 0
-    SESSION_ALL = 1
+    SESSION_ALL  = 1
 
 from vnpy.event import EventEngine, Event
 from vnpy.trader.constant import (
@@ -61,7 +55,7 @@ try:
 except Exception:
     CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
-# 尝试导入 K 线处理器（可能不存在，容错）
+# 尝试导入 K 线处理器
 try:
     from .multi_period_kline_handler import MultiPeriodKlineHandler
     _HAS_KLINE_HANDLER = True
@@ -74,11 +68,11 @@ except ImportError:
 
 EVENT_BAR = "eBar"
 
-# ════════════════════════════════════
-#  工具函数（模块级，避免循环依赖）
-# ════════════════════════════════════
+# ══════════════════════════════════
+#  工具函数
+# ══════════════════════════════════
 def convert_symbol_futu2vt(code) -> tuple:
-    """富途代码 → (symbol, exchange)。兜底版本。"""
+    """富途代码 → (symbol, exchange)。"""
     parts = str(code).split(".")
     if len(parts) >= 2:
         futu_exchange = parts[0]
@@ -86,11 +80,10 @@ def convert_symbol_futu2vt(code) -> tuple:
     else:
         futu_exchange = "US"
         futu_symbol = parts[0]
-    # 简单映射
     exchange_map = {
         "US": Exchange.SMART,
         "HK": Exchange.SEHK,
-        "HK_FUTURE": "HK_FUTURE",
+        "HK_FUTURE": Exchange.HKFE,
     }
     return futu_symbol, exchange_map.get(futu_exchange, Exchange.SMART)
 
@@ -98,8 +91,8 @@ def convert_symbol_futu2vt(code) -> tuple:
 def convert_symbol_vt2futu(symbol, exchange) -> str:
     rev = {
         Exchange.SMART: "US",
-        Exchange.SEHK: "HK",
-        "HK_FUTURE": "HK_FUTURE",
+        Exchange.SEHK:  "HK",
+        Exchange.HKFE:  "HK_FUTURE",
     }
     return f"{rev.get(exchange, 'US')}.{symbol}"
 
@@ -124,16 +117,12 @@ def _to_native(v):
     """把 numpy / pandas 标量转成 Python 原生类型，None→0。"""
     if v is None:
         return 0
-    # numpy scalar
     if isinstance(v, np.generic):
         return v.item()
-    # numpy array (单元素)
     if isinstance(v, np.ndarray):
         return v.item() if v.size == 1 else v.tolist()
-    # pandas Timestamp
     if isinstance(v, pd.Timestamp):
         return v.to_pydatetime()
-    # 其他对象尝试取原生
     if hasattr(v, "__float__") and not isinstance(v, (str, bytes)):
         try:
             return float(v)
@@ -142,48 +131,48 @@ def _to_native(v):
     return v
 
 
-# ════════════════════════════════════
+# ══════════════════════════════════
 #  常 / 枚举映射
-# ════════════════════════════════════
+# ══════════════════════════════════
 STATUS_FUTU2VT: Dict = {
-    OrderStatus.NONE: Status.SUBMITTING,
+    OrderStatus.NONE:           Status.SUBMITTING,
     OrderStatus.WAITING_SUBMIT: Status.SUBMITTING,
-    OrderStatus.SUBMITTING: Status.SUBMITTING,
-    OrderStatus.SUBMITTED: Status.NOTTRADED,
-    OrderStatus.FILLED_PART: Status.PARTTRADED,
-    OrderStatus.FILLED_ALL: Status.ALLTRADED,
+    OrderStatus.SUBMITTING:     Status.SUBMITTING,
+    OrderStatus.SUBMITTED:      Status.NOTTRADED,
+    OrderStatus.FILLED_PART:    Status.PARTTRADED,
+    OrderStatus.FILLED_ALL:     Status.ALLTRADED,
     OrderStatus.CANCELLED_PART: Status.CANCELLED,
-    OrderStatus.CANCELLED_ALL: Status.CANCELLED,
-    OrderStatus.FAILED: Status.REJECTED,
-    OrderStatus.DISABLED: Status.CANCELLED,
-    OrderStatus.DELETED: Status.CANCELLED,
+    OrderStatus.CANCELLED_ALL:  Status.CANCELLED,
+    OrderStatus.FAILED:         Status.REJECTED,
+    OrderStatus.DISABLED:       Status.CANCELLED,
+    OrderStatus.DELETED:        Status.CANCELLED,
 }
 
 DIRECTION_VT2FUTU: Dict = {Direction.LONG: TrdSide.BUY, Direction.SHORT: TrdSide.SELL}
 DIRECTION_FUTU2VT: Dict = {
-    TrdSide.BUY: (Direction.LONG, Offset.OPEN),
-    TrdSide.SELL: (Direction.SHORT, Offset.OPEN),
-    TrdSide.BUY_BACK: (Direction.LONG, Offset.CLOSE),
-    TrdSide.SELL_SHORT: (Direction.SHORT, Offset.CLOSE),
+    TrdSide.BUY:         (Direction.LONG,  Offset.OPEN),
+    TrdSide.SELL:        (Direction.SHORT, Offset.OPEN),
+    TrdSide.BUY_BACK:    (Direction.LONG,  Offset.CLOSE),
+    TrdSide.SELL_SHORT:  (Direction.SHORT, Offset.CLOSE),
 }
 
 EXCHANGE_VT2FUTU: Dict = {
     Exchange.SMART: "US",
-    Exchange.SEHK: "HK",
-    "HK_FUTURE": "HK_FUTURE",
+    Exchange.SEHK:  "HK",
+    Exchange.HKFE:  "HK_FUTURE",
 }
 EXCHANGE_FUTU2VT: Dict = {
-    "US": Exchange.SMART,
-    "HK": Exchange.SEHK,
+    "US":       Exchange.SMART,
+    "HK":       Exchange.SEHK,
     "HK_FUTURE": Exchange.HKFE,
 }
 
 SEC_TYPE_FUTU2VT = {
-    SecurityType.STOCK: Product.EQUITY,
-    SecurityType.ETF: Product.ETF,
-    SecurityType.IDX: Product.INDEX,
+    SecurityType.STOCK:   Product.EQUITY,
+    SecurityType.ETF:    Product.ETF,
+    SecurityType.IDX:    Product.INDEX,
     SecurityType.WARRANT: Product.WARRANT,
-    SecurityType.BOND: Product.BOND,
+    SecurityType.BOND:    Product.BOND,
 }
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -195,9 +184,9 @@ class FutuGateway(BaseGateway):
     default_setting = {"密码": "", "地址": "127.0.0.1", "端口": 11111, "市场": "US", "环境": TrdEnv.SIMULATE}
     exchanges = [Exchange.SMART, Exchange.SEHK, Exchange.HKFE]
 
-    # ──────────────────────────────────
+    # ────────────────────────────────
     #  构造
-    # ──────────────────────────────────
+    # ────────────────────────────────
     def __init__(self, event_engine: EventEngine, gateway_name: str, main_engine=None) -> None:
         super().__init__(event_engine, gateway_name)
         self.main_engine = main_engine
@@ -227,6 +216,9 @@ class FutuGateway(BaseGateway):
         self._max_trd_qty_cache: Dict[str, tuple] = {}
         self._max_trd_qty_cache_ttl = 30
 
+        # Tick 订阅引用计数
+        self.tick_ref_count: Dict[str, int] = {}
+
         # 落盘
         self._tick_db_path = os.path.join(_PROJECT_ROOT, "data", "history.db")
         self._tick_db_conn: Optional[sqlite3.Connection] = None
@@ -236,9 +228,9 @@ class FutuGateway(BaseGateway):
         self._db_lock = Lock()
         self._debug_dumped = False
 
-    # ──────────────────────────────────
+    # ────────────────────────────────
     #  类型安全转换
-    # ──────────────────────────────────
+    # ────────────────────────────────
     @staticmethod
     def _safe_float(val, default=0.0):
         if val is None:
@@ -255,9 +247,9 @@ class FutuGateway(BaseGateway):
         except (ValueError, OverflowError):
             return default
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  连接主流程
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def connect(self, setting: dict) -> None:
         self.host = setting.get("地址", "127.0.0.1")
         self.port = int(setting.get("端口", 11111))
@@ -284,16 +276,22 @@ class FutuGateway(BaseGateway):
     def _register_to_main_engine(self) -> None:
         if self._registered:
             return
-        if self.main_engine is not None:
-            self.main_engine.gateways[self.gateway_name] = self
+        me = self.main_engine
+        if me is None:
+            try:
+                me = getattr(self.event_engine, 'main_engine', None)
+            except Exception:
+                me = None
+        if me is not None:
+            me.gateways[self.gateway_name] = self
             self._registered = True
             self.write_log(f"[{self.gateway_name}] 已注册到 MainEngine.gateways['{self.gateway_name}']")
         else:
             self.write_log(f"[{self.gateway_name}] 警告：main_engine 为 None，无法自注册")
 
-    # ──────────────────────────────────
-    #  ★ 数据库初始化
-    # ──────────────────────────────────
+    # ────────────────────────────────
+    #  数据库初始化
+    # ────────────────────────────────
     def _init_tick_db(self) -> None:
         with self._db_lock:
             try:
@@ -307,7 +305,6 @@ class FutuGateway(BaseGateway):
                         pass
                     self._tick_db_conn = None
 
-                # 清理残留 WAL 锁
                 for ext in ['-wal', '-shm']:
                     lf = self._tick_db_path + ext
                     if os.path.exists(lf):
@@ -348,7 +345,6 @@ class FutuGateway(BaseGateway):
                         received_at TEXT
                     )
                 """)
-                # 唯一索引，防止重复
                 try:
                     cur.execute(
                         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tick_unique "
@@ -357,7 +353,6 @@ class FutuGateway(BaseGateway):
                 except Exception:
                     pass
 
-                # 兼容旧表：补缺失列
                 existing = set(r[1] for r in cur.execute("PRAGMA table_info(tick_data)"))
                 for col, ctype in [
                     ("name","TEXT"),("gateway_name","TEXT"),("turnover","REAL"),
@@ -384,15 +379,23 @@ class FutuGateway(BaseGateway):
                 self._tick_db_conn = None
                 self._db_ready = False
 
-    # ──────────────────────────────────
-    #  ★ Tick 落盘（完全容错）
-    # ──────────────────────────────────
+    # ────────────────────────────────
+    #  判断是否应该落盘（按需）
+    # ────────────────────────────────
+    def _should_save_tick(self, vt_symbol: str) -> bool:
+        futu_symbol = self._vt_to_futu_symbol(vt_symbol)
+        return self.tick_ref_count.get(futu_symbol, 0) > 0
+
+    # ────────────────────────────────
+    #  Tick 落盘（完全容错，按需执行）
+    # ────────────────────────────────
     def _save_tick_to_db(self, tick: TickData, source: str = 'quote') -> None:
         if not self._db_ready or self._tick_db_conn is None:
             return
+        if not self._should_save_tick(tick.vt_symbol):
+            return
         with self._db_lock:
             try:
-                # 探活
                 self._tick_db_conn.execute("SELECT 1")
             except Exception:
                 self.write_log(f"[{self.gateway_name}] DB 断开，重连...")
@@ -401,7 +404,6 @@ class FutuGateway(BaseGateway):
                     return
 
             try:
-                # 时间
                 if tick.datetime and getattr(tick.datetime, 'tzinfo', None):
                     ts_utc = tick.datetime.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S.%f")
                 else:
@@ -418,7 +420,6 @@ class FutuGateway(BaseGateway):
                         source, saved_at_utc, received_at
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """
-                # 构造参数并强制转原生类型
                 raw = [
                     str(getattr(tick, 'symbol', '') or ''),
                     str(getattr(tick, 'exchange', '') or ''),
@@ -441,7 +442,6 @@ class FutuGateway(BaseGateway):
                     received_at,
                 ]
                 params = tuple(_to_native(v) for v in raw)
-
                 self._tick_db_conn.execute(sql, params)
                 self._tick_count += 1
                 self._db_error_count = 0
@@ -452,7 +452,6 @@ class FutuGateway(BaseGateway):
                     self.write_log(f"[DB CHECKPOINT] {self.gateway_name} @ {self._tick_count}")
                 else:
                     self._tick_db_conn.commit()
-
             except Exception as e:
                 self._db_error_count += 1
                 if self._db_error_count <= 3 or self._db_error_count % 200 == 0:
@@ -460,7 +459,6 @@ class FutuGateway(BaseGateway):
                         f"[DB ERROR] {self.gateway_name} {source}: {e} | "
                         f"cnt={self._db_error_count}"
                     )
-                # 出错后标记断开，下一条会自动重连
                 try:
                     self._tick_db_conn.close()
                 except Exception:
@@ -476,11 +474,12 @@ class FutuGateway(BaseGateway):
             return
         if getattr(tick, 'gateway_name', '') != self.gateway_name:
             return
-        self._save_tick_to_db(tick, source='event_tick')
+        if self._should_save_tick(tick.vt_symbol):
+            self._save_tick_to_db(tick, source='event_tick')
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  行情连接
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def connect_quote(self) -> None:
         try:
             self.quote_ctx = OpenQuoteContext(self.host, self.port)
@@ -537,17 +536,25 @@ class FutuGateway(BaseGateway):
                 self.kline_handler = None
 
         self.quote_ctx.start()
-        self.write_log(f"[{self.gateway_name}] 行情接口连接成功（含多周期K线+TICKER）")
+        self.write_log(f"[{self.gateway_name}] 行情接口连接成功（含多周期K线+TICKER Handler）")
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  交易连接
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def connect_trade(self) -> None:
         try:
             if self.market == "HK":
-                self.trade_ctx = OpenSecTradeContext(filter_trdmarket=TrdMarket.HK, host=self.host, port=self.port)
+                self.trade_ctx = OpenSecTradeContext(
+                    filter_trdmarket=TrdMarket.HK,
+                    host=self.host, port=self.port,
+                    security_firm=SecurityFirm.FUTUSECURITIES,
+                )
             elif self.market == "US":
-                self.trade_ctx = OpenSecTradeContext(filter_trdmarket=TrdMarket.US, host=self.host, port=self.port)
+                self.trade_ctx = OpenSecTradeContext(
+                    filter_trdmarket=TrdMarket.US,
+                    host=self.host, port=self.port,
+                    security_firm=SecurityFirm.FUTUSECURITIES,
+                )
             elif self.market == "HK_FUTURE":
                 self.trade_ctx = OpenFutureTradeContext(host=self.host, port=self.port)
             else:
@@ -601,11 +608,11 @@ class FutuGateway(BaseGateway):
             ret = RET_ERROR
 
         if ret == RET_OK and not acc_list.empty:
-            self.write_log(f"[{self.gateway_name}] 账户列表 (共 {len(acc_list)} 个):")
+            self.write_log(f"[{self.gateway_name}] 账户列表 (共 {len(acc_list)}个):")
             for _, row in acc_list.iterrows():
                 self.write_log(
-                    f"  acc_id={row['acc_id']} env={row['trd_env']} "
-                    f"type={row['acc_type']} sim_type={row.get('sim_acc_type','N/A')} "
+                    f"  acc_id={row['acc_id']} env={row.get('trd_env','')} "
+                    f"type={row.get('acc_type','')} sim_type={row.get('sim_acc_type','N/A')} "
                     f"status={row.get('acc_status','N/A')}"
                 )
             sim = acc_list[acc_list['trd_env'] == 'SIMULATE']
@@ -621,7 +628,7 @@ class FutuGateway(BaseGateway):
                     self.write_log(f"[{self.gateway_name}] ⚠️ 降级使用首个模拟账号 acc_id={self.acc_id}")
             elif self.market == "HK":
                 hk_margin = sim[(sim['sim_acc_type']=='STOCK') & (sim['acc_type']=='MARGIN')]
-                hk_cash = sim[(sim['sim_acc_type']=='STOCK') & (sim['acc_type']=='CASH')]
+                hk_cash   = sim[(sim['sim_acc_type']=='STOCK') & (sim['acc_type']=='CASH')]
                 if not hk_margin.empty:
                     self.acc_id = int(hk_margin.iloc[0]['acc_id']); self.acc_type = "MARGIN"
                     self.write_log(f"[{self.gateway_name}] ✅ 选中: 港股融资模拟 acc_id={self.acc_id}")
@@ -639,10 +646,16 @@ class FutuGateway(BaseGateway):
         self.trade_ctx.start()
         self.write_log(f"[{self.gateway_name}] 交易接口连接成功 (最终 acc_id={self.acc_id})")
 
-    # ════════════════════════════════════
-    #  订阅
-    # ════════════════════════════════════
+    # ══════════════════════════════════
+    #  ★ subscribe — 只订阅基础类型
+    # ══════════════════════════════════
     def subscribe(self, req: SubscribeRequest) -> None:
+        """
+        v3.0.1：只订阅 QUOTE + K_1M。
+        美股 K_1M 用 SESSION_NONE → 仅在交易时段(09:30-16:00 美东)推送，
+        避免盘前盘后稀疏报价污染 ArrayManager。
+        高周期由 SubscriptionManager.subscribe_demand() 按需追加。
+        """
         try:
             futu_exchange = EXCHANGE_VT2FUTU[req.exchange]
         except KeyError:
@@ -654,12 +667,12 @@ class FutuGateway(BaseGateway):
             self._register_single_contract(req.symbol, req.exchange, futu_exchange)
 
         futu_symbol = f"{futu_exchange}.{req.symbol}"
-        # ★ Python SDK 枚举名是 K_1M（不是 KL_1M）
-        sub_types = [
-            SubType.QUOTE, SubType.ORDER_BOOK, SubType.TICKER,
-            SubType.K_1M, SubType.K_5M, SubType.K_15M, SubType.K_60M
-        ]
-        session = SESSION_ALL if futu_exchange == "US" else SESSION_NONE
+
+        # ★ 仅订阅基础类型
+        sub_types = [SubType.QUOTE, SubType.K_1M]
+
+        # ★ 修复：美股 K_1M 只在交易时段推送
+        session = SESSION_NONE if futu_exchange == "US" else SESSION_NONE
         self.write_log(f"[{self.gateway_name}] 订阅参数: {futu_symbol} session={session}")
 
         code, data = self.quote_ctx.subscribe(
@@ -667,14 +680,121 @@ class FutuGateway(BaseGateway):
             is_first_push=True, subscribe_push=True, session=session
         )
         if code == RET_OK:
-            self.write_log(f"[{self.gateway_name}] ✅ 全套订阅成功: {futu_symbol}")
+            self.write_log(f"[{self.gateway_name}] ✅ 基础订阅成功: {futu_symbol} (QUOTE+K_1M)")
         else:
             self.write_log(f"[{self.gateway_name}] ❌ 订阅失败: {futu_symbol} | {data}")
+            # 逐个退避重试
             for st in sub_types:
                 c2, d2 = self.quote_ctx.subscribe(
                     futu_symbol, [st], is_first_push=True, subscribe_push=True, session=session
                 )
                 self.write_log(f"[{self.gateway_name}]   单独 {st}: {'OK' if c2==RET_OK else d2}")
+
+    # ══════════════════════════════════
+    #  ★ subscribe_subtypes — 供 SubscriptionManager 按需追加高周期
+    # ══════════════════════════════════
+    def subscribe_subtypes(self, futu_symbol: str, subtypes: list) -> bool:
+        """由 SubscriptionManager 调用，追加订阅高周期类型。"""
+        if self.quote_ctx is None:
+            return False
+
+        sub_objs = []
+        for st_str in subtypes:
+            if st_str in ("QUOTE", "K_1M"):
+                continue
+            mapped = self._str_to_subtype(st_str)
+            if mapped is not None:
+                sub_objs.append(mapped)
+        sub_objs = list(set(sub_objs))
+
+        if not sub_objs:
+            return True
+
+        # 高周期（5M/15M/60M/日）同样只在交易时段推送
+        session = SESSION_NONE if futu_symbol.startswith("US.") else SESSION_NONE
+        code, data = self.quote_ctx.subscribe(
+            futu_symbol, sub_objs,
+            is_first_push=True, subscribe_push=True, session=session
+        )
+        if code == RET_OK:
+            self.write_log(f"[{self.gateway_name}] ✅ 追加订阅: {futu_symbol} 类型={subtypes}")
+            return True
+        else:
+            self.write_log(f"[{self.gateway_name}] ❌ 追加订阅失败: {futu_symbol} | {data}")
+            return False
+
+    @staticmethod
+    def _str_to_subtype(s: str):
+        mapping = {
+            "QUOTE":   SubType.QUOTE,
+            "K_1M":    SubType.K_1M,
+            "K_5M":    SubType.K_5M,
+            "K_15M":   SubType.K_15M,
+            "K_30M":   SubType.K_30M,
+            "K_60M":   SubType.K_60M,
+            "K_DAY":   SubType.K_DAY,
+            "ORDER_BOOK": SubType.ORDER_BOOK,
+            "TICKER":  SubType.TICKER,
+        }
+        return mapping.get(s)
+
+    # ────────────────────────────────
+    #  v2.9.7 按需订阅 Tick（引用计数）
+    # ────────────────────────────────
+    def _vt_to_futu_symbol(self, vt_symbol: str) -> str:
+        parts = vt_symbol.split(".")
+        if len(parts) >= 2:
+            symbol = parts[0]
+            try:
+                exchange = Exchange(parts[1])
+            except ValueError:
+                exchange = Exchange.SMART
+        else:
+            symbol = vt_symbol
+            exchange = Exchange.SMART
+        return convert_symbol_vt2futu(symbol, exchange)
+
+    def subscribe_tick(self, vt_symbol: str) -> None:
+        futu_symbol = self._vt_to_futu_symbol(vt_symbol)
+        if futu_symbol in self.tick_ref_count:
+            self.tick_ref_count[futu_symbol] += 1
+            self.write_log(f"[TICK] 引用计数 +1: {futu_symbol} -> {self.tick_ref_count[futu_symbol]}")
+            return
+
+        self.tick_ref_count[futu_symbol] = 1
+        try:
+            session = SESSION_NONE if futu_symbol.startswith("US.") else SESSION_NONE
+            code, data = self.quote_ctx.subscribe(
+                futu_symbol, [SubType.TICKER],
+                is_first_push=True, subscribe_push=True, session=session
+            )
+            if code == RET_OK:
+                self.write_log(f"[TICK] ✅ 真实订阅 TICKER: {futu_symbol} (引用计数=1)")
+            else:
+                self.write_log(f"[TICK] ❌ 订阅 TICKER 失败: {futu_symbol} | {data}")
+                del self.tick_ref_count[futu_symbol]
+        except Exception as e:
+            self.write_log(f"[TICK] ❌ 订阅 TICKER 异常: {futu_symbol} | {e}")
+            if futu_symbol in self.tick_ref_count:
+                del self.tick_ref_count[futu_symbol]
+
+    def release_tick(self, vt_symbol: str) -> None:
+        futu_symbol = self._vt_to_futu_symbol(vt_symbol)
+        if futu_symbol not in self.tick_ref_count:
+            self.write_log(f"[TICK] ⚠️ 尝试释放未订阅的 TICKER: {futu_symbol}")
+            return
+        self.tick_ref_count[futu_symbol] -= 1
+        self.write_log(f"[TICK] 引用计数 -1: {futu_symbol} -> {self.tick_ref_count[futu_symbol]}")
+        if self.tick_ref_count[futu_symbol] <= 0:
+            del self.tick_ref_count[futu_symbol]
+            try:
+                code, data = self.quote_ctx.unsubscribe(futu_symbol, [SubType.TICKER])
+                if code == RET_OK:
+                    self.write_log(f"[TICK] ✅ 真实取消 TICKER 订阅: {futu_symbol}")
+                else:
+                    self.write_log(f"[TICK] ⚠️ 取消 TICKER 返回: {data}")
+            except Exception as e:
+                self.write_log(f"[TICK] ⚠️ 取消 TICKER 订阅异常: {e}")
 
     def _register_single_contract(self, symbol, exchange, futu_exchange) -> None:
         vt_symbol = f"{symbol}.{exchange.value}"
@@ -696,9 +816,9 @@ class FutuGateway(BaseGateway):
         except Exception as e:
             self.write_log(f"[{self.gateway_name}] [动态注册] 异常: {e}")
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  查询最大可买
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def query_max_trd_qty(self, futu_symbol: str, price: float) -> Dict[str, int]:
         now = datetime.now().timestamp()
         if futu_symbol in self._max_trd_qty_cache:
@@ -719,9 +839,9 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] 查询最大可买异常: {e}")
         return {"max_cash_buy": 0, "max_cash_and_margin_buy": 0}
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  下单
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def send_order(self, req: OrderRequest) -> str:
         if self.trade_ctx is None or self.acc_id == 0:
             self.write_log(f"[{self.gateway_name}] ❌ 交易未就绪，无法下单")
@@ -788,9 +908,9 @@ class FutuGateway(BaseGateway):
         else:
             self.write_log(f"[{self.gateway_name}] 撤单已发送: {req.orderid}")
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  定时查询
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def query_data(self) -> None:
         sleep(2.0)
         try:
@@ -817,9 +937,9 @@ class FutuGateway(BaseGateway):
             self.write_log(f"[{self.gateway_name}] timer func 异常: {e}")
         self.query_funcs.append(func)
 
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     #  账户 / 持仓 / 订单 / 成交 / 合约
-    # ════════════════════════════════════
+    # ══════════════════════════════════
     def query_account(self) -> None:
         if self.acc_id == 0 or self.trade_ctx is None:
             return
@@ -834,14 +954,14 @@ class FutuGateway(BaseGateway):
 
         for _, row in data.iterrows():
             total = self._safe_float(row.get("total_assets"), 0)
-            cash = self._safe_float(row.get("cash"), total)
-            mval = self._safe_float(row.get("market_val"), 0)
+            cash  = self._safe_float(row.get("cash"), total)
+            mval  = self._safe_float(row.get("market_val"), 0)
             frozen = self._safe_float(row.get("frozen_cash"), 0)
             power = self._safe_float(row.get("power"), 0)
 
             if self.market == "US":
-                sc = self._safe_float(row.get("us_cash"), cash)
-                sp = self._safe_float(row.get("usd_net_cash_power"), power)
+                sc  = self._safe_float(row.get("us_cash"), cash)
+                sp  = self._safe_float(row.get("usd_net_cash_power"), power)
                 cur = "USD"
             else:
                 sc = self._safe_float(row.get("hk_cash"), cash)
@@ -885,8 +1005,8 @@ class FutuGateway(BaseGateway):
             return
         for _, row in data.iterrows():
             sym, ex = convert_symbol_futu2vt(row["code"])
-            qty = self._safe_float(row.get("qty"), 0)
-            can = self._safe_float(row.get("can_sell_qty", qty), qty)
+            qty  = self._safe_float(row.get("qty"), 0)
+            can  = self._safe_float(row.get("can_sell_qty", qty), qty)
             self.on_position(PositionData(
                 symbol=sym, exchange=ex, direction=Direction.NET,
                 volume=int(qty), frozen=qty - can,
@@ -933,19 +1053,29 @@ class FutuGateway(BaseGateway):
                 self.on_contract(c)
                 self.contracts[c.vt_symbol] = c
                 count += 1
-        self.write_log(f"[{self.gateway_name}] 合约查询完成: {count} 个")
+        self.write_log(f"[{self.gateway_name}] 合约查询完成: {count}个")
         self.event_engine.put(Event("eContractReady", self.gateway_name))
 
-    # ════════════════════════════════════
-    #  关闭（安全版）
-    # ════════════════════════════════════
+    # ══════════════════════════════════
+    #  关闭
+    # ══════════════════════════════════
     def close(self) -> None:
+        if self.tick_ref_count:
+            self.write_log(f"[{self.gateway_name}] 关闭时清理 {len(self.tick_ref_count)} 个 TICKER 订阅")
+            for futu_symbol in list(self.tick_ref_count.keys()):
+                try:
+                    self.quote_ctx.unsubscribe(futu_symbol, [SubType.TICKER])
+                except Exception:
+                    pass
+            self.tick_ref_count.clear()
+
         for ctx, name in [(self.quote_ctx, "quote"), (self.trade_ctx, "trade")]:
             if ctx is not None:
                 try:
                     ctx.close()
                 except Exception as e:
                     self.write_log(f"[{self.gateway_name}] 关闭{name}异常: {e}")
+
         self.quote_ctx = None
         self.trade_ctx = None
 
@@ -959,9 +1089,9 @@ class FutuGateway(BaseGateway):
                 self._tick_db_conn = None
         print(f"[DB STATS] [{self.gateway_name}] 共接收 {self._tick_count} ticks", flush=True)
 
-    # ──────────────────────────────────
+    # ────────────────────────────────
     #  get_tick（带去重）
-    # ──────────────────────────────────
+    # ────────────────────────────────
     def get_tick(self, code_str) -> TickData:
         tick = self.ticks.get(code_str)
         sym, ex = convert_symbol_futu2vt(code_str)
@@ -973,12 +1103,10 @@ class FutuGateway(BaseGateway):
             )
             self.ticks[code_str] = tick
         else:
-            # 更新 symbol/exchange（可能首次时是占位）
             if not tick.symbol:
                 tick.symbol = sym
                 tick.exchange = ex
                 tick.gateway_name = self.gateway_name
-        # 补充 name
         contract = self.contracts.get(tick.vt_symbol)
         if contract and not tick.name:
             tick.name = contract.name
@@ -993,7 +1121,7 @@ class FutuGateway(BaseGateway):
             return bars
         futu_symbol = f"{EXCHANGE_VT2FUTU.get(req.exchange,'US')}.{req.symbol}"
         start = req.start.replace(tzinfo=None).strftime("%Y-%m-%d")
-        end = req.end.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        end   = req.end.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
         ret, df, key = self.quote_ctx.request_history_kline(
             code=futu_symbol, start=start, end=end, ktype=KLType.K_1M
         )
@@ -1021,9 +1149,9 @@ class FutuGateway(BaseGateway):
             ))
         return bars
 
-    # ──────────────────────────────────
-    #  ★ process_quote
-    # ──────────────────────────────────
+    # ────────────────────────────────
+    #  process_quote / orderbook / ticker
+    # ────────────────────────────────
     def process_quote(self, data) -> None:
         for _, row in data.iterrows():
             code_str = row.get("code", "")
@@ -1041,24 +1169,21 @@ class FutuGateway(BaseGateway):
             except ValueError:
                 tick.datetime = datetime.now(CHINA_TZ)
 
-            tick.open_price = self._safe_float(row.get("open_price"), 0)
-            tick.high_price = self._safe_float(row.get("high_price"), 0)
+            tick.open_price  = self._safe_float(row.get("open_price"), 0)
+            tick.high_price  = self._safe_float(row.get("high_price"), 0)
             low_r = self._safe_float(row.get("low_price"), None)
-            prev = self._safe_float(row.get("prev_close_price"), None)
-            op = self._safe_float(row.get("open_price"), 0)
+            prev  = self._safe_float(row.get("prev_close_price"), None)
+            op    = self._safe_float(row.get("open_price"), 0)
             tick.low_price = low_r if low_r else (prev if prev else op)
-            tick.pre_close = prev if prev else op
+            tick.pre_close  = prev if prev else op
             tick.last_price = self._safe_float(row.get("last_price"), 0)
-            tick.volume = self._safe_float(row.get("volume"), 0)  # 累计
-            tick.turnover = self._safe_float(row.get("turnover"), 0)
+            tick.volume     = self._safe_float(row.get("volume"), 0)
+            tick.turnover   = self._safe_float(row.get("turnover"), 0)
 
-            if self.market == "US":
+            if self._should_save_tick(tick.vt_symbol):
                 self._save_tick_to_db(tick, source='quote')
             self.on_tick(copy(tick))
 
-    # ──────────────────────────────────
-    #  process_orderbook
-    # ──────────────────────────────────
     def process_orderbook(self, data) -> None:
         code_str = data.get("code", "")
         if not code_str:
@@ -1081,18 +1206,11 @@ class FutuGateway(BaseGateway):
                 d[f"ask_price_{n}"] = 0.0
                 d[f"ask_volume_{n}"] = 0
         if tick.datetime:
-            if self.market == "US":
+            if self._should_save_tick(tick.vt_symbol):
                 self._save_tick_to_db(tick, source='orderbook')
             self.on_tick(copy(tick))
 
-    # ──────────────────────────────────
-    #  ★ process_ticker（关键修复）
-    # ──────────────────────────────────
     def process_ticker(self, data) -> None:
-        """逐笔成交推送。
-        注意：不直接覆盖 tick.volume（那是累计量），
-        也不假设 row 字段是 Python 原生类型。
-        """
         for _, row in data.iterrows():
             code_str = row.get("code", "")
             if not code_str:
@@ -1110,21 +1228,19 @@ class FutuGateway(BaseGateway):
                         pass
 
             price = self._safe_float(row.get("price"), 0)
-            vol = self._safe_float(row.get("volume"), 0)  # 当笔成交量
+            vol   = self._safe_float(row.get("volume"), 0)
             if price > 0:
                 tick.last_price = price
-            # ★ 不覆盖 tick.volume（累计），只在 0 时做兜底
             if not tick.volume and vol > 0:
                 tick.volume = vol
 
-            # ★ 用独立变量传值，避免 numpy 类型传给 SQLite
-            if self.market == "US":
+            if self._should_save_tick(tick.vt_symbol):
                 self._save_tick_to_db(tick, source='ticker')
             self.on_tick(copy(tick))
 
-    # ──────────────────────────────────
+    # ────────────────────────────────
     #  process_order / process_deal
-    # ──────────────────────────────────
+    # ────────────────────────────────
     def process_order(self, data) -> None:
         for _, row in data.iterrows():
             if row.get("order_status") == OrderStatus.DELETED:
@@ -1171,9 +1287,9 @@ class FutuGateway(BaseGateway):
             ))
 
 
-# ════════════════════════════════════
+# ══════════════════════════════════
 #  Datafeed 兼容
-# ════════════════════════════════════
+# ══════════════════════════════════
 class FutuDatafeed:
     def __init__(self):
         self.name = "FutuDatafeed"

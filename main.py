@@ -1,23 +1,5 @@
 """
-main.py — Apollo AI Trader v2.8.4 最终修正版 + KlineProvider 集成
-基于原始 v2.8.3 双引擎架构 + 数据库驱动流水线
-
-关键事实（来自原始代码分析）：
-  - MachineRegistry() 无参构造，自动注册+心跳，summary() 返回字符串
-  - FutuGateway(event_engine, gateway_name) 两个位置参数
-  - StrategyEngine(main_us, main_hk, db, config) 四个位置参数
-  - DBManager(db_path) 一个位置参数
-  - 流水线：选股→诊股→regime→策略生成写库→引擎从DB加载
-
-修正点：
-  1. MachineRegistry 无参构造 + summary()
-  2. FutuGateway(ev_us, "FUTU_US") 位置参数
-  3. StrategyEngine(main_us=me_us, main_hk=me_hk, db=db, config=CONFIG)
-  4. 流水线在合约就绪事件之前执行（确保策略先写入DB）
-  5. 删除旧数据库后自动重建所有表
-  6. 【新增】流水线写库后立即调用 strategy_engine.boot() 部署策略
-  7. 【新增】启动热加载线程，支持运行时数据库变更自动部署
-  8. 【新增】KlineProvider 统一K线缓存，减少富途请求
+main.py - Apollo AI Trader v3.0.0 (with Apollo OrderManager integration)
 """
 import json
 import logging
@@ -29,17 +11,22 @@ import threading
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.setting import SETTINGS
+from vnpy_ctastrategy import CtaStrategyApp
 from vnpy_futu import FutuGateway
 
 from core.machine_registry import MachineRegistry
 from core.subscription_manager import SubscriptionManager
-from core.subscription_plan import apply_subscription_plan
+from core.subscription_plan import (
+    apply_subscription_plan,
+    _strategy_required_subtypes,
+)
 from core.remote_controller import RemoteController
 from core.duallink import DualLink
 from monitoring.telegram_notifier import TelegramNotifier
 from monitoring.telegram_webhook import TelegramCommandListener
+from core.order_manager import OrderManager  # <<< NEW IMPORT
 
-# ========== 日志配置 ==========
+# ========== Logging ==========
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -51,234 +38,249 @@ logging.basicConfig(
 )
 log = logging.getLogger("Main")
 
-# ========== 配置加载 ==========
+# ========== Config ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "system_config.json")
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-log.info(f"🖥️ 本机标识: [{CONFIG.get('opend_host','127.0.0.1')}:{CONFIG.get('opend_port',11111)}]")
+log.info(f"Host: [{CONFIG.get('opend_host','127.0.0.1')}:{CONFIG.get('opend_port',11111)}]")
 
 
 def main():
-    # ===== 0. 删除旧数据库（确保表结构干净）=====
-    # 如果 history.db 是旧版本（缺列），直接删掉让 DBManager 重建
+    # ===== 0. Remove old database =====
     db_path = CONFIG.get("db_path") or os.path.join(BASE_DIR, "data", "history.db")
     db_dir = os.path.dirname(db_path) or "."
     for f in [db_path, db_path + "-wal", db_path + "-shm"]:
         if os.path.exists(f):
             try:
                 os.remove(f)
-                log.info(f"🗑️ 删除旧数据库: {f}")
+                log.info(f"Removed old db: {f}")
             except Exception:
                 pass
     os.makedirs(db_dir, exist_ok=True)
 
-    # ===== 1. 机器注册（无参构造）=====
+    # ===== 1. Machine Registry =====
     registry = MachineRegistry()
-    log.info(f"🏷️ 机器注册: {registry.summary()}")
+    log.info(f"Machine: {registry.summary()}")
 
-    # ===== 2. 数据服务 =====
+    # ===== 2. Data feed =====
     SETTINGS["datafeed.name"] = "localdata"
     SETTINGS["datafeed.username"] = ""
     SETTINGS["datafeed.password"] = ""
-    log.info("📊 数据服务: 本地数据库 (vnpy_localdata)")
+    log.info("Data feed: localdata")
 
-    # ===== 3. 双引擎初始化 =====
+    # ===== 3. Twin engines =====
     ev_us = EventEngine()
     me_us = MainEngine(ev_us)
-    from vnpy_ctastrategy import CtaStrategyApp
     me_us.add_app(CtaStrategyApp)
-    log.info("✅ US MainEngine 已创建并加载 CTA 策略应用")
-
     ev_hk = EventEngine()
     me_hk = MainEngine(ev_hk)
     me_hk.add_app(CtaStrategyApp)
-    log.info("✅ HK MainEngine 已创建并加载 CTA 策略应用")
+    log.info("US/HK MainEngine ready")
 
-    # ===== 4. 连接 Futu 网关（位置参数：event_engine, gateway_name）=====
+    # ===== 4. Futu gateways =====
     host = CONFIG["opend_host"]
     port = CONFIG["opend_port"]
     env = CONFIG["trade_env"]
 
     gw_us = FutuGateway(ev_us, "FUTU_US")
     me_us.gateways["FUTU_US"] = gw_us
-
     gw_hk = FutuGateway(ev_hk, "FUTU_HK")
     me_hk.gateways["FUTU_HK"] = gw_hk
 
-    us_setting = {"地址": host, "端口": port, "市场": "US", "环境": env}
-    hk_setting = {"地址": host, "端口": port, "市场": "HK", "环境": env}
+    us_setting = {"address": host, "port": port, "market": "US", "env": env}
+    hk_setting = {"address": host, "port": port, "market": "HK", "env": env}
 
     gw_us.connect(us_setting)
-    log.info("✅ US 网关连接中...")
     gw_hk.connect(hk_setting)
-    log.info("✅ HK 网关连接中...")
+    log.info("Connecting to Futu...")
 
     timeout = CONFIG.get("connection_timeout", 15)
     for i in range(timeout):
         us_rdy = gw_us.quote_ctx is not None
         hk_rdy = gw_hk.quote_ctx is not None
         if us_rdy and hk_rdy:
-            log.info("✅ US 行情就绪")
-            log.info("✅ HK 行情就绪")
+            log.info("US/HK quote ready")
             break
         time.sleep(1)
     else:
-        if gw_us.quote_ctx is None:
-            log.error(f"❌ US 行情超时（{timeout}秒内未就绪）")
-        if gw_hk.quote_ctx is None:
-            log.error(f"❌ HK 行情超时（{timeout}秒内未就绪）")
+        log.error("Quote context timeout")
         ev_us.stop()
         ev_hk.stop()
         sys.exit(1)
 
-    # ===== 5. 订阅管理 =====
+    # ===== 5. Subscription Manager =====
     sub_manager = SubscriptionManager(
         max_quota=CONFIG.get("subscription", {}).get("max_quota", 300)
     )
     sub_manager.set_contexts(gw_us.quote_ctx, gw_hk.quote_ctx)
-    apply_subscription_plan(sub_manager, CONFIG)
-    sub_manager.audit_quota()
+    sub_manager.register_gateway("FUTU_US", gw_us)
+    sub_manager.register_gateway("FUTU_HK", gw_hk)
+    log.info("SubscriptionManager ready")
 
-    # ===== 6. 数据库（删除后自动重建所有表）=====
+    # ===== 6. Database =====
     from core.db_manager import DBManager
     db = DBManager(db_path)
-    log.info(f"✅ 数据库就绪: {db_path}")
+    log.info(f"DB ready: {db_path}")
 
-    # ===== 7. RegimeTrainer =====
+    # ===== 7. Regime Trainer =====
     regime_trainer = None
     try:
         from core.regime_trainer import RegimeTrainer
         regime_trainer = RegimeTrainer(config=CONFIG.get("regime", {}), db=db)
         if hasattr(regime_trainer, "start"):
             regime_trainer.start()
-        log.info("✅ RegimeTrainer 已初始化")
-    except ImportError:
-        log.info("ℹ️ RegimeTrainer 不可用，跳过")
+        log.info("RegimeTrainer ready")
     except Exception as e:
-        log.warning(f"⚠️ RegimeTrainer 初始化失败(非致命): {e}")
+        log.warning(f"RegimeTrainer skipped: {e}")
 
-    # ===== 8. ★ StrategyEngine（4参数签名，与v2.8.4一致）=====
+    # ===== 8. Strategy Engine =====
+    advisor = None
+    try:
+        from ai.param_advisor import ParamAdvisor
+        advisor = ParamAdvisor(db)
+        log.info("ParamAdvisor ready")
+    except Exception as e:
+        log.warning(f"ParamAdvisor skipped: {e}")
+
+    matcher = None
+    try:
+        from core.strategy_matcher import StrategyMatcher
+        matcher = StrategyMatcher(db_path=db_path)
+        log.info("StrategyMatcher ready")
+    except Exception as e:
+        log.warning(f"StrategyMatcher skipped: {e}")
+
     from core.strategy_engine import StrategyEngine
     strategy_engine = StrategyEngine(
         main_us=me_us,
         main_hk=me_hk,
         db=db,
         config=CONFIG,
+        advisor=advisor,
     )
-    log.info("✅ StrategyEngine 已初始化（双引擎模式）")
-    # 注意：StrategyEngine 内部已注册 eContractReady 事件，
-    # 合约就绪后会自动从 strategy_config 表加载并部署策略。
-    # 因此流水线必须在合约就绪事件触发前完成。
+    strategy_engine.sub_manager = sub_manager
+    log.info("StrategyEngine ready")
 
-    # ===== 8.5 ★ 创建 KlineProvider（统一K线缓存）=====
+    # ===== 8.1 Apollo OrderManager (NEW) =====
+    order_manager = OrderManager(
+        gateways={"FUTU_US": gw_us, "FUTU_HK": gw_hk},
+        query_interval=2.0,
+        account_equity=CONFIG.get("account_equity", 100000.0)
+    )
+    order_manager.start()
+    strategy_engine.order_manager = order_manager
+    log.info("Apollo OrderManager started (smart routing + position + sizing)")
+
+    # ===== 8.5 Kline Provider =====
     from core.kline_provider import KlineProvider
-    kp_us = KlineProvider(quote_ctx=gw_us.quote_ctx, market="US")
-    # 如果港股也需要选股，可以创建 kp_hk，这里暂不创建
-    log.info("✅ KlineProvider(US) 已初始化")
+    kp_us = KlineProvider(quote_ctx=gw_us.quote_ctx, market="US",
+                          max_retries=3, request_interval=0.35)
+    kp_hk = KlineProvider(quote_ctx=gw_hk.quote_ctx, market="HK",
+                          max_retries=3, request_interval=0.35)
+    log.info("KlineProvider ready")
 
-    # ===== 9. ★ 流水线（选股→诊股→regime→写库）=====
-    # 关键时序：流水线先写库 → 合约就绪事件后 → 引擎从DB读 → 部署
-    log.info("[Pipeline] ═══ 开始执行策略生成流水线 ═══")
+    if hasattr(strategy_engine, '_contract_ready'):
+        for _ in range(30):
+            if strategy_engine._contract_ready:
+                log.info("Contracts ready, preloading...")
+                break
+            time.sleep(1)
+        else:
+            log.warning("Contract wait timeout")
+    else:
+        log.info("Waiting 15s for contracts...")
+        time.sleep(15)
+
+    base_subtypes = _strategy_required_subtypes({"GridStrategy"})
+    log.info(f"Base subscription: {base_subtypes}")
+
+    us_symbols = CONFIG.get("universe", {}).get("US", [])
+    hk_symbols = CONFIG.get("universe", {}).get("HK", [])
+
+    kp_us.preload_for_subscription_plan(us_symbols, base_subtypes)
+    kp_hk.preload_for_subscription_plan(hk_symbols, base_subtypes)
+    log.info("K-line preload done")
+
+    # ===== 9. Pipeline =====
+    log.info("=== Pipeline start ===")
     selected = []
     try:
         from ai.stock_selector import AIStockSelector
-        # 【修改】传入 kline_provider
         selector = AIStockSelector(
-            quote_ctx=gw_us.quote_ctx,
-            db=db,
-            market="US",
-            kline_provider=kp_us  # 新增
+            quote_ctx=gw_us.quote_ctx, db=db, market="US", kline_provider=kp_us
         )
         selected = selector.select()
-        log.info(f"[Pipeline] ✅ 选股完成: {len(selected)} 只")
+        log.info(f"Selected {len(selected)} stocks")
     except Exception as e:
-        log.warning(f"⚠️ 选股失败(非致命): {e}")
+        log.warning(f"Selection failed: {e}")
 
     if selected:
-        # --- 9a. 诊股 ---
         try:
             from ai.stock_diagnosis import StockDiagnosis
-            # 【修改】传入 kline_provider
-            diag = StockDiagnosis(
-                quote_ctx=gw_us.quote_ctx,
-                db=db,
-                kline_provider=kp_us  # 新增
-            )
+            diag = StockDiagnosis(quote_ctx=gw_us.quote_ctx, db=db, kline_provider=kp_us)
             for item in selected:
                 symbol = item.get("vt_symbol", item.get("code", ""))
                 if not symbol:
                     continue
                 try:
-                    # ★★★ 修正：方法名从 run 改为 diagnose ★★★
                     result = diag.diagnose(symbol)
-                    # 兼容多种返回值
-                    if isinstance(result, (tuple, list)):
-                        if len(result) >= 2:
-                            summary = str(result[1])
-                        else:
-                            summary = str(result[0])
-                    elif isinstance(result, dict):
-                        summary = result.get("summary", str(result))
-                    else:
-                        summary = str(result)
-                    log.info(f"[Pipeline] 🩺 {symbol} → {summary}")
+                    log.info(f"Diagnosis {symbol}: {result}")
                 except Exception as e:
-                    log.warning(f"[Pipeline] {symbol} 诊股失败: {e}")
+                    log.warning(f"Diagnosis failed {symbol}: {e}")
         except Exception as e:
-            log.warning(f"⚠️ 诊股模块加载失败: {e}")
+            log.warning(f"Diagnosis module error: {e}")
 
-        # --- 9b. Regime ---
         if regime_trainer:
-            # 【修改】传入 kline_provider
-            regime_trainer.kp = kp_us  # 直接注入 kp
+            regime_trainer.kp = kp_us
             for item in selected:
                 symbol = item.get("vt_symbol", item.get("code", ""))
                 if not symbol:
                     continue
                 try:
                     regime_result = regime_trainer.predict(symbol)
-                    log.info(f"[Regime] ✅ {symbol} → {regime_result}")
+                    log.info(f"Regime {symbol}: {regime_result}")
                 except Exception as e:
-                    log.warning(f"[Regime] {symbol} 失败: {e}")
+                    log.warning(f"Regime failed {symbol}: {e}")
 
-        # --- 9c. 策略生成并写入 cta_strategy 表 ---
         try:
             from core.strategy_generator import StrategyGenerator
-            # ★★★ 修正：参数名改为 quote_ctx 和 db_path，移除 config ★★★
             generator = StrategyGenerator(
-                quote_ctx=gw_us.quote_ctx,
-                db_path=db_path,           # 注意：不是 db，而是 db_path
-                kline_provider=kp_us
+                quote_ctx=gw_us.quote_ctx, db_path=db_path,
+                matcher=matcher, param_advisor=advisor, db=db
             )
-            # ★★★ 修正：方法名从 generate_from_selection 改为 generate_from_selector ★★★
             count = generator.generate_from_selector(selected)
-            log.info(f"[Pipeline] ✅ 策略生成完成: {count}个写入 cta_strategy 表")
+            log.info(f"Generated {count} strategies")
         except Exception as e:
-            log.error(f"❌ 策略生成失败: {e}")
+            log.error(f"Strategy generation failed: {e}")
 
-        # ===== ★【新增】立即部署流水线生成的策略 =====
-        deployed_count = strategy_engine.boot(operator="pipeline")
-        log.info(f"[Pipeline] ✅ 立即部署 {deployed_count} 个策略")
+        deployed_result = strategy_engine.boot(operator="pipeline")
+        deployed_count = len(deployed_result.get("deployed", [])) if isinstance(deployed_result, dict) else deployed_result
+        log.info(f"Deployed {deployed_count} strategies")
 
-        # ===== ★【新增】启动热加载（每60秒检查数据库变更）=====
+        # ===== 8.2 Inject OrderManager into every deployed strategy (NEW) =====
+        for strategy in strategy_engine.get_all_strategies():
+            strategy.order_manager = order_manager
+        log.info(f"Injected OrderManager into {deployed_count} strategies")
+
+        sub_manager.audit_quota()
+
         if hasattr(strategy_engine, 'start_hot_reload'):
             strategy_engine.start_hot_reload(interval=60)
-            log.info("[Pipeline] ✅ 热加载已启动")
-
+            log.info("Hot reload started")
     else:
-        log.info("[Pipeline] ⚠️ 无选股结果，跳过流水线")
-    log.info("[Pipeline] ═══ 流水线执行完毕 ═══")
+        log.info("No selection, skip pipeline")
+    log.info("=== Pipeline done ===")
 
-    # ===== 10. 启动 DualLink =====
+    # ===== 10. DualLink =====
     duallink = None
     try:
         duallink = DualLink(main_us=me_us, main_hk=me_hk, db=db)
         duallink.start()
-        log.info("✅ DualLink 双链路健康检查已启动")
+        log.info("DualLink started")
     except Exception as e:
-        log.warning(f"⚠️ DualLink 初始化失败(非致命): {e}")
+        log.warning(f"DualLink skipped: {e}")
 
     # ===== 11. Telegram =====
     token = CONFIG.get("telegram_token", "")
@@ -287,10 +289,10 @@ def main():
     if token and chat_id:
         notifier = TelegramNotifier(token, chat_id, machine_registry=registry)
         try:
-            notifier.send_message("🚀 Apollo v2.8.4 启动完成")
-            log.info("✅ Telegram Bot连接成功")
+            notifier.send_message("Apollo v3.0.0 started")
+            log.info("Telegram connected")
         except Exception as e:
-            log.warning(f"⚠️ Telegram 发送失败: {e}")
+            log.warning(f"Telegram send failed: {e}")
 
         controller = RemoteController(db=db, notifier=notifier, config=CONFIG)
         controller.set_main_engines(me_us, me_hk)
@@ -302,22 +304,20 @@ def main():
             poll_interval=CONFIG.get("telegram_poll_interval", 3.0)
         )
         listener.start()
-        log.info("✅ Telegram 远程控制已启动")
+        log.info("Telegram command listener started")
 
-    # ===== 12. SchedulerJobs =====
+    # ===== 12. Scheduler =====
     scheduler = None
     try:
         from core.scheduler_jobs import SchedulerJobs
         scheduler = SchedulerJobs(config=CONFIG)
         if hasattr(scheduler, "start"):
             scheduler.start()
-        log.info("✅ SchedulerJobs 定时调度已启动")
-    except ImportError:
-        log.info("ℹ️ SchedulerJobs 不可用，跳过")
+        log.info("Scheduler started")
     except Exception as e:
-        log.warning(f"⚠️ SchedulerJobs 启动失败(非致命): {e}")
+        log.warning(f"Scheduler skipped: {e}")
 
-    # ===== 13. 后台维护线程 =====
+    # ===== 13. Background maintenance =====
     def periodic():
         while True:
             time.sleep(60)
@@ -331,8 +331,7 @@ def main():
                 pass
             if duallink and hasattr(duallink, "health"):
                 try:
-                    health = duallink.health()
-                    log.info(f"[DualLink] {health}")
+                    log.info(f"[DualLink] {duallink.health()}")
                 except Exception:
                     pass
             if duallink and hasattr(duallink, "reconnect_if_needed"):
@@ -340,7 +339,6 @@ def main():
                     duallink.reconnect_if_needed()
                 except Exception:
                     pass
-            # 每10分钟审计一次配额
             if int(time.time()) % 600 < 60:
                 try:
                     sub_manager.audit_quota()
@@ -349,19 +347,20 @@ def main():
 
     threading.Thread(target=periodic, daemon=True).start()
 
-    # ===== 14. 主循环 =====
-    log.info(f"🚀 启动完成 | {registry.summary()} | 模式: 双引擎 + 数据库驱动流水线")
+    # ===== 14. Main loop =====
+    log.info(f"Startup complete | {registry.summary()} | twin-engine + smart routing")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log.info("👋 收到中断信号 (Ctrl+C)...")
+        log.info("Interrupted (Ctrl+C)")
     finally:
-        log.info("🔄 开始安全关闭...")
+        log.info("Shutting down...")
         try:
             strategy_engine.stop_all()
         except Exception:
             pass
+        order_manager.stop()  # NEW
         if scheduler and hasattr(scheduler, "stop"):
             try:
                 scheduler.stop()
@@ -384,7 +383,7 @@ def main():
             db.close()
         except Exception:
             pass
-        log.info("✅ 已安全关闭（双引擎已停止）")
+        log.info("Safe shutdown complete")
 
 
 if __name__ == "__main__":

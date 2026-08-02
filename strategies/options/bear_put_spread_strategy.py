@@ -1,6 +1,11 @@
 """
-strategies/options/bear_put_spread_strategy.py - Apollo-AI-Trader v2.9.3
+strategies/options/bear_put_spread_strategy.py - Apollo-AI-Trader v2.9.6
 Bear Put Spread：买高K Put + 卖低K Put，温和看跌
+
+v2.9.6 变更：
+- 修复：on_bar 调用 super().on_bar() 保证链路完整
+- 修复：_check_tick_exit 签名统一（接受可选 bar 参数）
+- 优化：ema 计算防御性增强
 """
 from vnpy.trader.object import BarData, Direction, Offset
 from strategies.options.base_option_strategy import BaseOptionStrategy
@@ -8,13 +13,13 @@ from strategies.options.base_option_strategy import BaseOptionStrategy
 
 class BearPutSpreadStrategy(BaseOptionStrategy):
     author = "Apollo"
-    version = "v2.9.3"
+    version = "v2.9.6"
 
     delta_long         = -0.35
     delta_short        = -0.15
     delta_tolerance    = 0.15
-    min_days_to_expiry = 14
-    max_days_to_expiry = 45
+    min_days_to_expire = 14
+    max_days_to_expire = 45
     min_credit_ratio   = 0.30
     min_net_debit_pct  = 0.005
     rolling_days       = 7
@@ -25,7 +30,7 @@ class BearPutSpreadStrategy(BaseOptionStrategy):
 
     parameters = [
         "delta_long", "delta_short", "delta_tolerance",
-        "min_days_to_expiry", "max_days_to_expiry",
+        "min_days_to_expire", "max_days_to_expire",
         "min_credit_ratio", "min_net_debit_pct",
         "rolling_days", "max_positions",
         "adx_downtrend_min", "ema_fast_period", "ema_slow_period",
@@ -49,10 +54,11 @@ class BearPutSpreadStrategy(BaseOptionStrategy):
             self._find_spread(bar)
 
     def on_bar(self, bar: BarData):
-        if self._manage_expiry(bar): return
+        super().on_bar(bar)  # v2.9.6：保证链路完整
+        if self._manage_expire(bar): return
         if self.legs and len(self.legs) >= 2:
             for leg in self.legs.values():
-                if leg.get("days_to_expiry", 999) <= self.rolling_days:
+                if leg.get("days_to_expire", 999) <= self.rolling_days:
                     self._roll_positions()
                     return
         if self.legs and len(self.legs) >= 2:
@@ -106,9 +112,14 @@ class BearPutSpreadStrategy(BaseOptionStrategy):
                            f"short@{short_leg['strike_price']} "
                            f"net={net:.2f} max_loss={self.max_loss:.0f}")
 
-    def _check_tick_exit(self):
+    # ── Tick 退出（统一签名） ────────────────────────
+    def _check_tick_exit(self, bar: BarData = None):
+        if len(self.legs) < 2:
+            return
         cur_pnl = self._estimate_pnl()
         cost = abs(self.max_loss) + 0.01
+        if cost <= 0:
+            return
         if cur_pnl < -cost * 0.8:
             self.write_log(f"[BPS] 止损 pnl={cur_pnl:.0f}")
             self._close_all_legs()

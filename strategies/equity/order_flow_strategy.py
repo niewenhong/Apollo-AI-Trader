@@ -1,22 +1,20 @@
 """
-strategies/equity/order_flow_strategy.py - v2.9.0
-Tick 订单流策略（依赖 TICKER 订阅，v2.9.0 已修复）
-v2.9.0 优化：
-- 充分利用已订阅的 TICKER + ORDER_BOOK 数据
-- 盘口 imbalance 加权计算（1~5 档，指数衰减权重）
-- Kelly 仓位 + 移动止盈 + 硬止损
-- 时间窗口（US 9:45-15:50, HK 9:45-11:55/13:15-15:50）
+strategies/equity/order_flow_strategy.py - v2.9.6 修正版
+Tick 订单流策略（依赖 TICKER 订阅）
+
+修复：
+- 继承 BaseStrategy（原 ApolloBaseStrategy 已重命名）
+- on_tick 不再调用 super().on_tick()（避免 Tick 重复喂入 bg_1m）
+- 盘口 imbalance 防御性降级
 - 尾盘强制清仓
-- 防御：盘口字段缺失时降级到 1 档
-- Regime 感知：强趋势时放大仓位，震荡时缩仓
+- 部分平仓状态一致性修复
 """
 import time
 from datetime import datetime, time as dtime
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple
 
-from vnpy.trader.constant import Direction, Offset, Status, Interval, Exchange
-from vnpy.trader.object import BarData, TickData, OrderData, TradeData, PositionData
-from vnpy.trader.utility import ArrayManager, extract_vt_symbol
+from vnpy.trader.constant import Direction, Status
+from vnpy.trader.object import BarData, TickData, OrderData, TradeData
 
 try:
     from zoneinfo import ZoneInfo
@@ -27,10 +25,10 @@ except ImportError:
     _US_TZ = pytz.timezone("America/New_York")
     _HK_TZ = pytz.timezone("Asia/Hong_Kong")
 
-from strategies.base_strategy import ApolloBaseStrategy
+from strategies.base_strategy import BaseStrategy   # ★ 修复：ApolloBaseStrategy → BaseStrategy
 
 
-class TickOrderFlowStrategy(ApolloBaseStrategy):
+class TickOrderFlowStrategy(BaseStrategy):   # ★ 修复：ApolloBaseStrategy → BaseStrategy
     """
     Tick 级订单流策略：
     - 盘口 imbalance → 方向
@@ -40,7 +38,7 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
     """
     author = "Apollo-AI-Trader"
 
-    parameters = ApolloBaseStrategy.parameters + [
+    parameters = BaseStrategy.parameters + [
         "volume_multiplier",
         "imbalance_threshold",
         "profit_activation_pct",
@@ -51,14 +49,14 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
         "tick_cooldown_ms",
         "use_regime_sizing",
     ]
-    variables = ApolloBaseStrategy.variables + [
+    variables = BaseStrategy.variables + [
         "long_pos", "last_price",
         "current_trend", "stop_line",
         "trailing_profit_active", "highest_price_since_entry", "profit_target_line",
     ]
 
     DEFAULTS = {
-        **ApolloBaseStrategy.DEFAULTS,
+        **BaseStrategy.DEFAULTS,   # ★ 修复
         "volume_multiplier": 2.5,
         "imbalance_threshold": 0.65,
         "profit_activation_pct": 0.020,
@@ -78,6 +76,7 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
 
     def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+        self.need_tick = True
 
         self.long_pos = 0
         self.last_price = 0.0
@@ -103,9 +102,9 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
         self.trailing_profit_active = False
         self.highest_price_since_entry = 0.0
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  时间窗口
-    # ──────────────────────────────
+    # ───────────────────────────
     def check_time_window(self, now_t: Optional[dtime] = None) -> Tuple[bool, bool]:
         if now_t is None:
             now_t = datetime.now(self.market_tz).time()
@@ -119,9 +118,9 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
             must_close = (dtime(11, 55) <= now_t < dtime(12, 0)) or (now_t >= dtime(15, 50))
         return allow_open, must_close
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  Kelly 仓位（结合 Regime）
-    # ──────────────────────────────
+    # ───────────────────────────
     def calculate_kelly_volume(self, current_price: float) -> int:
         p = self.ai_score
         q = 1.0 - p
@@ -150,12 +149,17 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
         raw = (available * f_optimized / current_price) / lot
         return int(max(round(raw) * lot, lot))
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  on_tick（核心）
-    # ──────────────────────────────
+    #  v2.9.6：不再调用 super().on_tick()
+    #  原因：need_tick=True 时基类 on_tick 会执行完整逻辑
+    #  （包括 bg_1m.update_tick），导致同一 tick 被喂入两次。
+    #  本策略完全自己处理 Tick，不依赖基类的 Tick→Bar 合成。
+    # ───────────────────────────
     def on_tick(self, tick: TickData):
         """Tick 级微观执行：这是本策略的主战场"""
-        super().on_tick(tick)
+        if not self.need_tick:
+            return
 
         if not tick or tick.last_price <= 0:
             return
@@ -192,30 +196,44 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
                 self.notice_callback(self.vt_symbol, tick.last_price, "🟢 AI开仓", f"imb={imbalance:.2f}")
             self.buy(tick.last_price + 0.05, vol)
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  盘口 imbalance
-    # ──────────────────────────────
+    # ───────────────────────────
     def _calc_imbalance(self, tick: TickData) -> float:
-        """加权盘口 imbalance，降级安全"""
+        """加权盘口 imbalance，防御性降级"""
         try:
-            bids = [tick.bid_volume_1, tick.bid_volume_2, tick.bid_volume_3, tick.bid_volume_4, tick.bid_volume_5]
-            asks = [tick.ask_volume_1, tick.ask_volume_2, tick.ask_volume_3, tick.ask_volume_4, tick.ask_volume_5]
+            bids = [
+                getattr(tick, 'bid_volume_1', 0) or 0,
+                getattr(tick, 'bid_volume_2', 0) or 0,
+                getattr(tick, 'bid_volume_3', 0) or 0,
+                getattr(tick, 'bid_volume_4', 0) or 0,
+                getattr(tick, 'bid_volume_5', 0) or 0,
+            ]
+            asks = [
+                getattr(tick, 'ask_volume_1', 0) or 0,
+                getattr(tick, 'ask_volume_2', 0) or 0,
+                getattr(tick, 'ask_volume_3', 0) or 0,
+                getattr(tick, 'ask_volume_4', 0) or 0,
+                getattr(tick, 'ask_volume_5', 0) or 0,
+            ]
             total_bid = sum(b * w for b, w in zip(bids, self.BOOK_WEIGHTS) if b > 0)
             total_ask = sum(a * w for a, w in zip(asks, self.BOOK_WEIGHTS) if a > 0)
             total = total_bid + total_ask
             if total <= 0:
                 return 0.5
             return total_bid / total
-        except AttributeError:
+        except (AttributeError, TypeError):
             # 降级：仅 1 档
-            total = tick.bid_volume_1 + tick.ask_volume_1
+            b1 = getattr(tick, 'bid_volume_1', 0) or 0
+            a1 = getattr(tick, 'ask_volume_1', 0) or 0
+            total = b1 + a1
             if total <= 0:
                 return 0.5
-            return tick.bid_volume_1 / total
+            return b1 / total
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  持仓管理
-    # ──────────────────────────────
+    # ───────────────────────────
     def _manage_position(self, tick: TickData):
         price = tick.last_price
 
@@ -261,16 +279,16 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
                 self.notice_callback(self.vt_symbol, price, "🛑 尾盘清仓", "")
             self.sell(price - 0.05, self.long_pos)
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  on_bar（备用，记录 1M 收盘价）
-    # ──────────────────────────────
+    # ───────────────────────────
     def on_1m_bar(self, bar: BarData):
         super().on_1m_bar(bar)
         self.last_price = bar.close_price
 
-    # ──────────────────────────────
+    # ───────────────────────────
     #  回调
-    # ──────────────────────────────
+    # ───────────────────────────
     def on_order(self, order: OrderData):
         super().on_order(order)
         if order.status in (Status.REJECTED, Status.CANCELLED, Status.ALLTRADED):
@@ -291,10 +309,18 @@ class TickOrderFlowStrategy(ApolloBaseStrategy):
             self.total_trades += 1
             if pnl > 0:
                 self.winning_trades += 1
+
+            # 部分平仓时正确维护状态
             self.long_pos = max(0, self.long_pos - trade.volume)
             if self.long_pos == 0:
                 self.entry_price = 0.0
                 self.stop_line = 0.0
+                self.trailing_profit_active = False
+                self.highest_price_since_entry = 0.0
+                self.profit_target_line = 0.0
+            else:
+                self.write_log(f"[成交] 部分平仓 {trade.volume}@{trade.price:.2f} | 剩余={self.long_pos}")
+
             self.write_log(f"[成交] SELL {trade.volume}@{trade.price:.2f} | PnL={pnl:+.2f}")
         self.is_ordering = False
         self.put_event()

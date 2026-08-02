@@ -1,6 +1,11 @@
 """
-strategies/options/bull_call_spread_strategy.py - Apollo-AI-Trader v2.9.3
+strategies/options/bull_call_spread_strategy.py - Apollo-AI-Trader v2.9.6
 Bull Call Spread：买低K Call + 卖高K Call，温和看涨，风险有限
+
+v2.9.6 变更：
+- 修复：on_bar 调用 super().on_bar() 保证链路完整
+- 修复：_check_tick_exit 签名统一（接受可选 bar 参数）
+- 优化：ema 计算防御性增强
 """
 from vnpy.trader.object import BarData, Direction, Offset
 from strategies.options.base_option_strategy import BaseOptionStrategy
@@ -8,24 +13,24 @@ from strategies.options.base_option_strategy import BaseOptionStrategy
 
 class BullCallSpreadStrategy(BaseOptionStrategy):
     author = "Apollo"
-    version = "v2.9.3"
+    version = "v2.9.6"
 
     delta_long         = 0.35
     delta_short        = 0.15
-    delta_tolerance    = 0.15     # ±放宽（旧版±0.1 太窄常落空）
-    min_days_to_expiry = 14
-    max_days_to_expiry = 45
-    min_credit_ratio   = 0.30     # short.premium / long.premium
-    min_net_debit_pct  = 0.005    # 净成本 < 价差宽度 × 此比例才合格
+    delta_tolerance    = 0.15
+    min_days_to_expire = 14
+    max_days_to_expire = 45
+    min_credit_ratio   = 0.30
+    min_net_debit_pct  = 0.005
     rolling_days       = 7
     max_positions      = 3
-    adx_uptrend_min    = 18       # 5M ADX 至少此值（确认多头）
+    adx_uptrend_min    = 18
     ema_fast_period    = 5
     ema_slow_period    = 20
 
     parameters = [
         "delta_long", "delta_short", "delta_tolerance",
-        "min_days_to_expiry", "max_days_to_expiry",
+        "min_days_to_expire", "max_days_to_expire",
         "min_credit_ratio", "min_net_debit_pct",
         "rolling_days", "max_positions",
         "adx_uptrend_min", "ema_fast_period", "ema_slow_period",
@@ -33,7 +38,6 @@ class BullCallSpreadStrategy(BaseOptionStrategy):
     variables = ["net_premium", "max_loss", "max_profit", "pnl",
                  "legs", "regime_label", "last_adx"]
 
-    # ──────────────────────────────────────────────────────
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
         self.last_adx = 0.0
@@ -44,26 +48,25 @@ class BullCallSpreadStrategy(BaseOptionStrategy):
         ema_fast = getattr(self, "_ema_5m_fast", bar.close_price)
         ema_slow = getattr(self, "_ema_5m_slow", bar.close_price)
         if ema_fast <= ema_slow:
-            return  # 不在多头排列，不开仓
+            return
         if self.last_adx < self.adx_uptrend_min:
             return
-        # 趋势确认通过，触发开仓
         if not self.legs:
             self._find_spread(bar)
 
     def on_bar(self, bar: BarData):
-        if self._manage_expiry(bar): return
+        super().on_bar(bar)  # v2.9.6：保证链路完整
+        if self._manage_expire(bar): return
         if self.legs and len(self.legs) >= 2:
             for leg in self.legs.values():
-                if leg.get("days_to_expiry", 999) <= self.rolling_days:
+                if leg.get("days_to_expire", 999) <= self.rolling_days:
                     self.write_log("[BCS] 临近到期，展期")
                     self._roll_positions()
                     return
-        # tick 快速回撤平仓
         if self.legs and len(self.legs) >= 2:
             self._check_tick_exit(bar)
 
-    # ── 选价差 ────────────────────────────────────────────
+    # ── 选价差 ────────────────────────────────────────
     def _find_spread(self, bar: BarData):
         code = self._to_futu_code()
         chain = self._query_full_chain(code)
@@ -77,7 +80,6 @@ class BullCallSpreadStrategy(BaseOptionStrategy):
         short_cands = [c for c in calls
                        if abs(abs(c.get("delta",0))-self.delta_short) <= self.delta_tolerance]
         if not long_cands or not short_cands:
-            # 放宽：直接按 delta 排序取最近
             long_cands  = sorted(calls, key=lambda c: abs(abs(c.get("delta",0))-self.delta_long))[:5]
             short_cands = sorted(calls, key=lambda c: abs(abs(c.get("delta",0))-self.delta_short))[:5]
 
@@ -96,7 +98,7 @@ class BullCallSpreadStrategy(BaseOptionStrategy):
                 width = sc["strike_price"] - lc["strike_price"]
                 net   = long_p - short_p
                 if net >= width * (1 - self.min_net_debit_pct):
-                    continue  # 净成本太高，放弃
+                    continue
                 if best is None or net < best[2]:
                     best = (lc, sc, net, width)
         if not best:
@@ -116,19 +118,17 @@ class BullCallSpreadStrategy(BaseOptionStrategy):
                            f"net={net:.2f} width={width} "
                            f"max_loss={self.max_loss:.0f}")
 
-    # ── Tick 回撤平仓 ────────────────────────────────────
-    def _check_tick_exit(self, bar: BarData):
+    # ── Tick 回撤平仓（统一签名） ──────────────────────
+    def _check_tick_exit(self, bar: BarData = None):
         if len(self.legs) < 2:
             return
         cur_pnl = self._estimate_pnl()
         cost = abs(self.max_loss) + 0.01
         if cost <= 0:
             return
-        # 已亏损超过最大风险的 80% → 止损
         if cur_pnl < -cost * 0.8:
             self.write_log(f"[BCS] 回撤止损 pnl={cur_pnl:.0f}")
             self._close_all_legs()
-        # 已盈利超过最大收益的 70% → 止盈
         elif cur_pnl > self.max_profit * 0.7:
             self.write_log(f"[BCS] 止盈平仓 pnl={cur_pnl:.0f}")
             self._close_all_legs()

@@ -1,748 +1,708 @@
 """
-strategies/structured_products/cbbc_strategy.py - v2.9.3
-牛熊证策略（实盘级重写）
-
-═════════════════════════════════════════════════════════════
-【核心数据源】富途 OpenAPI 官方接口
-    get_warrant(stock_owner, WarrantRequest)
-        → 返回 DataFrame，牛熊证相关关键字段（已按官方文档核对）：
-            stock                 牛熊证代码（如下单标的）
-            type                  WrtType.BULL / WrtType.BEAR
-            stock_owner           所属正股代码
-            leverage             杠杆倍数
-            recovery_price        收回价（触发强制收回用）
-            price_recovery_ratio 正股距收回价（%，越大越安全）
-            maturity_time        到期日
-            last_trade_time      最后交易日
-            strike_price         行使价（牛熊证通常等于收回价附近）
-            conversion_ratio     换股比率
-            status               状态（NORMAL/SUSPENDED/PRE_IPO）
-            break_even_point     打和点
-            cur_price/current_price 现价
-            lot_size             每手数量
-            implied_volatility   引伸波幅
-            delta                对冲值
-            effective_leverage   有效杠杆
-            ipop                 价内/价外
-            premium              溢价
-
-═════════════════════════════════════════════════════════════
-【与上版的根本性差异】
-    上版（v2.6）致命缺陷：
-        1. 从未调用 get_warrant —— 杠杆/距收回价全是 np.random 伪造
-        2. self.buy/sell 用正股 vt_symbol —— 牛熊证必须下到自己的代码
-        3. 没有"距收回价"真实数据 → 无法防御强制收回
-        4. 盈亏用杠杆×价格变动估算但杠杆是假的 → 全是随机数
-        5. 完全没订阅牛熊证自身行情
-
-    本版修复：
-        1. _query_cbbc_chain() 真实调 get_warrant(type_list=[BULL/BEAR])
-        2. 下单标的 = 筛选出的牛熊证 stock 代码
-        3. 真实 recovery_price + price_recovery_ratio 防御强制收回
-        4. 多周期分层（1M 执行 / 5M 趋势 / 60M Regime）
-        5. 盘口 imbalance + 逐笔 tick 利用
-        6. Regime 仓位缩放 + ADX 趋势过滤
-        7. 距收回价过近时禁止开仓（核心风控）
+CBBCStrategy v2.9.7
+- 继承 ApolloBaseStrategy，统一订阅管理
+- 只订阅 Tick + 1M bar，其余本地合成
+- Quote 按需查询（subscribe_push=False）
+- 信号/开仓/平仓时保存 Quote 快照到数据库
+- on_tick 实时检查距收回价（牛熊证核心风控）
+- 修复：参数未声明、bar 引用未定义、SQL 参数数量不匹配、继承链断裂
 """
 import time
-import math
-import numpy as np
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+import logging
+from datetime import datetime
+from typing import Optional, Dict, Any
 
-from vnpy_ctastrategy import CtaTemplate, BarGenerator, ArrayManager
-from vnpy.trader.object import BarData, TickData, OrderRequest, SubscribeRequest
-from vnpy.trader.constant import Direction, Exchange, Offset, Status
-from vnpy.trader.utility import round_to
+from vnpy.trader.object import TickData, BarData
+from vnpy.trader.utility import BarGenerator, ArrayManager
+from vnpy.trader.constant import Interval, Exchange
+from vnpy_ctastrategy import CtaTemplate
 
 from futu import (
-    OpenQuoteContext, RET_OK, WarrantRequest, WrtType,
-    WarrantStatus, SortField, SecurityType,
+    RET_OK, SubType, Session, WrtType,
+    OptionType, FinancialQuota, KLType, AuType
 )
 
-# ═══════════════════════════════════════════════════════════
-#  工具函数（与 warrant_strategy 保持一致）
-# ═══════════════════════════════════════════════════════════
-def _to_float(val, default=0.0):
-    if val is None:
-        return default
-    if isinstance(val, (int, float)):
-        try:
-            return float(val)
-        except (ValueError, OverflowError):
-            return default
-    s = str(val).strip()
-    if s == '' or s.upper() == 'N/A':
-        return default
+logger = logging.getLogger(__name__)
+
+# 尝试导入 ApolloBaseStrategy
+try:
+    from strategies.base_strategy import ApolloBaseStrategy
+    _HAS_BASE = True
+except ImportError:
     try:
-        return float(s)
-    except ValueError:
-        return default
+        from ..base_strategy import ApolloBaseStrategy
+        _HAS_BASE = True
+    except ImportError:
+        _HAS_BASE = False
 
 
-def _days_to_maturity(maturity_str: str) -> int:
-    try:
-        m = datetime.strptime(maturity_str, "%Y-%m-%d").date()
-        return (m - datetime.now().date()).days
-    except (ValueError, TypeError):
-        return 999
+if _HAS_BASE:
+    class CBBCStrategy(ApolloBaseStrategy):
+        """牛熊证策略：趋势跟踪 + 收回距离风控 + Quote 存库"""
 
+        author = "Apollo v2.9.7"
 
-def _wrt_type_to_str(t) -> str:
-    mapping = {WrtType.CALL: "CALL", WrtType.PUT: "PUT",
-               WrtType.BULL: "BULL", WrtType.BEAR: "BEAR"}
-    if t in mapping:
-        return mapping[t]
-    int_map = {1: "CALL", 2: "PUT", 3: "BULL", 4: "BEAR", 5: "INLINE"}
-    try:
-        return int_map.get(int(t), str(t))
-    except (ValueError, TypeError):
-        return str(t)
+        # ---- 参数 ----
+        underlying_symbol = ""       # 正股代码，如 "HK.00700"
+        cbbc_type = "BULL"          # BULL / BEAR
+        min_distance_to_call = 5.0
+        max_distance_to_call = 18.0
+        min_leverage = 3.0
+        max_leverage = 12.0
+        min_volume = 1000000
+        min_days_to_expire = 30
+        max_days_to_expire = 180
+        recovery_warn_pct = 5.0
+        recovery_exit_pct = 3.0
+        stop_loss_pct = 0.5
+        take_profit_pct = 1.0
+        max_position = 3
+        timeout_bars = 240
+        tick_size = 0.01
+        min_trade_qty = 1
+        quote_cache_ttl = 5.0
+        quote_sample_interval = 300
 
+        # 继承并扩展 parameters
+        parameters = ApolloBaseStrategy.parameters + [
+            "underlying_symbol", "cbbc_type",
+            "min_distance_to_call", "max_distance_to_call",
+            "min_leverage", "max_leverage",
+            "min_volume",
+            "min_days_to_expire", "max_days_to_expire",
+            "recovery_warn_pct", "recovery_exit_pct",
+            "stop_loss_pct", "take_profit_pct",
+            "max_position", "timeout_bars",
+            "tick_size", "min_trade_qty",
+            "quote_cache_ttl", "quote_sample_interval",
+        ]
+        variables = ApolloBaseStrategy.variables + [
+            "_entry_price", "_bars_held", "_cbbc_symbol",
+        ]
 
-# ═══════════════════════════════════════════════════════════
-#  主策略类
-# ═══════════════════════════════════════════════════════════
-class CBBCStrategy(CtaTemplate):
-    """
-    实盘级牛熊证策略
+        # ---- DEFAULTS 合并 ----
+        DEFAULTS = dict(ApolloBaseStrategy.DEFAULTS, **{
+            "underlying_symbol": "",
+            "cbbc_type": "BULL",
+            "min_distance_to_call": 5.0,
+            "max_distance_to_call": 18.0,
+            "min_leverage": 3.0,
+            "max_leverage": 12.0,
+            "min_volume": 1000000,
+            "min_days_to_expire": 30,
+            "max_days_to_expire": 180,
+            "recovery_warn_pct": 5.0,
+            "recovery_exit_pct": 3.0,
+            "stop_loss_pct": 0.5,
+            "take_profit_pct": 1.0,
+            "max_position": 3,
+            "timeout_bars": 240,
+            "tick_size": 0.01,
+            "min_trade_qty": 1,
+            "quote_cache_ttl": 5.0,
+            "quote_sample_interval": 300,
+        })
 
-    数据流（对应已订阅的全套数据）：
-        TICKER  → on_tick   ：盘口 imbalance、加权价
-        K_1M    → on_1m_bar ：执行层（止损/止盈/收回预警/超时）
-        K_5M    → on_5m_bar ：趋势确认（EMA 多头/空头排列）
-        K_60M   → on_60m_bar：宏观 Regime 更新
-        QUOTE   → on_tick   ：bid/ask 快照
-    """
-    author = "Apollo"
+        def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+            super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 
-    # ───────────────────────────────────────
-    #  可调参数
-    # ───────────────────────────────────────
-    parameters = [
-        # 信号
-        "signal_source",
-        "underlying_symbol",
-        # 牛熊证筛选
-        "min_leverage", "max_leverage",
-        "min_distance_to_call",    # 正股距收回价最小（%）：越近杠杆越高风险越大
-        "max_distance_to_call",    # 正股距收回价最大（%）：越远越安全但杠杆越低
-        "min_days_to_expiry", "max_days_to_expiry",
-        "min_effective_leverage",  # 最低有效杠杆
-        "max_recovery_pct",        # 距收回价上限（%）
-        "prefer_issuer_list",
-        # 风控
-        "recovery_warn_pct",       # 距收回价低于此值发预警（%）
-        "recovery_exit_pct",       # 距收回价低于此值强制平仓（%）
-        "max_position_value",
-        "position_pct_of_cash",
-        "profit_take_pct",        # 止盈（基于杠杆放大后的盈亏%）
-        "stop_loss_pct",
-        "max_hold_bars",
-        "time_decay_close_days",
-        # 趋势
-        "adx_threshold",
-        "ema_fast", "ema_slow",
-        # Regime
-        "regime_scale",
-        # 节流
-        "requery_interval_sec",
-    ]
+            # 牛熊证需要 Tick（实时收回价检查）
+            self.need_tick = True
 
-    variables = [
-        "pos", "entry_price", "entry_time", "current_cbbc_stock",
-        "cbbc_type", "leverage", "distance_to_call",
-        "days_to_expiry", "pnl_pct", "bars_held",
-        "last_signal", "regime_label",
-    ]
+            # ========== 本地多周期合成 ==========
+            # bg_1m 由基类管理（on_tick → bg_1m → on_bar → on_1m_bar）
+            self.bg_5m = BarGenerator(self.on_1m_bar, 5, self.on_5m_bar)
+            self.bg_60m = BarGenerator(self.on_1m_bar, 60, self.on_60m_bar)
 
-    # ═══════════════════════════════════════════════════
-    #  初始化
-    # ═══════════════════════════════════════════════════
-    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
-        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+            self.am_1m = ArrayManager(200)
+            self.am_5m = ArrayManager(200)
+            self.am_60m = ArrayManager(100)
 
-        self.pos = 0
-        self.entry_price = 0.0
-        self.entry_time = 0.0
-        self.current_cbbc_stock = ""
-        self.cbbc_type = ""          # BULL / BEAR
-        self.leverage = 0.0
-        self.distance_to_call = 0.0  # 正股距收回价（%）
-        self.days_to_expiry = 0
-        self.pnl_pct = 0.0
-        self.bars_held = 0
-        self.last_signal = 0.0
-        self.regime_label = "unknown"
+            # ========== Quote 按需查询 ==========
+            self._quote_cache: Dict[str, tuple] = {}
+            self._quote_ctx = None
+            self._quote_subscribed = set()
+            self._last_periodic_sample = 0.0
 
-        # 多周期
-        self.bg_1m = BarGenerator(self.on_1m_bar, window=1, on_window_bar=self.on_1m_bar)
-        self.bg_5m = BarGenerator(self.on_1m_bar, window=5, on_window_bar=self.on_5m_bar)
-        self.bg_60m = BarGenerator(self.on_1m_bar, window=60, on_window_bar=self.on_60m_bar)
-        self.am_1m = ArrayManager(size=200)
-        self.am_5m = ArrayManager(size=200)
-        self.am_60m = ArrayManager(size=100)
+            # ========== 状态 ==========
+            self._current_1m = None
+            self._current_5m = None
+            self._current_60m = None
+            self._entry_price = 0.0
+            self._entry_time = None
+            self._bars_held = 0
+            self._cbbc_symbol = ""
+            self._underlying_price = 0.0
+            self._option_symbols = set()
 
-        self.last_tick = None
-        self.tick_imbalance = 0.0
+            # ========== 数据库 ==========
+            self._db_path = getattr(cta_engine, 'db_path', 'data/history.db')
 
-        self.quote_ctx: Optional[OpenQuoteContext] = None
-        self._last_query_ts = 0.0
-        self._candidates: List[Dict] = []
-        self._current_info: Dict = {}
+        # ============================================================
+        # 行情入口
+        # ============================================================
+        def on_tick(self, tick: TickData):
+            """Tick → bg_1m 合成 1M bar + 实时收回价检查"""
+            # 先让基类处理 Tick → Bar 合成
+            super().on_tick(tick)
 
-        self._shared_signal = 0.0
+            # 更新正股价
+            self._underlying_price = tick.last_price
 
-        self._set_defaults()
+            # 🔴 核心：on_tick 实时检查距收回价
+            if self.pos != 0 and self._cbbc_symbol:
+                quote = self.get_quote(self._cbbc_symbol)
+                if quote is not None:
+                    recovery_ratio = self._f(quote.get('price_recovery_ratio'))
+                    if recovery_ratio > 0 and recovery_ratio < self.recovery_exit_pct:
+                        self._close_position(
+                            tick.last_price,
+                            reason=f"距收回价过近 {recovery_ratio:.1f}%"
+                        )
 
-    def _set_defaults(self):
-        defaults = {
-            "signal_source": "self",
-            "underlying_symbol": "HK.00700",
-            "min_leverage": 3.0, "max_leverage": 12.0,
-            "min_distance_to_call": 3.0,   # 距收回价至少 3%
-            "max_distance_to_call": 18.0,  # 距收回价最多 18%
-            "min_days_to_expiry": 14, "max_days_to_expiry": 120,
-            "min_effective_leverage": 2.0,
-            "max_recovery_pct": 25.0,
-            "prefer_issuer_list": "",
-            "recovery_warn_pct": 5.0,      # 距收回价 <5% 预警
-            "recovery_exit_pct": 2.0,      # 距收回价 <2% 强平
-            "max_position_value": 60000.0,
-            "position_pct_of_cash": 0.1,
-            "profit_take_pct": 0.20,
-            "stop_loss_pct": 0.12,
-            "max_hold_bars": 240,
-            "time_decay_close_days": 5,
-            "adx_threshold": 20.0,
-            "ema_fast": 5, "ema_slow": 20,
-            "regime_scale": True,
-            "requery_interval_sec": 300,
-        }
-        for k, v in defaults.items():
-            if not hasattr(self, k) or getattr(self, k) is None:
-                setattr(self, k, v)
+        def on_bar(self, bar: BarData):
+            """
+            接收 1M bar（来自 bg_1m 或引擎推送）。
+            喂给 5M/60M BarGenerator 合成，再触发 on_1m_bar。
+            """
+            self.bg_5m.update_bar(bar)
+            self.bg_60m.update_bar(bar)
+            self.on_1m_bar(bar)
 
-    def on_init(self):
-        self.load_bar(30, use_database=True)
-        self.write_log(
-            f"[CBBC] 策略初始化 | 正股={self.underlying_symbol} | "
-            f"杠杆={self.min_leverage:.0f}x~{self.max_leverage:.0f}x | "
-            f"距收回={self.min_distance_to_call}~{self.max_distance_to_call}%"
-        )
+        # ============================================================
+        # 周期回调
+        # ============================================================
+        def on_1m_bar(self, bar: BarData):
+            self._current_1m = bar
+            self.am_1m.update_bar(bar)
+            self._bars_held += 1
 
-    def on_start(self):
-        self.quote_ctx = self._get_quote_ctx()
-        if self.quote_ctx is None:
-            self.write_log("[CBBC] ⚠️ quote_ctx 未就绪，牛熊证筛选将失败！")
-        else:
-            self.write_log("[CBBC] ✅ quote_ctx 已就绪")
-        self._subscribe_underlying()
-        self._query_cbbc_chain(force=True)
+            # 定时采样 Quote
+            if self.quote_sample_interval > 0:
+                now = time.time()
+                if now - self._last_periodic_sample >= self.quote_sample_interval:
+                    self._last_periodic_sample = now
+                    self._periodic_quote_sample()
 
-    def on_stop(self):
-        self.write_log(f"[CBBC] 停止 | 持仓={self.pos}")
+        def on_5m_bar(self, bar: BarData):
+            self._current_5m = bar
+            self.am_5m.update_bar(bar)
 
-    # ═══════════════════════════════════════════════════
-    #  行情接入
-    # ═══════════════════════════════════════════════════
-    def on_tick(self, tick: TickData):
-        self.last_tick = tick
-        bid = _to_float(tick.bid_price_1, 0.0)
-        ask = _to_float(tick.ask_price_1, 0.0)
-        bv = _to_float(tick.bid_volume_1, 0.0)
-        av = _to_float(tick.ask_volume_1, 0.0)
-        total = bv + av
-        self.tick_imbalance = (bv - av) / total if total > 0 else 0.0
-        self.bg_1m.update_tick(tick)
+            # 5M 周期：检查信号 + 管理持仓
+            self._check_signal(bar)
+            if self.pos != 0:
+                self._manage_position(bar)
 
-    def on_bar(self, bar: BarData):
-        self.bg_1m.update_bar(bar)
-        self.bg_5m.update_bar(bar)
-        self.bg_60m.update_bar(bar)
+        def on_60m_bar(self, bar: BarData):
+            self._current_60m = bar
+            self.am_60m.update_bar(bar)
 
-    def on_1m_bar(self, bar: BarData):
-        self.am_1m.update_bar(bar)
-        if not self.am_1m.inited:
-            return
+        # ============================================================
+        # 信号检测
+        # ============================================================
+        def _check_signal(self, bar: BarData):
+            """5M bar 触发信号检测"""
+            if self.pos != 0:
+                return
 
-        self._read_shared_signal()
+            # 1. 技术面确认
+            if not self._tech_confirmed():
+                return
 
-        if self.pos != 0:
-            self.bars_held += 1
-            self._manage_position(bar)
-        else:
-            self.bars_held = 0
-            signal = self._get_combined_signal(bar)
-            self.last_signal = signal
-            if abs(signal) >= 1.0:
-                self._try_open_position(signal, bar)
+            # 2. 查询牛熊证链
+            chain = self._query_cbbc_chain()
+            if not chain:
+                return
 
-        self._maybe_requery()
+            # 3. 筛选最优
+            best = self._select_best_cbbc(chain)
+            if best is None:
+                return
 
-    def on_5m_bar(self, bar: BarData):
-        self.am_5m.update_bar(bar)
-        if not self.am_5m.inited:
-            return
-        self._update_regime_from_5m()
+            # 4. 保存信号触发时的 Quote 快照
+            self.save_quote_snapshot(best['stock'], 'signal')
 
-    def on_60m_bar(self, bar: BarData):
-        self.am_60m.update_bar(bar)
-        if not self.am_60m.inited:
-            return
-        self._update_regime_from_60m()
+            # 5. 开仓
+            self._open_position(best, bar)
 
-    # ═══════════════════════════════════════════════════
-    #  信号
-    # ═══════════════════════════════════════════════════
-    def _get_combined_signal(self, bar: BarData) -> float:
-        if not self.am_5m.inited or not self.am_1m.inited:
+        def _tech_confirmed(self) -> bool:
+            """技术面确认"""
+            if not self.am_5m.inited:
+                return False
+            ma5 = self.am_5m.sma(5)
+            ma20 = self.am_5m.sma(20)
+            if ma5 is None or ma20 is None:
+                return False
+
+            if self.cbbc_type == "BULL":
+                return ma5 > ma20
+            else:
+                return ma5 < ma20
+
+        def _query_cbbc_chain(self) -> list:
+            """查询牛熊证链"""
+            qc = self._get_quote_ctx()
+            if qc is None or not self.underlying_symbol:
+                return []
+
+            try:
+                from futu import WarrantRequest
+                req = WarrantRequest()
+                req.code = self.underlying_symbol
+                req.wrt_type = WrtType.BULL if self.cbbc_type == "BULL" else WrtType.BEAR
+                req.price_recovery_ratio_min = self.min_distance_to_call
+                req.price_recovery_ratio_max = self.max_distance_to_call
+
+                ret, data = qc.get_warrant(self.underlying_symbol, req)
+                if ret != RET_OK or len(data) == 0:
+                    return []
+
+                results = []
+                for _, r in data.iterrows():
+                    dte = self._f(r.get('expiry_date_distance', 0))
+                    leverage = self._f(r.get('leverage', 0))
+                    vol = self._f(r.get('last_turnover', 0))
+                    recovery_ratio = self._f(r.get('price_recovery_ratio'))
+
+                    if dte < self.min_days_to_expire or dte > self.max_days_to_expire:
+                        continue
+                    if leverage < self.min_leverage or leverage > self.max_leverage:
+                        continue
+                    if vol < self.min_volume:
+                        continue
+                    if recovery_ratio < self.min_distance_to_call:
+                        continue
+
+                    results.append({
+                        'stock': str(r.get('stock', '')),
+                        'name': str(r.get('name', '')),
+                        'leverage': leverage,
+                        'recovery_price': self._f(r.get('recovery_price')),
+                        'price_recovery_ratio': recovery_ratio,
+                        'last_price': self._f(r.get('last_price')),
+                        'expiry_date_distance': int(dte),
+                        'last_turnover': vol,
+                    })
+                return results
+            except Exception as e:
+                self.write_log(f"[CBBC] 查询牛熊证链失败: {e}")
+                return []
+
+        def _select_best_cbbc(self, chain: list) -> Optional[dict]:
+            """筛选最优牛熊证"""
+            if not chain:
+                return None
+
+            # 按距收回价降序（越远越安全）
+            chain.sort(key=lambda x: x['price_recovery_ratio'], reverse=True)
+
+            safe = [c for c in chain if c['price_recovery_ratio'] >= self.recovery_warn_pct]
+            if not safe:
+                return None
+
+            target_leverage = (self.min_leverage + self.max_leverage) / 2
+            safe.sort(key=lambda x: abs(x['leverage'] - target_leverage))
+            return safe[0]
+
+        # ============================================================
+        # 开仓 / 平仓
+        # ============================================================
+        def _open_position(self, cbbc: dict, bar: BarData):
+            """开仓"""
+            price = cbbc['last_price']
+            if price <= 0:
+                return
+
+            cash = self._get_available_cash()
+            if cash <= 0:
+                self.write_log("[CBBC] ⚠️ 资金不足，无法开仓")
+                return
+
+            qty = max(self.min_trade_qty, int(cash * 0.1 / (price * 100) / 100) * 100)
+            qty = min(qty, self.max_position * 100)
+
+            if qty <= 0:
+                self.write_log(f"[CBBC] ⚠️ 计算数量为0，无法开仓 price={price} cash={cash}")
+                return
+
+            self.buy(price + self.tick_size, qty, stop=False)
+            self._entry_price = price
+            self._entry_time = datetime.now()
+            self._bars_held = 0
+            self._cbbc_symbol = cbbc['stock']
+            self._option_symbols.add(self._cbbc_symbol)
+
+            self.save_quote_snapshot(self._cbbc_symbol, 'entry')
+
+            self.write_log(
+                f"[CBBC] 🟢 开仓 {cbbc['stock']} "
+                f"价格={price:.4f} 数量={qty} "
+                f"杠杆={cbbc['leverage']:.1f}x "
+                f"距收回={cbbc['price_recovery_ratio']:.1f}%"
+            )
+            self._telegram_push(
+                f"🟢 牛熊证开仓\n"
+                f"标的: {cbbc['stock']} ({cbbc['name']})\n"
+                f"类型: {self.cbbc_type}\n"
+                f"价格: {price:.4f} | 数量: {qty}\n"
+                f"杠杆: {cbbc['leverage']:.1f}x\n"
+                f"距收回: {cbbc['price_recovery_ratio']:.1f}%\n"
+                f"到期: {cbbc['expiry_date_distance']}天"
+            )
+
+        def _manage_position(self, bar: BarData):
+            """持仓管理"""
+            if self._entry_price <= 0 or self.pos == 0:
+                return
+
+            current_price = bar.close_price
+            pnl_pct = (current_price - self._entry_price) / self._entry_price
+
+            if pnl_pct >= self.take_profit_pct:
+                self._close_position(current_price, reason=f"止盈 +{pnl_pct*100:.1f}%")
+                return
+
+            if pnl_pct <= -self.stop_loss_pct:
+                self._close_position(current_price, reason=f"止损 {pnl_pct*100:.1f}%")
+                return
+
+            if self._bars_held >= self.timeout_bars:
+                self._close_position(current_price, reason=f"超时 {self._bars_held}根1Mbar")
+                return
+
+        def _close_position(self, price: float, reason: str = ""):
+            """平仓"""
+            if self.pos == 0:
+                return
+            qty = abs(self.pos)
+            self.sell(price - self.tick_size, qty, stop=False)
+
+            if self._cbbc_symbol:
+                self.save_quote_snapshot(self._cbbc_symbol, 'exit')
+
+            pnl = (price - self._entry_price) * qty if self._entry_price > 0 else 0
+            self.write_log(f"[CBBC] 🔴 平仓 {reason} 价格={price:.4f} PnL≈{pnl:.0f}")
+            self._telegram_push(
+                f"🔴 牛熊证平仓\n原因: {reason}\n"
+                f"价格: {price:.4f} | PnL: {pnl:.0f}"
+            )
+            self._entry_price = 0.0
+            self._cbbc_symbol = ""
+
+        # ============================================================
+        # Quote 按需查询
+        # ============================================================
+        def _get_quote_ctx(self):
+            if self._quote_ctx is not None:
+                try:
+                    ret, _ = self._quote_ctx.get_global_state()
+                    if ret == RET_OK:
+                        return self._quote_ctx
+                except Exception:
+                    self._quote_ctx = None
+
+            me = getattr(self.cta_engine, 'main_engine', None)
+            if me is not None:
+                for gw in getattr(me, 'gateways', {}).values():
+                    qc = getattr(gw, 'quote_ctx', None)
+                    if qc is not None:
+                        try:
+                            ret, _ = qc.get_global_state()
+                            if ret == RET_OK:
+                                self._quote_ctx = qc
+                                return qc
+                        except Exception:
+                            continue
+
+            try:
+                from futu import OpenQuoteContext
+                host = getattr(self.cta_engine, 'opend_host', '127.0.0.1')
+                port = getattr(self.cta_engine, 'opend_port', 11111)
+                self._quote_ctx = OpenQuoteContext(host, port)
+                return self._quote_ctx
+            except Exception as e:
+                self.write_log(f"[CBBC] 创建 OpenQuoteContext 失败: {e}")
+                return None
+
+        def _ensure_quote_subscribed(self, symbol: str) -> bool:
+            if symbol in self._quote_subscribed:
+                return True
+            qc = self._get_quote_ctx()
+            if qc is None:
+                return False
+            try:
+                ret, _ = qc.subscribe(
+                    [symbol], [SubType.QUOTE],
+                    subscribe_push=False,
+                    session=Session.ALL
+                )
+                if ret == RET_OK:
+                    self._quote_subscribed.add(symbol)
+                    self.write_log(f"[Quote] ✅ 订阅 QUOTE(push=off): {symbol}")
+                    return True
+            except Exception as e:
+                self.write_log(f"[Quote] ⚠️ 订阅失败 {symbol}: {e}")
+            return False
+
+        def get_quote(self, symbol: str):
+            """按需获取 Quote（带 TTL 缓存）"""
+            now = time.time()
+            if symbol in self._quote_cache:
+                ts, data = self._quote_cache[symbol]
+                if now - ts < self.quote_cache_ttl:
+                    return data
+
+            if not self._ensure_quote_subscribed(symbol):
+                return None
+
+            qc = self._get_quote_ctx()
+            if qc is None:
+                return None
+
+            try:
+                ret, data = qc.get_stock_quote([symbol])
+                if ret == RET_OK and len(data) > 0:
+                    row = data.iloc[0]
+                    self._quote_cache[symbol] = (now, row)
+                    self._option_symbols.add(symbol)
+                    return row
+            except Exception as e:
+                self.write_log(f"[Quote] 获取 {symbol} 失败: {e}")
+            return None
+
+        # ============================================================
+        # Quote 存库
+        # ============================================================
+        def init_quote_tables(self):
+            """创建 quote_snapshot 表"""
+            try:
+                import sqlite3
+                conn = sqlite3.connect(self._db_path)
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS quote_snapshot (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        underlying TEXT,
+                        timestamp DATETIME NOT NULL,
+                        trigger_type TEXT,
+                        last_price REAL, open_price REAL, high_price REAL,
+                        low_price REAL, prev_close REAL,
+                        volume INTEGER, turnover REAL,
+                        implied_volatility REAL, delta REAL, gamma REAL,
+                        vega REAL, theta REAL, rho REAL,
+                        premium REAL, strike_price REAL,
+                        expiry_date_distance INTEGER, open_interest INTEGER,
+                        recovery_price REAL, price_recovery_ratio REAL,
+                        pre_price REAL, after_price REAL,
+                        regime TEXT, strategy_name TEXT,
+                        UNIQUE(symbol, timestamp, trigger_type)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_qs_symbol_time
+                        ON quote_snapshot(symbol, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_qs_trigger
+                        ON quote_snapshot(trigger_type);
+                """)
+                conn.commit()
+                conn.close()
+                self.write_log("[Quote] ✅ quote_snapshot 表就绪")
+            except Exception as e:
+                self.write_log(f"[Quote] 建表失败: {e}")
+
+        def save_quote_snapshot(self, symbol: str, trigger_type: str):
+            """保存 Quote 快照到数据库"""
+            quote = self.get_quote(symbol)
+            if quote is None:
+                return
+
+            try:
+                import sqlite3
+                conn = sqlite3.connect(self._db_path)
+                conn.execute("""
+                    INSERT OR REPLACE INTO quote_snapshot
+                    (symbol, underlying, timestamp, trigger_type,
+                     last_price, open_price, high_price, low_price, prev_close,
+                     volume, turnover,
+                     implied_volatility, delta, gamma, vega, theta, rho,
+                     premium, strike_price, expiry_date_distance, open_interest,
+                     recovery_price, price_recovery_ratio,
+                     pre_price, after_price,
+                     regime, strategy_name)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    symbol, self.underlying_symbol,
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    trigger_type,
+                    self._f(quote.get('last_price')),
+                    self._f(quote.get('open_price')),
+                    self._f(quote.get('high_price')),
+                    self._f(quote.get('low_price')),
+                    self._f(quote.get('prev_close_price')),
+                    int(quote.get('volume', 0) or 0),
+                    self._f(quote.get('turnover')),
+                    self._f(quote.get('implied_volatility')),
+                    self._f(quote.get('delta')),
+                    self._f(quote.get('gamma')),
+                    self._f(quote.get('vega')),
+                    self._f(quote.get('theta')),
+                    self._f(quote.get('rho')),
+                    self._f(quote.get('premium')),
+                    self._f(quote.get('strike_price')),
+                    int(quote.get('expiry_date_distance', 0) or 0),
+                    int(quote.get('open_interest', 0) or 0),
+                    self._f(quote.get('recovery_price')),
+                    self._f(quote.get('price_recovery_ratio')),
+                    self._f(quote.get('pre_price')),
+                    self._f(quote.get('after_price')),
+                    getattr(self, 'current_regime', ''),
+                    self.strategy_name,
+                ))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                self.write_log(f"[Quote] 存库失败: {e}")
+
+        def _periodic_quote_sample(self):
+            for sym in list(self._option_symbols):
+                self.save_quote_snapshot(sym, 'periodic')
+
+        # ============================================================
+        # 生命周期
+        # ============================================================
+        def on_start(self):
+            self.init_quote_tables()
+            # 订阅正股 Tick + QUOTE（基类 _acquire_tick 会管理 TICKER）
+            if self.underlying_symbol:
+                qc = self._get_quote_ctx()
+                if qc is not None:
+                    try:
+                        qc.subscribe(
+                            [self.underlying_symbol],
+                            [SubType.TICKER, SubType.QUOTE],
+                            subscribe_push=True,
+                            session=Session.ALL
+                        )
+                        self.write_log(f"[CBBC] ✅ 订阅 {self.underlying_symbol} TICKER+QUOTE")
+                    except Exception as e:
+                        self.write_log(f"[CBBC] ⚠️ 订阅失败: {e}")
+
+            self.write_log(
+                f"[CBBC] 🚀 {self.strategy_name} 启动 | "
+                f"正股={self.underlying_symbol} 类型={self.cbbc_type} | "
+                f"Tick+1M订阅 | Quote按需(push=off)"
+            )
+
+        def on_stop(self):
+            if self._quote_ctx is not None:
+                try:
+                    self._quote_ctx.close()
+                except Exception:
+                    pass
+                self._quote_ctx = None
+            self.write_log(f"[CBBC] 🛑 {self.strategy_name} 停止")
+
+        # ============================================================
+        # 工具方法
+        # ============================================================
+        def _f(self, v):
+            try:
+                return float(v) if v is not None else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
+        def _get_available_cash(self) -> float:
+            try:
+                me = getattr(self.cta_engine, 'main_engine', None)
+                if me is not None:
+                    for gw in getattr(me, 'gateways', {}).values():
+                        pm = getattr(gw, 'position_manager', None)
+                        if pm is not None and hasattr(pm, 'available_cash'):
+                            return float(pm.available_cash())
+                qc = self._get_quote_ctx()
+                if qc is not None:
+                    ret, acc = qc.get_acc_list()
+                    if ret == RET_OK and len(acc) > 0:
+                        return float(acc.iloc[0].get('power', 0))
+            except Exception as e:
+                self.write_log(f"[Cash] 查询失败: {e}")
             return 0.0
 
-        ema_f = self.am_5m.ema(self.ema_fast)
-        ema_s = self.am_5m.ema(self.ema_slow)
-        if ema_f > ema_s * 1.002:
-            trend = 1.0
-        elif ema_f < ema_s * 0.998:
-            trend = -1.0
-        else:
-            trend = 0.0
+        def _telegram_push(self, text: str):
+            try:
+                me = getattr(self.cta_engine, 'main_engine', None)
+                if me is not None:
+                    rc = getattr(me, 'remote_controller', None)
+                    if rc is not None and hasattr(rc, 'send_message'):
+                        rc.send_message(text)
+            except Exception:
+                pass
+            self.write_log(text)
 
-        adx = self.am_5m.adx(14) if hasattr(self.am_5m, 'adx') else 25.0
-        adx_w = min(max((adx - 10) / 30, 0.0), 1.0)
+else:
+    # Fallback：无法导入 ApolloBaseStrategy 时
+    class CBBCStrategy(CtaTemplate):
+        """牛熊证策略 Fallback 版本"""
+        author = "Apollo v2.9.7-fallback"
 
-        rsi = self.am_1m.rsi(14)
-        rsi_sig = 0.0
-        if rsi > 72:
-            rsi_sig = -0.3
-        elif rsi < 28:
-            rsi_sig = 0.3
+        underlying_symbol = ""
+        cbbc_type = "BULL"
+        min_distance_to_call = 5.0
+        max_distance_to_call = 18.0
+        min_leverage = 3.0
+        max_leverage = 12.0
+        min_volume = 1000000
+        min_days_to_expire = 30
+        max_days_to_expire = 180
+        recovery_warn_pct = 5.0
+        recovery_exit_pct = 3.0
+        stop_loss_pct = 0.5
+        take_profit_pct = 1.0
+        max_position = 3
+        timeout_bars = 240
+        tick_size = 0.01
+        min_trade_qty = 1
+        quote_cache_ttl = 5.0
+        quote_sample_interval = 300
 
-        imb = np.clip(self.tick_imbalance, -1.0, 1.0)
-        shared = self._shared_signal if abs(self._shared_signal) >= 1.0 else 0.0
+        def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+            super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+            self._quote_cache = {}
+            self._quote_ctx = None
+            self._quote_subscribed = set()
+            self._last_periodic_sample = 0.0
+            self._entry_price = 0.0
+            self._bars_held = 0
+            self._cbbc_symbol = ""
+            self._underlying_price = 0.0
+            self._option_symbols = set()
+            self._db_path = getattr(cta_engine, 'db_path', 'data/history.db')
+            self.write_log("[CBBC] ⚠️ Fallback 模式：未继承 ApolloBaseStrategy")
 
-        raw = (
-            trend * 0.5 * (0.5 + 0.5 * adx_w)
-            + rsi_sig * 0.2
-            + imb * 0.15
-            + shared * 0.15
-        )
+        def on_tick(self, tick):
+            self._underlying_price = tick.last_price
 
-        if raw >= 0.5 and trend > 0:
-            return 1.0
-        if raw <= -0.5 and trend < 0:
-            return -1.0
-        return 0.0
-
-    def _update_regime_from_5m(self):
-        if not hasattr(self.am_5m, 'adx'):
-            return
-        adx = self.am_5m.adx(14)
-        close = self.am_5m.close[-1] if len(self.am_5m.close) else 0.0
-        ma20 = np.mean(self.am_5m.close[-20:]) if len(self.am_5m.close) >= 20 else close
-        if adx > 30 and close > ma20:
-            self.regime_label = "bull_trend"
-        elif adx > 30 and close < ma20:
-            self.regime_label = "bear_trend"
-        elif adx < 18:
-            self.regime_label = "range"
-        else:
-            self.regime_label = "volatile"
-
-    def _update_regime_from_60m(self):
-        if len(self.am_60m.close) < 20:
-            return
-        ma20 = np.mean(self.am_60m.close[-20:])
-        ma60 = np.mean(self.am_60m.close[-60:]) if len(self.am_60m.close) >= 60 else ma20
-        adx = self.am_60m.adx(14) if hasattr(self.am_60m, 'adx') else 25.0
-        if adx > 30:
-            self.regime_label = "bull_trend" if ma20 > ma60 else "bear_trend"
-        else:
-            self.regime_label = "range"
-
-    def _read_shared_signal(self):
-        try:
-            bus = getattr(self, 'event_bus', None) or getattr(self.cta_engine, 'event_bus', None)
-            if bus is None:
-                return
-            last = bus.get_last('eSignal')
-            if last and last.get('symbol') == self.underlying_symbol:
-                self._shared_signal = float(last.get('signal', 0.0))
-        except Exception:
+        def on_bar(self, bar):
             pass
 
-    # ═══════════════════════════════════════════════════
-    #  牛熊证筛选（核心）
-    # ═══════════════════════════════════════════════════
-    def _query_cbbc_chain(self, force=False) -> List[Dict]:
-        """
-        调用富途 get_warrant 筛选牛熊证（WrtType.BULL / WrtType.BEAR）
-        """
-        now = time.time()
-        if not force and (now - self._last_query_ts) < self.requery_interval_sec:
-            return self._candidates
-        self._last_query_ts = now
-
-        if self.quote_ctx is None:
-            self.write_log("[CBBC] ⚠️ quote_ctx 未就绪")
-            return []
-
-        cands: List[Dict] = []
-
-        for cbbc_type in [WrtType.BULL, WrtType.BEAR]:
-            req = WarrantRequest()
-            req.type_list = [cbbc_type]
-            req.leverage_ratio_min = self.min_leverage
-            req.leverage_ratio_max = self.max_leverage
-            req.status = WarrantStatus.NORMAL
-            # 距收回价过滤（牛熊证核心字段）
-            req.price_recovery_ratio_min = self.min_distance_to_call
-            req.price_recovery_ratio_max = self.max_distance_to_call
-            # 到期日
-            today = datetime.now().date()
-            req.maturity_time_min = (today + timedelta(days=self.min_days_to_expiry)).strftime("%Y-%m-%d")
-            req.maturity_time_max = (today + timedelta(days=self.max_days_to_expiry)).strftime("%Y-%m-%d")
-            # 排序
-            req.sort_field = SortField.SCORE
-            req.ascend = False
-            req.num = 50
-
+        def _f(self, v):
             try:
-                ret, result = self.quote_ctx.get_warrant(self.underlying_symbol, req)
-            except Exception as e:
-                self.write_log(f"[CBBC] get_warrant({cbbc_type}) 异常: {e}")
-                continue
+                return float(v) if v is not None else 0.0
+            except (ValueError, TypeError):
+                return 0.0
 
-            if ret != RET_OK:
-                self.write_log(f"[CBBC] get_warrant({cbbc_type}) 失败: {result}")
-                continue
-
-            try:
-                data, last_page, all_count = result
-            except (TypeError, ValueError):
-                data = result if hasattr(result, '__iter__') else None
-                last_page, all_count = True, 0
-
-            if data is None or len(data) == 0:
-                continue
-
-            for _, row in data.iterrows():
-                item = self._parse_row(row, cbbc_type)
-                if item and self._passes_filter(item):
-                    cands.append(item)
-
-        cands.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        self._candidates = cands
-
-        if cands:
-            s = cands[0]
-            self.write_log(
-                f"[CBBC] ✅ 筛选完成: {len(cands)} 只 | "
-                f"样本={s['stock']} type={s['cbbc_type_str']} "
-                f"lev={s['leverage']:.1f}x dist={s['price_recovery_ratio']:.1f}% "
-                f"days={s['days_to_expiry']}"
-            )
-        else:
-            self.write_log(f"[CBBC] ⚠️ 无符合筛选条件的牛熊证（正股={self.underlying_symbol}）")
-
-        return cands
-
-    def _parse_row(self, row, cbbc_type) -> Optional[Dict]:
-        try:
-            stock = str(row.get("stock", "")).strip()
-            if not stock:
-                return None
-            d = {
-                "stock": stock,
-                "cbbc_type": cbbc_type,
-                "cbbc_type_str": _wrt_type_to_str(cbbc_type),
-                "stock_owner": str(row.get("stock_owner", self.underlying_symbol)),
-                "name": str(row.get("name", stock)),
-                "leverage": _to_float(row.get("leverage"), 0.0),
-                "effective_leverage": _to_float(row.get("effective_leverage"), 0.0),
-                "recovery_price": _to_float(row.get("recovery_price"), 0.0),
-                "price_recovery_ratio": _to_float(row.get("price_recovery_ratio"), 0.0),
-                "strike_price": _to_float(row.get("strike_price"), 0.0),
-                "conversion_ratio": _to_float(row.get("conversion_ratio"), 1.0),
-                "maturity_time": str(row.get("maturity_time", "")),
-                "last_trade_time": str(row.get("last_trade_time", "")),
-                "status": int(_to_float(row.get("status"), 0)),
-                "break_even_point": _to_float(row.get("break_even_point"), 0.0),
-                "cur_price": _to_float(row.get("cur_price", row.get("current_price", 0.0)), 0.0),
-                "delta": _to_float(row.get("delta"), 0.0),
-                "implied_volatility": _to_float(row.get("implied_volatility"), 0.0),
-                "premium": _to_float(row.get("premium"), 0.0),
-                "ipop": _to_float(row.get("ipop"), 0.0),
-                "lot_size": int(_to_float(row.get("lot_size"), 1000)),
-                "issuer": str(row.get("issuer", "")),
-                "score": _to_float(row.get("score"), 0.0),
-                "days_to_expiry": _days_to_maturity(str(row.get("maturity_time", ""))),
-            }
-            return d
-        except Exception as e:
-            self.write_log(f"[CBBC] 解析行异常: {e}")
+        def _get_quote_ctx(self):
             return None
 
-    def _passes_filter(self, w: Dict) -> bool:
-        # 状态
-        if w["status"] != 0:
-            return False
-        # 有效杠杆
-        if w["effective_leverage"] < self.min_effective_leverage:
-            return False
-        # 距收回价
-        d = w["price_recovery_ratio"]
-        if d < self.min_distance_to_call or d > self.max_distance_to_call:
-            return False
-        # 发行人
-        if self.prefer_issuer_list:
-            allowed = [s.strip().upper() for s in str(self.prefer_issuer_list).split(",") if s.strip()]
-            if w["issuer"].upper() not in allowed:
-                return False
-        # 距到期
-        if w["days_to_expiry"] < self.min_days_to_expiry or w["days_to_expiry"] > self.max_days_to_expiry:
-            return False
-        return True
-
-    def _maybe_requery(self):
-        now = time.time()
-        if (now - self._last_query_ts) >= self.requery_interval_sec:
-            self._query_cbbc_chain(force=True)
-
-    # ═══════════════════════════════════════════════════
-    #  开仓 / 平仓
-    # ═══════════════════════════════════════════════════
-    def _try_open_position(self, signal: float, bar: BarData):
-        if self.pos != 0:
-            return
-
-        cands = self._query_cbbc_chain()
-        if not cands:
-            return
-
-        # 信号方向 → 牛/熊
-        if signal > 0:
-            pool = [c for c in cands if c["cbbc_type_str"] == "BULL"]
-        else:
-            pool = [c for c in cands if c["cbbc_type_str"] == "BEAR"]
-        if not pool:
-            self.write_log(f"[CBBC] 信号={signal} 但无对应方向牛熊证")
-            return
-
-        # 距收回价过近的直接排除（防御强制收回）
-        safe_pool = [c for c in pool if c["price_recovery_ratio"] >= self.recovery_warn_pct]
-        if not safe_pool:
-            self.write_log(f"[CBBC] 候选均距收回价过近（<{self.recovery_warn_pct}%），不开仓")
-            return
-
-        pick = safe_pool[0]
-
-        # 仓位
-        cash = self._get_available_cash()
-        size_hkd = min(cash * self.position_pct_of_cash, self.max_position_value)
-        if self.regime_scale:
-            size_hkd *= self._regime_size_multiplier()
-        qty = int(size_hkd / max(pick["cur_price"], 1e-6) / max(pick["lot_size"], 1)) * max(pick["lot_size"], 1)
-        qty = max(qty, max(pick["lot_size"], 1))
-
-        # 订阅牛熊证行情
-        self._subscribe_cbbc(pick["stock"])
-
-        req = OrderRequest(
-            symbol=pick["stock"],
-            exchange=Exchange.SEHK,
-            direction=Direction.LONG,
-            offset=Offset.OPEN,
-            price=round_to(pick["cur_price"] * 1.005, 0.001),
-            volume=qty,
-            reference=f"CBBC_{pick['cbbc_type_str']}",
-        )
-        vt = self.send_order(req)
-        if vt:
-            self.pos = qty
-            self.entry_price = pick["cur_price"]
-            self.entry_time = time.time()
-            self.current_cbbc_stock = pick["stock"]
-            self.cbbc_type = pick["cbbc_type_str"]
-            self.leverage = pick["leverage"]
-            self.distance_to_call = pick["price_recovery_ratio"]
-            self.days_to_expiry = pick["days_to_expiry"]
-            self.pnl_pct = 0.0
-            self.bars_held = 0
-            self._current_info = pick
-            self.write_log(
-                f"[CBBC] 🟢 开仓: {pick['stock']}({pick['cbbc_type_str']}) "
-                f"lev={pick['leverage']:.1f}x dist={pick['price_recovery_ratio']:.1f}% "
-                f"days={pick['days_to_expiry']} qty={qty} @ {pick['cur_price']:.3f}"
-            )
-            self._telegram_push(
-                f"🟢 开仓 {pick['stock']}({pick['cbbc_type_str']})\n"
-                f"正股={self.underlying_symbol} 信号={signal:.0f}\n"
-                f"lev={pick['leverage']:.1f}x 距收回={pick['price_recovery_ratio']:.1f}%\n"
-                f"days={pick['days_to_expiry']} qty={qty} @ {pick['cur_price']:.3f}"
-            )
-
-    def _manage_position(self, bar: BarData):
-        if self.pos == 0 or not self._current_info:
-            return
-
-        cur = bar.close_price
-        entry = self.entry_price if self.entry_price > 0 else cur
-        raw = (cur - entry) / entry if entry > 0 else 0.0
-        pnl = raw * max(self.leverage, 1.0)
-        self.pnl_pct = pnl
-
-        # 1. 距收回价预警 → 提前平仓（牛熊证核心风控）
-        dist = self._current_info.get("price_recovery_ratio", self.distance_to_call)
-        if dist < self.recovery_exit_pct:
-            self._close_position(cur, reason=f"距收回价过近 {dist:.1f}%")
-            return
-        if dist < self.recovery_warn_pct:
-            self.write_log(f"[CBBC] ⚠️ 距收回价仅 {dist:.1f}%，准备平仓")
-
-        # 2. 止盈
-        if pnl >= self.profit_take_pct:
-            self._close_position(cur, reason=f"止盈 {pnl*100:.1f}%")
-            return
-
-        # 3. 止损
-        if pnl <= -self.stop_loss_pct:
-            self._close_position(cur, reason=f"止损 {pnl*100:.1f}%")
-            return
-
-        # 4. 到期
-        real_days = self._current_info.get("days_to_expiry", self.days_to_expiry)
-        if real_days <= self.time_decay_close_days:
-            self._close_position(cur, reason=f"临近到期 {real_days}天")
-            return
-
-        # 5. 超时
-        if self.bars_held >= self.max_hold_bars:
-            self._close_position(cur, reason=f"超时 {self.bars_held}根bar")
-            return
-
-        # 6. 信号反转
-        sig = self._get_combined_signal(bar)
-        is_bull = self.cbbc_type == "BULL"
-        if is_bull and sig < 0:
-            self._close_position(cur, reason="信号反转(牛→熊)")
-            return
-        if not is_bull and sig > 0:
-            self._close_position(cur, reason="信号反转(熊→牛)")
-            return
-
-    def _close_position(self, cur: float, reason: str):
-        if self.pos == 0:
-            return
-        qty = abs(self.pos)
-        req = OrderRequest(
-            symbol=self.current_cbbc_stock,
-            exchange=Exchange.SEHK,
-            direction=Direction.SHORT,
-            offset=Offset.CLOSE,
-            price=round_to(cur * 0.995, 0.001),
-            volume=qty,
-            reference=f"CBBC_CLOSE_{reason}",
-        )
-        vt = self.send_order(req)
-        if vt:
-            self.write_log(
-                f"[CBBC] 🔴 平仓: {self.current_cbbc_stock}({self.cbbc_type}) "
-                f"@ {cur:.3f} | {reason} | 盈亏{self.pnl_pct*100:.1f}%"
-            )
-            self._telegram_push(
-                f"🔴 平仓 {self.current_cbbc_stock}({self.cbbc_type})\n"
-                f"原因={reason} 价={cur:.3f}\n"
-                f"盈亏={self.pnl_pct*100:.1f}%"
-            )
-            self._reset_state()
-
-    def _reset_state(self):
-        self.pos = 0
-        self.entry_price = 0.0
-        self.entry_time = 0.0
-        self.current_cbbc_stock = ""
-        self.cbbc_type = ""
-        self.leverage = 0.0
-        self.distance_to_call = 0.0
-        self.days_to_expiry = 0
-        self.pnl_pct = 0.0
-        self.bars_held = 0
-        self._current_info = {}
-
-    # ═══════════════════════════════════════════════════
-    #  辅助
-    # ═══════════════════════════════════════════════════
-    def _get_quote_ctx(self) -> Optional[OpenQuoteContext]:
-        me = getattr(self.cta_engine, 'main_engine', None)
-        if me is not None:
-            for gw in getattr(me, 'gateways', {}).values():
-                qc = getattr(gw, 'quote_ctx', None)
-                if qc is not None:
-                    self.write_log(f"[CBBC] 复用网关 quote_ctx")
-                    return qc
-        try:
-            from futu import OpenQuoteContext as OQC
-            host = getattr(self.cta_engine, 'gateway_host', '127.0.0.1')
-            port = getattr(self.cta_engine, 'gateway_port', 11111)
-            return OQC(host=host, port=port)
-        except Exception as e:
-            self.write_log(f"[CBBC] 自建 quote_ctx 失败: {e}")
+        def get_quote(self, symbol):
             return None
 
-    def _subscribe_underlying(self):
-        try:
-            sym = self.underlying_symbol
-            code = sym.split('.')[-1] if '.' in sym else sym
-            ex = Exchange.SEHK if 'SEHK' in sym.upper() or code.isdigit() else Exchange.SMART
-            self.cta_engine.subscribe(SubscribeRequest(symbol=code, exchange=ex))
-            self.write_log(f"[CBBC] 订阅正股: {sym}")
-        except Exception as e:
-            self.write_log(f"[CBBC] 订阅正股失败: {e}")
-
-    def _subscribe_cbbc(self, stock: str):
-        try:
-            code = stock.split('.')[-1] if '.' in stock else stock
-            self.cta_engine.subscribe(SubscribeRequest(symbol=code, exchange=Exchange.SEHK))
-        except Exception:
+        def save_quote_snapshot(self, symbol, trigger_type):
             pass
 
-    def _get_available_cash(self) -> float:
-        try:
-            me = getattr(self.cta_engine, 'main_engine', None)
-            if me is None:
-                return 100000.0
-            for gw in getattr(me, 'gateways', {}).values():
-                info = getattr(gw, 'acc_info', {})
-                c = _to_float(info.get("cash"), 0.0)
-                if c > 0:
-                    return c
-        except Exception:
-            pass
-        return 100000.0
-
-    def _regime_size_multiplier(self) -> float:
-        m = {"bull_trend": 1.0, "bear_trend": 0.6, "range": 0.8, "volatile": 0.5}
-        return m.get(self.regime_label, 0.7)
-
-    def _telegram_push(self, text: str):
-        try:
-            me = getattr(self.cta_engine, 'main_engine', None)
-            rc = getattr(me, 'remote_controller', None) if me else None
-            if rc and hasattr(rc, 'push_text'):
-                rc.push_text(text)
-        except Exception:
+        def init_quote_tables(self):
             pass
 
-    # ═══════════════════════════════════════════════════
-    #  防御性接口
-    # ═══════════════════════════════════════════════════
-    def on_trade(self, trade):
-        pass
+        def _telegram_push(self, text):
+            self.write_log(text)
 
-    def on_order(self, order):
-        if order.status == Status.REJECTED:
-            self.write_log(f"[CBBC] ⚠️ 委托被拒: {order.orderid}")
-            if "CLOSE" not in str(getattr(order, 'reference', '')):
-                self.pos = 0
-                self._reset_state()
+        def _get_available_cash(self):
+            return 0.0

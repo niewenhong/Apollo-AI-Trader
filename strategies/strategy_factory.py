@@ -1,10 +1,12 @@
 """
 strategies/strategy_factory.py - v2.9.4
 策略工厂：统一注册、创建、管理所有策略类
+
 v2.9.4 更新：
-- 注册全部 15 个策略（equity 6 + futures 1 + options 8 + structured 2）
+- 注册全部 17 个策略（equity 6 + futures 1 + options 8 + structured 2 + ipo 1）
 - 每个策略标注 metadata（市场、类型、依赖数据）
 - needs_tick / needs_kline 用于按需订阅
+- v2.9.4：所有策略统一为只订阅 tick + 1M bar
 """
 import importlib
 import logging
@@ -101,7 +103,6 @@ class StrategyFactory:
         return defaults
 
     def get_all_metadata(self) -> Dict[str, dict]:
-        """返回所有已注册策略的元数据"""
         return dict(self._metadata)
 
 
@@ -116,7 +117,7 @@ try:
         "market": ["US", "HK"],
         "type": "equity",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M", "60M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -140,7 +141,7 @@ try:
         "market": ["US", "HK"],
         "type": "equity",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -152,7 +153,7 @@ try:
         "market": ["US", "HK"],
         "type": "equity",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M", "60M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -164,7 +165,7 @@ try:
         "market": ["US", "HK"],
         "type": "equity",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -176,7 +177,7 @@ try:
         "market": ["US", "HK"],
         "type": "equity",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -189,7 +190,7 @@ try:
         "market": ["US"],
         "type": "futures",
         "needs_tick": False,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -202,7 +203,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -214,7 +215,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -226,7 +227,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -238,7 +239,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -250,7 +251,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -262,7 +263,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -274,7 +275,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -286,7 +287,7 @@ try:
         "market": ["US"],
         "type": "options",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -299,7 +300,7 @@ try:
         "market": ["HK"],
         "type": "structured",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass
@@ -307,11 +308,24 @@ except ImportError:
 try:
     from strategies.structured_products.cbbc_strategy import CBBCStrategy
     factory.register(CBBCStrategy, {
-        "description": "牛熊证专用策略（距收回价防御+杠杆估值+Regime缩放）",
+        "description": "牛熊证专用策略（距收回价防御+杠杆估值+Regime缩放+Tick实时检查）",
         "market": ["HK"],
         "type": "structured",
         "needs_tick": True,
-        "needs_kline": ["1M", "5M"],
+        "needs_kline": ["1M"],
+    })
+except ImportError:
+    pass
+
+# ========== IPO 策略注册 ==========
+try:
+    from strategies.ipo.ipo_strategy import IPOStrategy
+    factory.register(IPOStrategy, {
+        "description": "新股申购+首日交易策略",
+        "market": ["US", "HK"],
+        "type": "ipo",
+        "needs_tick": True,
+        "needs_kline": ["1M"],
     })
 except ImportError:
     pass

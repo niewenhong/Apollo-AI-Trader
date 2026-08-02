@@ -1,31 +1,16 @@
 """
-kline_provider.py — 统一的历史K线数据提供者（带内存缓存 + 限频保护）
-====================================================================
-设计目标：
-  1. 选股器 / StockDiagnosis / RegimeTrainer / StrategyGenerator
-     全部通过本模块取历史K线，禁止各自直接调 request_history_kline。
-  2. 同一进程内，同一 (vt_symbol, ktype, days) 只请求富途一次，
-     后续全部命中内存缓存，彻底杜绝重复请求触发的限频。
-  3. 内置 vt_symbol ↔ 富途代码 的双向转换，不再依赖外部模块。
-  4. 三返回值解包统一用 ret, data, *_ ，永不再出
-     "too many values to unpack" 错误。
-  5. 请求间自动插入间隔（默认 0.35s），保证 30 秒窗口内
-     远不会超过 60 次限制。
-
-使用方式：
-  kp = KlineProvider(quote_ctx=us_ctx, market="US")
-  df = kp.get_daily(symbol)              # 日K，默认 120 根
-  df = kp.get(symbol, ktype=KLType.K_60M, days=300)  # 任意周期
-  diag_input = kp.get_for_diagnosis(symbol)   # 返回 200 根日K DataFrame
-  regime_input = kp.get_for_regime(symbol)     # 返回 120 根日K DataFrame
-
-返回 DataFrame 列：
-  time_key | open | high | low | close | volume | turnover
+core/kline_provider.py — 统一的历史K线数据提供者（带内存缓存 + 限频保护 + 重试）
+================================================================================
+v1.5 最终修复：
+  - 修复 symbol 格式转换（去掉 .SMART / .SEHK 后缀）
+  - 空 DataFrame 也写入缓存（TTL 30 秒），避免重复请求
+  - 增加返回行数日志，便于排查
+  - 预热时机移到合约就绪后（配合 main.py 修改）
 """
 
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 import pandas as pd
 
 try:
@@ -49,132 +34,117 @@ except ImportError:
 
 
 # ---------- 常量 ----------
-DEFAULT_DAILY_DAYS = 120        # 默认日K 根数
-REQUEST_INTERVAL_SEC = 0.35      # 两次富途请求之间的最小间隔
-CONNECT_TIMEOUT_SEC = 5.0        # 连接检测超时（保留接口）
-STALE_CACHE_SEC = 60             # 同一只票缓存有效期（秒）
+DEFAULT_DAILY_DAYS = 120
+REQUEST_INTERVAL_SEC = 0.35
+STALE_CACHE_SEC = 60          # 正常缓存的 TTL（秒）
+EMPTY_CACHE_SEC = 30          # 空数据缓存的 TTL（秒），避免频繁请求
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 0.5
 
 
 class KlineProvider:
-    """
-    统一的历史K线提供者。
-    线程不安全（vnpy 主线程内使用即可），进程内单例。
-    """
+    """统一的历史K线提供者。进程内单例，类级缓存共享。"""
 
-    # 类级缓存（同一进程所有模块共享）
     _cache: Dict[Tuple[str, str, int], Tuple[float, pd.DataFrame]] = {}
     _last_request_ts: float = 0.0
 
     def __init__(self, quote_ctx, market: str = "US",
                  request_interval: float = REQUEST_INTERVAL_SEC,
-                 auto_type: str = "QFQ"):
-        """
-        Parameters
-        ----------
-        quote_ctx : futu.OpenQuoteContext 或任何提供 request_history_kline 的对象
-        market : "US" | "HK"  仅用于默认 universe 和日志提示
-        request_interval : 两次真实请求之间的最小间隔（秒）
-        auto_type : 复权类型 "QFQ" / "HFQ" / "NONE"
-        """
+                 auto_type: str = "QFQ",
+                 max_retries: int = MAX_RETRIES):
         self.ctx = quote_ctx
         self.market = market
         self.request_interval = request_interval
         self.auto_type = auto_type
+        self.max_retries = max_retries
         self._stats = {"hits": 0, "misses": 0, "errors": 0}
 
     # ==================== 公开 API ====================
 
     def get(self, vt_symbol: str, ktype: str = KLType.K_DAY,
             days: int = DEFAULT_DAILY_DAYS) -> pd.DataFrame:
-        """
-        获取任意周期的K线。
-        返回标准化 DataFrame，空 DataFrame 表示失败（调用方降级处理）。
-        """
         cache_key = self._make_key(vt_symbol, ktype, days)
 
-        # 1. 命中缓存且未过期
+        # 1. 查缓存
         cached = self._cache.get(cache_key)
         if cached is not None:
             ts, df = cached
-            if time.time() - ts < STALE_CACHE_SEC and not df.empty:
+            age = time.time() - ts
+            ttl = STALE_CACHE_SEC if not df.empty else EMPTY_CACHE_SEC
+            if age < ttl:
                 self._stats["hits"] += 1
                 return df.copy()
+            else:
+                del self._cache[cache_key]
 
-        # 2. 缓存未命中 → 请求富途
+        # 2. 缓存未命中，回源
         self._stats["misses"] += 1
         df = self._fetch_from_futu(vt_symbol, ktype, days)
 
-        # 存入缓存（即使是空 DF 也缓存，避免反复踩坑）
-        self._cache[cache_key] = (time.time(), df)
+        # ★ 无论是否为空，都写入缓存（空数据 TTL 较短）
+        if df is not None:
+            self._cache[cache_key] = (time.time(), df)
+        else:
+            self._stats["errors"] += 1
+            self._cache[cache_key] = (time.time(), pd.DataFrame())
         return df.copy()
 
     def get_daily(self, vt_symbol: str,
                   days: int = DEFAULT_DAILY_DAYS) -> pd.DataFrame:
-        """日K 快捷方法（最常用）。"""
         return self.get(vt_symbol, ktype=KLType.K_DAY, days=days)
 
     def get_for_diagnosis(self, vt_symbol: str) -> pd.DataFrame:
-        """
-        给 StockDiagnosis 用的 200 根日K。
-        返回列：同 get()，空 DF 时诊断模块应走降级。
-        """
         return self.get(vt_symbol, ktype=KLType.K_DAY, days=200)
 
     def get_for_regime(self, vt_symbol: str) -> pd.DataFrame:
-        """
-        给 RegimeTrainer 用的 120 根日K。
-        """
         return self.get(vt_symbol, ktype=KLType.K_DAY, days=120)
 
     def get_for_selector(self, vt_symbol: str) -> pd.DataFrame:
-        """
-        给 AIStockSelector 用的 120 根日K。
-        """
         return self.get(vt_symbol, ktype=KLType.K_DAY, days=120)
 
-    def get_weekly(self, vt_symbol: str,
-                   weeks: int = 100) -> pd.DataFrame:
-        """周K，给趋势/52周高低点用。"""
+    def get_weekly(self, vt_symbol: str, weeks: int = 100) -> pd.DataFrame:
         return self.get(vt_symbol, ktype=KLType.K_WEEK, days=weeks * 7)
 
-    def get_intraday(self, vt_symbol: str, ktype: str,
-                     days: int = 5) -> pd.DataFrame:
-        """分钟级K线（1M/5M/15M/30M/60M）。days 控制回看自然日。"""
+    def get_intraday(self, vt_symbol: str, ktype: str, days: int = 5) -> pd.DataFrame:
         return self.get(vt_symbol, ktype=ktype, days=days)
 
     # ==================== 符号转换 ====================
-
     @staticmethod
     def vt_to_futu(vt_symbol: str) -> str:
         """
-        vt_symbol → 富途代码。
-        例：
-          AAPL.SMART  → US.AAPL
-          00700.SEHK   → HK.00700
-          US.NVDA      → US.NVDA   (已是富途格式，原样返回)
+        将任意格式的 vt_symbol 转换为富途认可的股票代码。
+        支持格式：
+        - AAPL.SMART          → US.AAPL
+        - US.AAPL.SMART       → US.AAPL
+        - US.AAPL             → US.AAPL
+        - 00700.SEHK          → HK.00700
+        - HK.00700.SEHK       → HK.00700
+        - HK.00700            → HK.00700
+        - NVDA                → US.NVDA（无后缀时自动补 US.）
         """
-        if vt_symbol.startswith(("US.", "HK.", "SH.", "SZ.")):
-            return vt_symbol
+        # 1. 如果已带市场前缀（US./HK./SH./SZ.），先去掉后缀
+        for prefix in ("US.", "HK.", "SH.", "SZ."):
+            if vt_symbol.startswith(prefix):
+                rest = vt_symbol[len(prefix):]
+                if "." in rest:
+                    sym, _ = rest.rsplit(".", 1)
+                    return f"{prefix}{sym}"
+                return vt_symbol
+
+        # 2. 不带市场前缀，但有交易所后缀
         if "." not in vt_symbol:
-            # 纯代码，按 market 猜
             return f"US.{vt_symbol}"
+
         sym, exch = vt_symbol.rsplit(".", 1)
         exch_upper = exch.upper()
         if exch_upper in ("SMART", "NASDAQ", "NYSE", "AMEX"):
             return f"US.{sym}"
         if exch_upper in ("SEHK", "HKEX"):
             return f"HK.{sym}"
-        # 兜底
         return f"US.{sym}"
 
     @staticmethod
     def futu_to_vt(code: str) -> str:
-        """
-        富途代码 → vt_symbol。
-        例：
-          US.AAPL → AAPL.SMART
-          HK.00700 → 00700.SEHK
-        """
         if code.startswith("US."):
             return code.split(".", 1)[1] + ".SMART"
         if code.startswith("HK."):
@@ -184,69 +154,115 @@ class KlineProvider:
     # ==================== 内部方法 ====================
 
     def _make_key(self, vt_symbol: str, ktype: str, days: int) -> tuple:
-        # 统一用富途代码做 key，避免 AAPL.SMART / US.AAPL 被视为不同
         futu_code = self.vt_to_futu(vt_symbol)
         return (futu_code, ktype, days)
 
     def _fetch_from_futu(self, vt_symbol: str,
                          ktype: str, days: int) -> pd.DataFrame:
-        """真正打富途接口，含限频间隔、三返回值解包、标准化。"""
         if self.ctx is None:
-            self._stats["errors"] += 1
+            print(f"[KlineProvider] {vt_symbol} ctx 为 None")
             return pd.DataFrame()
 
         futu_code = self.vt_to_futu(vt_symbol)
 
-        # 限频保护：保证两次请求间隔 ≥ request_interval
+        # 限频
         now = time.time()
         elapsed = now - self.__class__._last_request_ts
         if elapsed < self.request_interval:
             time.sleep(self.request_interval - elapsed)
 
-        # 计算日期范围（多拉 1.5 倍自然日，过滤周末/假日）
         end = datetime.now()
         start = end - timedelta(days=int(days * 1.5))
         max_count = max(days * 2, 300)
 
-        try:
-            ret, k, *_ = self.ctx.request_history_kline(
-                futu_code,
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                ktype=ktype,
-                autype=getattr(AuType, self.auto_type, AuType.QFQ),
-                max_count=max_count,
-            )
-        except Exception as e:
-            print(f"[KlineProvider] {futu_code} 请求异常: {e}")
-            self._stats["errors"] += 1
-            self.__class__._last_request_ts = time.time()
-            return pd.DataFrame()
+        last_err = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                ret, k, *_ = self.ctx.request_history_kline(
+                    futu_code,
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    ktype=ktype,
+                    autype=getattr(AuType, self.auto_type, AuType.QFQ),
+                    max_count=max_count,
+                )
+                self.__class__._last_request_ts = time.time()
 
-        self.__class__._last_request_ts = time.time()
+                if ret == RET_OK and k is not None:
+                    rows = len(k) if not k.empty else 0
+                    print(f"[KlineProvider] {futu_code} {ktype} 返回 {rows} 行")
+                    if rows > 0:
+                        needed = ["time_key", "open", "high", "low", "close", "volume"]
+                        if "turnover" in k.columns:
+                            needed.append("turnover")
+                        df = k[needed].copy()
+                        df.sort_values("time_key", inplace=True)
+                        df.reset_index(drop=True, inplace=True)
+                        if len(df) > days:
+                            df = df.iloc[-days:].reset_index(drop=True)
+                        return df
+                    else:
+                        print(f"[KlineProvider] {futu_code} {ktype} 数据为空，将缓存空数据")
+                        return pd.DataFrame()
+                else:
+                    last_err = f"ret={ret}, data={k}"
+                    if ret != RET_OK:
+                        print(f"[KlineProvider] {futu_code} 请求失败: {k}")
 
-        if ret != RET_OK or k is None or k.empty:
-            self._stats["errors"] += 1
-            return pd.DataFrame()
+            except Exception as e:
+                last_err = f"异常: {e}"
+                print(f"[KlineProvider] {futu_code} 请求异常: {e}")
+                self.__class__._last_request_ts = time.time()
 
-        # 标准化列 & 排序
-        needed = ["time_key", "open", "high", "low", "close", "volume"]
-        if "turnover" in k.columns:
-            needed.append("turnover")
-        df = k[needed].copy()
-        df.sort_values("time_key", inplace=True)
-        df.reset_index(drop=True, inplace=True)
+            if attempt < self.max_retries:
+                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(f"[KlineProvider] {futu_code} {ktype} 第{attempt}次失败，{wait:.1f}s 后重试 | {last_err}")
+                time.sleep(wait)
 
-        # 截断到需要的根数
-        if len(df) > days:
-            df = df.iloc[-days:].reset_index(drop=True)
+        print(f"[KlineProvider] {futu_code} {ktype} 全部{self.max_retries}次失败 | {last_err}")
+        return pd.DataFrame()
 
-        return df
+    # ==================== 批量预热 ====================
+
+    def preload(self, vt_symbols: list, ktype: str = KLType.K_DAY,
+                days: int = DEFAULT_DAILY_DAYS):
+        print(f"[KlineProvider] 预热 {len(vt_symbols)} 只, ktype={ktype}, days={days}")
+        for sym in vt_symbols:
+            self.get(sym, ktype=ktype, days=days)
+        s = self.stats()
+        print(f"[KlineProvider] 预热完成: hits={s['hits']} misses={s['misses']} "
+              f"errors={s['errors']} hit_rate={s['hit_rate_pct']}%")
+
+    def preload_for_subscription_plan(self, vt_symbols: List[str],
+                                       subtypes: List[str],
+                                       days_override: Optional[dict] = None):
+        subtype_to_ktype = {
+            "K_1M": KLType.K_1M, "K_5M": KLType.K_5M, "K_15M": KLType.K_15M,
+            "K_30M": KLType.K_30M, "K_60M": KLType.K_60M, "K_DAY": KLType.K_DAY,
+        }
+        default_days = {
+            KLType.K_1M: 2, KLType.K_5M: 10, KLType.K_15M: 30,
+            KLType.K_30M: 45, KLType.K_60M: 60, KLType.K_DAY: 120,
+        }
+        if days_override:
+            default_days.update(days_override)
+
+        for st in subtypes:
+            ktype = subtype_to_ktype.get(st)
+            if ktype is None:
+                continue
+            days = default_days.get(ktype, 30)
+            print(f"[KlineProvider] 预热 {len(vt_symbols)} 只, ktype={st}, days={days}")
+            for sym in vt_symbols:
+                self.get(sym, ktype=ktype, days=days)
+        s = self.stats()
+        print(f"[KlineProvider] 按订阅计划预热完成: "
+              f"hits={s['hits']} misses={s['misses']} "
+              f"errors={s['errors']} hit_rate={s['hit_rate_pct']}%")
 
     # ==================== 统计 / 调试 ====================
 
     def stats(self) -> dict:
-        """返回缓存命中统计，便于日志/监控。"""
         total = self._stats["hits"] + self._stats["misses"]
         hit_rate = (self._stats["hits"] / total * 100) if total else 0
         return {
@@ -257,21 +273,5 @@ class KlineProvider:
         }
 
     def clear_cache(self):
-        """手动清空缓存（换交易日/盘前刷新时用）。"""
         self._cache.clear()
         self._stats = {"hits": 0, "misses": 0, "errors": 0}
-
-    def preload(self, vt_symbols: list, ktype: str = KLType.K_DAY,
-                days: int = DEFAULT_DAILY_DAYS):
-        """
-        批量预热：流水线启动前一次性把所需K线拉满缓存。
-        之后所有模块调用 get() 全部命中缓存，零额外请求。
-        """
-        print(f"[KlineProvider] 预热 {len(vt_symbols)} 只, "
-              f"ktype={ktype}, days={days}")
-        for sym in vt_symbols:
-            self.get(sym, ktype=ktype, days=days)
-        s = self.stats()
-        print(f"[KlineProvider] 预热完成: "
-              f"hits={s['hits']} misses={s['misses']} "
-              f"errors={s['errors']} hit_rate={s['hit_rate_pct']}%")

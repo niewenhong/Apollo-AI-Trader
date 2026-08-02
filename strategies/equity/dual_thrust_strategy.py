@@ -1,27 +1,21 @@
 """
-strategies/equity/dual_thrust_strategy.py - v2.9.0
-Dual Thrust 开盘区间突破 + 多周期确认 + Regime 感知
-v2.9.0 优化：
-- 继承 ApolloBaseStrategy
-- 用 1M K线驱动（已订阅），不再合成
-- ATR 动态区间 + 突破确认用 5M 收盘
-- 反转逻辑 + 移动止盈
-- 超时 + 止损
+strategies/equity/dual_thrust_strategy.py - v3.1.4
+Dual Thrust 开盘区间突破 + 多周期确认 + Regime感知
+继承 BaseStrategy，启动交易保护
 """
 import numpy as np
 
-from vnpy.trader.object import BarData, TickData
-from vnpy.trader.constant import Direction
+from vnpy.trader.object import BarData, TradeData
 
-from strategies.base_strategy import ApolloBaseStrategy
+from strategies.base_strategy import BaseStrategy
 
 
-class DualThrustStrategy(ApolloBaseStrategy):
-    """Dual Thrust 开盘区间突破（v2.9.0）"""
+class DualThrustStrategy(BaseStrategy):
+    """Dual Thrust 开盘区间突破（v3.1.4）"""
 
     author = "Apollo"
 
-    parameters = ApolloBaseStrategy.parameters + [
+    parameters = BaseStrategy.parameters + [
         "lookback_period",
         "kshort",
         "klong",
@@ -31,14 +25,14 @@ class DualThrustStrategy(ApolloBaseStrategy):
         "session_open_minute",
         "use_5m_confirm",
     ]
-    variables = ApolloBaseStrategy.variables + [
+    variables = BaseStrategy.variables + [
         "upper_band", "lower_band",
         "range_val", "open_price",
         "_5m_breakout_up", "_5m_breakout_down",
     ]
 
     DEFAULTS = {
-        **ApolloBaseStrategy.DEFAULTS,
+        **BaseStrategy.DEFAULTS,
         "lookback_period": 10,
         "kshort": 0.5,
         "klong": 0.5,
@@ -126,7 +120,7 @@ class DualThrustStrategy(ApolloBaseStrategy):
                 self.write_log(f"⏰ DT超时(空) @ {close:.2f}")
                 return
 
-        # 开仓（需 5M 确认 + Regime）
+        # 开仓（需5M确认 + Regime）
         else:
             if self.use_5m_confirm and not (self._5m_breakout_up or self._5m_breakout_down):
                 return
@@ -134,6 +128,8 @@ class DualThrustStrategy(ApolloBaseStrategy):
                 return
             allow_open, _ = self.check_time_window(bar.datetime)
             if not allow_open:
+                return
+            if not getattr(self, '_trading_allowed', False):
                 return
 
             if close > self.upper_band:
@@ -149,7 +145,6 @@ class DualThrustStrategy(ApolloBaseStrategy):
         if not self.am_5m.inited:
             return
         close = bar.close_price
-        # 用 5M 收盘价确认突破（过滤 1M 噪音）
         if self.range_val > 0:
             self._5m_breakout_up = close > (self.open_price + self.range_val * self.kshort)
             self._5m_breakout_down = close < (self.open_price - self.range_val * self.klong)
@@ -168,10 +163,10 @@ class DualThrustStrategy(ApolloBaseStrategy):
         self.lower_band = self.open_price - self.range_val * self.klong
 
     def _is_session_open(self, bar_datetime) -> bool:
-        h = bar_datetime.hour if hasattr(bar_datetime, 'hour') else 0
-        m = bar_datetime.minute if hasattr(bar_datetime, 'minute') else 0
+        h = getattr(bar_datetime, 'hour', 0)
+        m = getattr(bar_datetime, 'minute', 0)
         return (h == self.session_open_hour and m >= self.session_open_minute)
 
-    def on_trade(self, trade):
+    def on_trade(self, trade: TradeData):
         super().on_trade(trade)
         self.write_log(f"💰 DT成交: {trade.direction.name} {trade.volume}@{trade.price:.2f}")
