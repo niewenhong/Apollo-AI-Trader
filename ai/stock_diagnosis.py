@@ -155,24 +155,37 @@ class StockDiagnosis:
         mf = d.get("money", {}) or {}
         tr = d.get("trend", {}) or {}
 
-        if t.get("bullish"): parts.append("多头排列")
-        if t.get("above_ma20"): parts.append("站上MA20")
-        if t.get("rsi"): rsi = t["rsi"]
-        if rsi > 70: parts.append(f"RSI超买{rsi:.0f}")
-        elif rsi < 30: parts.append(f"RSI超卖{rsi:.0f}")
-        elif 40 < rsi < 60: parts.append(f"RSI中性{rsi:.0f}")
+        # 安全获取 rsi
+        rsi = t.get("rsi", 50.0)
+        if rsi > 70:
+            parts.append(f"RSI超买{rsi:.0f}")
+        elif rsi < 30:
+            parts.append(f"RSI超卖{rsi:.0f}")
+        elif 40 < rsi < 60:
+            parts.append(f"RSI中性{rsi:.0f}")
+
+        if t.get("bullish"):
+            parts.append("多头排列")
+        if t.get("above_ma20"):
+            parts.append("站上MA20")
 
         net = mf.get("net", 0.0)
-        if net > 0: parts.append(f"资金流入{net:,.0f}")
-        elif net < 0: parts.append(f"资金流出{abs(net):,.0f}")
+        if net > 0:
+            parts.append(f"资金流入{net:,.0f}")
+        elif net < 0:
+            parts.append(f"资金流出{abs(net):,.0f}")
 
         p = tr.get("pos", 0.5)
-        if p > 0.7: parts.append(f"52周高位{p*100:.0f}%")
-        elif p < 0.3: parts.append(f"52周低位{p*100:.0f}%")
+        if p > 0.7:
+            parts.append(f"52周高位{p*100:.0f}%")
+        elif p < 0.3:
+            parts.append(f"52周低位{p*100:.0f}%")
 
         trend = tr.get("trend", "")
-        if trend == "up": parts.append("周线偏多")
-        elif trend == "down": parts.append("周线偏空")
+        if trend == "up":
+            parts.append("周线偏多")
+        elif trend == "down":
+            parts.append("周线偏空")
 
         return ";".join(parts) if parts else "无明显信号"
 

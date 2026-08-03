@@ -1,5 +1,6 @@
 """
-core/strategy_engine.py - Apollo Trader v3.1.4 双引擎版（严格幂等 + 状态追踪 + 外部 Advisor）
+core/strategy_engine.py - Apollo Trader v3.1.5 双引擎增强版
+（严格幂等 + 状态追踪 + 外部 Advisor + 衍生品自动K线订阅 + 类映射完备）
 """
 import importlib
 import json
@@ -8,6 +9,7 @@ import threading
 import logging
 import traceback
 import hashlib
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -15,9 +17,11 @@ from vnpy.trader.engine import MainEngine
 from vnpy.trader.constant import Exchange
 from vnpy_ctastrategy.engine import CtaEngine
 
+from core.strategy_generator import StrategyGenerator
 from core.db_manager import DBManager
 from core.prelive_gate import PreliveGate
 from ai.param_advisor import ParamAdvisor
+
 
 logger = logging.getLogger("StrategyEngine")
 
@@ -29,6 +33,7 @@ class StrategyEngine:
     }
 
     CLASS_MODULE_MAP = {
+        # 权益类
         "MultiIndicatorStrategy": "strategies.equity.multi_indicator_strategy",
         "DualThrustStrategy": "strategies.equity.dual_thrust_strategy",
         "GridStrategy": "strategies.equity.grid_strategy",
@@ -36,7 +41,24 @@ class StrategyEngine:
         "VWAPStrategy": "strategies.equity.vwap_strategy",
         "OrderFlowStrategy": "strategies.equity.order_flow_strategy",
         "TickOrderFlowStrategy": "strategies.equity.order_flow_strategy",
+        "MomentumStrategy": "strategies.futures.momentum_strategy",
+        # 期权类
+        "SellCallStrategy": "strategies.options.sell_call_strategy",
+        "SellPutStrategy": "strategies.options.sell_put_strategy",
+        "CashSecuredPutStrategy": "strategies.options.cash_secured_put_strategy",
+        "CoveredCallStrategy": "strategies.options.covered_call_strategy",
+        "BullCallSpreadStrategy": "strategies.options.bull_call_spread_strategy",
+        "BearPutSpreadStrategy": "strategies.options.bear_put_spread_strategy",
+        "IronCondorStrategy": "strategies.options.iron_condor_strategy",
+        "StraddleStrategy": "strategies.options.straddle_strategy",
+        # 衍生品（牛熊证、窝轮）
+        "WarrantStrategy": "strategies.structured_products.warrant_strategy",
+        "CBBCStrategy": "strategies.structured_products.cbbc_strategy",
+        # IPO
+        "IPOStrategy": "strategies.ipo.ipo_strategy",
     }
+
+    DERIVATIVE_KEYWORDS = ["CBBC", "Warrant", "BullBear"]
 
     INIT_WAIT_INTERVAL = 0.1
     INIT_WAIT_TIMEOUT = 15.0
@@ -56,11 +78,10 @@ class StrategyEngine:
         self.quote_ctx = quote_ctx
         self.telegram_bot = None
 
-        self.strategies = {}
-        self._deployed = {}
-
-        # ★ FIX: 新增 sub_manager 属性，由 main.py 注入
+        # 可选注入属性（由 main.py 设置）
         self.sub_manager = None
+        self.kline_provider = None
+        self.matcher = None
 
         gate_cfg = self.config.get("prelive_gate", {})
         self.prelive_gate = PreliveGate(db, thresholds=gate_cfg.get("thresholds"))
@@ -71,6 +92,9 @@ class StrategyEngine:
         self.hot_reload_interval = gate_cfg.get("hot_reload_interval", 600)
         self.backtest_days = gate_cfg.get("backtest_days", 60)
         self.backtest_interval = gate_cfg.get("backtest_interval", "1m")
+
+        self.strategies = {}
+        self._deployed = {}
 
         self._hot_reload_stop = threading.Event()
         self._init_cta_engines()
@@ -146,20 +170,51 @@ class StrategyEngine:
         self.boot(configs=db_configs, operator="system:bootstrap")
 
     def _trigger_pipeline(self):
+        """后备流水线：当 strategy_config 为空时触发一次选股"""
         try:
             from ai.stock_selector import AIStockSelector
-            selector = AIStockSelector(quote_ctx=self.quote_ctx or self._get_quote_ctx(), db=self.db, market="US")
-            selected = selector.select()
+            selector = AIStockSelector(
+                quote_ctx_us=self.quote_ctx or self._get_quote_ctx(),
+                quote_ctx_hk=None,
+                db=self.db,
+                config=self.config,
+            )
+            selected = selector.select_all(markets=["US"])
             logger.info(f"[Pipeline] ✅ 选股完成: {len(selected)} 只")
             if not selected:
                 logger.error("[Pipeline] ❌ 选股返回空")
                 return
-            from core.strategy_generator import StrategyGenerator
-            from core.strategy_matcher import StrategyMatcher
-            matcher = StrategyMatcher(db_path=getattr(self.db, 'db_path', ''))
-            generator = StrategyGenerator(quote_ctx=self.quote_ctx or self._get_quote_ctx(),
-                                          matcher=matcher, param_advisor=self.advisor)
-            written = generator.generate_from_selector(selected)
+
+            # 构造 regime_map（如果 regime_trainer 可用）
+            regime_map = {}
+            if hasattr(self, 'regime_trainer') and self.regime_trainer:
+                for item in selected:
+                    vt = item.get("vt_symbol", "")
+                    if vt:
+                        try:
+                            result = self.regime_trainer.predict(vt)
+                            regime_map[vt] = {
+                                "regime": result.get("regime", "range"),
+                                "confidence": result.get("confidence", 0.5),
+                                "iv_percentile": result.get("iv_percentile", 0.5),
+                            }
+                        except Exception:
+                            regime_map[vt] = {"regime": "range", "confidence": 0.5, "iv_percentile": 0.5}
+            else:
+                for item in selected:
+                    vt = item.get("vt_symbol", "")
+                    if vt:
+                        regime_map[vt] = {"regime": "range", "confidence": 0.5, "iv_percentile": 0.5}
+
+            # StrategyGenerator 真实签名: (quote_ctx, db_path, kline_provider, config)
+            db_path = getattr(self.db, 'db_path', '') or 'data/history.db'
+            generator = StrategyGenerator(
+                quote_ctx=self.quote_ctx or self._get_quote_ctx(),
+                db_path=db_path,
+                kline_provider=getattr(self, 'kline_provider', None),
+                config=self.config,
+            )
+            written = generator.generate(selected, regime_map)
             logger.info(f"[Pipeline] ✅ 策略生成完成: {written} 个写入 strategy_config")
         except Exception as e:
             logger.error(f"[Pipeline] ❌ 流水线触发失败: {e}\n{traceback.format_exc()}")
@@ -177,25 +232,34 @@ class StrategyEngine:
     def _compute_params_hash(params: dict) -> str:
         return hashlib.md5(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
 
-    # ★ FIX: 新增辅助方法，将 vt_symbol 转为富途格式
     @staticmethod
     def _to_futu_symbol(vt_symbol: str, market: str) -> str:
-        """如 AAPL.SMART → US.AAPL ; 00700.SEHK → HK.00700"""
         if not vt_symbol:
             return ""
-        parts = vt_symbol.split(".")
-        if len(parts) == 2:
-            sym, exch = parts
-            if exch.upper() in ("SMART", "NASDAQ", "NYSE"):
-                return f"US.{sym}"
-            elif exch.upper() in ("SEHK", "HKEX"):
-                return f"HK.{sym}"
-        # 如果已经是 US. 或 HK. 开头，直接返回
         if vt_symbol.startswith("US.") or vt_symbol.startswith("HK."):
             return vt_symbol
-        # 默认按 market 补前缀
+        pattern = r'^([A-Z0-9]+)\.(SMART|NASDAQ|NYSE|SEHK|HKEX|HK|US)$'
+        match = re.match(pattern, vt_symbol, re.IGNORECASE)
+        if match:
+            sym = match.group(1)
+            exch = match.group(2).upper()
+            if exch in ("SMART", "NASDAQ", "NYSE", "US"):
+                return f"US.{sym}"
+            elif exch in ("SEHK", "HKEX", "HK"):
+                return f"HK.{sym}"
         prefix = "US." if market == "US" else "HK."
         return f"{prefix}{vt_symbol.replace('.SMART','').replace('.SEHK','')}"
+
+    @staticmethod
+    def _infer_market_from_vt_symbol(vt_symbol: str) -> str:
+        if not vt_symbol:
+            return "US"
+        upper = vt_symbol.upper()
+        if ".SMART" in upper or ".NASDAQ" in upper or ".NYSE" in upper or upper.startswith("US."):
+            return "US"
+        if ".SEHK" in upper or ".HKEX" in upper or upper.startswith("HK."):
+            return "HK"
+        return "US"
 
     def _deploy_to_cta(self, strategy_name: str, class_name: str,
                        vt_symbol: str, params: dict, market: str) -> bool:
@@ -305,13 +369,14 @@ class StrategyEngine:
             self._set_status(strategy_name, "RUNNING", "正常运行中")
             logger.info(f"[StrategyEngine] ✅ {strategy_name} add→init→start 完成 [{market}]")
 
-            # ★ FIX: 部署成功后，向 SubscriptionManager 注册订阅（记录配额）
             if self.sub_manager:
                 futu_symbol = self._to_futu_symbol(vt_symbol, market)
                 if futu_symbol:
-                    # 基础订阅类型：QUOTE（策略运行时需要实时报价）
-                    self.sub_manager.subscribe(futu_symbol, ["QUOTE"])
-                    logger.info(f"[StrategyEngine] ✅ 已向 SubManager 注册订阅: {futu_symbol} QUOTE")
+                    subscribe_types = ["QUOTE"]
+                    if any(kw in class_name for kw in self.DERIVATIVE_KEYWORDS):
+                        subscribe_types.append("K_1M")
+                    self.sub_manager.subscribe(futu_symbol, subscribe_types)
+                    logger.info(f"[StrategyEngine] ✅ 已向 SubManager 注册订阅: {futu_symbol} {subscribe_types}")
             return True
         except Exception as e:
             err = f"部署异常: {e}"
@@ -476,11 +541,9 @@ class StrategyEngine:
                 return symbol, market
         return None, None
 
-    # ==================== 新增方法 ====================
+    # ==================== 公开方法 ====================
     def get_all_strategies(self) -> List[Any]:
-        """返回所有已部署的策略对象列表"""
         return list(self.strategies.values())
-    # =================================================
 
     def start_all(self):
         for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
@@ -595,16 +658,19 @@ class StrategyEngine:
         return self._remove_strategy(strategy_name, operator)
 
     def _remove_strategy(self, strategy_name: str, operator: str) -> bool:
-        # ★ FIX: 移除前先取消订阅
-        if self.sub_manager and strategy_name in self.strategies:
-            strategy_obj = self.strategies[strategy_name]
+        strategy_obj = self.strategies.get(strategy_name)
+        if strategy_obj is not None:
             vt_symbol = getattr(strategy_obj, 'vt_symbol', '')
-            market = 'US'  # 简化，可从策略对象获取
-            if vt_symbol:
-                futu_symbol = self._to_futu_symbol(vt_symbol, market)
-                if futu_symbol:
-                    self.sub_manager.unsubscribe(futu_symbol, ["QUOTE"])
-                    logger.info(f"[StrategyEngine] ✅ 已从 SubManager 注销订阅: {futu_symbol}")
+            market = self._infer_market_from_vt_symbol(vt_symbol)
+        else:
+            vt_symbol = ''
+            market = 'US'
+
+        if self.sub_manager and vt_symbol:
+            futu_symbol = self._to_futu_symbol(vt_symbol, market)
+            if futu_symbol:
+                self.sub_manager.unsubscribe(futu_symbol, ["QUOTE", "K_1M"])
+                logger.info(f"[StrategyEngine] ✅ 已从 SubManager 注销订阅: {futu_symbol}")
 
         for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
             cta = self._get_cta_engine(label)

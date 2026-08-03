@@ -1,181 +1,292 @@
 """
-ai/stock_selector.py — AI选股器 v3.0.2
-==========================================
-v3.0.2 - 接入修复版 KlineProvider（空缓存不再污染，支持重试）
-v3.0.1 - 修复 add_to_pool 调用方式（逐条插入）
-v3.0.0 - 日K 由 Provider 统一拉取+缓存
-功能：技术面+资金面评分，排序后写入 ai_stock_pool。
+ai/stock_selector.py — AI 选股器 v3.3.1
+修复：__init__ 兼容旧版 quote_ctx 参数；去掉美股IPO扫描
 """
-
+import logging
 import time
+import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
+
+import pandas as pd
 import numpy as np
 
-try:
-    from futu import RET_OK
-except ImportError:
-    RET_OK = 0
+from core.regime_trainer import RegimeTrainer
+from core.futu_data_enricher import FutuDataEnricher
 
-from core.kline_provider import KlineProvider
+log = logging.getLogger("StockSelector")
 
 
 class AIStockSelector:
-    def __init__(self, quote_ctx, db=None, top_n: int = 30,
-                 market: str = "US",
-                 kline_provider: Optional[KlineProvider] = None):
-        self.ctx = quote_ctx
+    """AI 选股器：融合异动扫描 + 基本盘评分 + 衍生品链 + IPO"""
+
+    def __init__(self,
+                 quote_ctx_us: Optional[object] = None,
+                 quote_ctx_hk: Optional[object] = None,
+                 enricher: Optional[FutuDataEnricher] = None,
+                 regime_trainer: Optional[RegimeTrainer] = None,
+                 db: Optional[object] = None,
+                 config: Optional[dict] = None,
+                 quote_ctx: Optional[object] = None):   # ← 兼容旧版调用
+        """
+        :param quote_ctx_us: 富途美股行情上下文
+        :param quote_ctx_hk: 富途港股行情上下文
+        :param enricher: 数据增强器
+        :param regime_trainer: 市场状态训练器
+        :param db: DBManager 实例
+        :param config: 配置字典
+        :param quote_ctx: 兼容旧版单一上下文（自动设为 quote_ctx_us）
+        """
+        self.ctx_us = quote_ctx_us or quote_ctx
+        self.ctx_hk = quote_ctx_hk
+        self.enricher = enricher
+        self.regime_trainer = regime_trainer
         self.db = db
-        self.top_n = top_n
-        self.market = market
-        self.min_score = 55.0
-        self.kp = kline_provider
+        self.config = config or {}
 
-    def select(self, universe: Optional[List[str]] = None) -> List[Dict]:
-        if universe is None:
-            universe = self._get_default_universe()
+        # 基本盘股票池（可配置）
+        self.base_pool_us = self.config.get("base_pool_us", [
+            "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AMD","NFLX","BABA",
+            "SPY","QQQ","DIA","IWM","XLE","XLF","XLK","XLV","XLI","XLB"
+        ])
+        self.base_pool_hk = self.config.get("base_pool_hk", [
+            "00700","09988","03690","01810","09999","01211","02382","09618","02015","09888"
+        ])
 
-        # 预热：把本批股票的日K一次性拉满缓存
-        # universe 中的格式为 'US.NVDA'，KlineProvider 会自动转为 'NVDA.SMART' 作为缓存 key
-        if self.kp is not None:
-            self.kp.preload(universe, ktype="K_DAY", days=120)
+        # 异动扫描缓存
+        self._last_scan = 0.0
+        self._scan_cache: List[dict] = []
 
-        scored = []
-        for code in universe:
+    # ========== 对外主接口 ==========
+    def select_all(self, markets: List[str] = None) -> List[dict]:
+        """执行全量选股：异动扫描 + 基本盘 + 衍生品 + IPO"""
+        if markets is None:
+            markets = ["US", "HK"]
+
+        all_candidates = []
+
+        for m in markets:
+            # 1. 基本盘
+            base = self._select_base(m)
+            all_candidates.extend(base)
+
+            # 2. 异动扫描（量比/涨幅/振幅）
+            anomaly = self._scan_anomaly(m)
+            all_candidates.extend(anomaly)
+
+            # 3. IPO（只保留港股IPO）
+            if m == "HK":   # ← 去掉美股IPO
+                ipo = self._scan_ipo(m)
+                all_candidates.extend(ipo)
+
+            # 4. 衍生品链（港股正股异动扩展窝轮/牛熊）
+            if m == "HK":
+                deriv = self._expand_derivatives(anomaly)
+                all_candidates.extend(deriv)
+
+        # 去重（按 vt_symbol 去重，保留第一个出现的）
+        seen = set()
+        unique = []
+        for c in all_candidates:
+            vt = c.get("vt_symbol", "")
+            if vt not in seen:
+                seen.add(vt)
+                unique.append(c)
+
+        log.info(f"[Selector] ✅ 合并候选: {len(unique)} 只 "
+                 f"(正股={sum(1 for c in unique if c.get('asset_type')=='EQUITY')}, "
+                 f"衍生品={sum(1 for c in unique if c.get('asset_type') in ('WARRANT','CBBC','OPTION'))}, "
+                 f"IPO={sum(1 for c in unique if c.get('asset_type')=='IPO')})")
+        return unique
+
+    # ========== 基本盘 ==========
+    def _select_base(self, market: str) -> List[dict]:
+        pool = self.base_pool_us if market == "US" else self.base_pool_hk
+        results = []
+        for sym in pool:
+            vt = f"{sym}.SMART" if market == "US" else f"{sym}.SEHK"
+            results.append({
+                "vt_symbol": vt,
+                "asset_type": "EQUITY",
+                "anomaly_type": "none",
+                "score": 50.0,
+                "signals": ["基本盘"],
+                "market": market,
+                "underlying": "",
+                "extra": {},
+            })
+        log.info(f"[Selector] 📊 基本盘评分: {len(results)} 只 ({market})")
+        return results
+
+    # ========== 异动扫描 ==========
+    def _scan_anomaly(self, market: str) -> List[dict]:
+        """使用富途 get_stock_filter 扫描异动（量比≥2x / 涨幅≥3% / 振幅≥4%）"""
+        ctx = self.ctx_us if market == "US" else self.ctx_hk
+        if ctx is None:
+            return []
+
+        try:
+            from futu import (
+                RET_OK, Market, AccumulateField, SortDir, AccumulateFilter
+            )
+        except ImportError:
+            return []
+
+        futu_market = Market.US if market == "US" else Market.HK
+        results = []
+        conditions = [
+            ("volume_surge", AccumulateField.VOLUME, 2.0, 1e9, "量比"),
+            ("price_breakout", AccumulateField.CHANGE_RATE, 3.0, 30.0, "涨幅"),
+            ("amplitude", AccumulateField.AMPLITUDE, 4.0, 100.0, "振幅"),
+        ]
+
+        for anom_type, field, fmin, fmax, label in conditions:
             try:
-                s = self._score(code)
-                if s["score"] >= self.min_score:
-                    scored.append(s)
+                flt = AccumulateFilter(
+                    stock_field=field,
+                    filter_min=fmin,
+                    filter_max=fmax,
+                    days=1,
+                    sort=SortDir.DESCEND,
+                )
+                ret, data = ctx.get_stock_filter(futu_market, [flt], begin=0, num=20)
+                if ret != RET_OK or data is None or data.empty:
+                    continue
+                for _, r in data.iterrows():
+                    code = str(r.get("code", ""))
+                    if not code:
+                        continue
+                    sym = code.split(".", 1)[-1] if "." in code else code
+                    vt = f"{sym}.SMART" if market == "US" else f"{sym}.SEHK"
+                    val = float(r.get(label.lower(), 0))
+                    score = min(val * 10, 100) if anom_type == "volume_surge" else min(50 + val * 3, 100)
+                    results.append({
+                        "vt_symbol": vt,
+                        "asset_type": "EQUITY",
+                        "anomaly_type": anom_type,
+                        "score": round(score, 1),
+                        "signals": [f"{label}{val:.1f}"],
+                        "market": market,
+                        "underlying": "",
+                        "extra": {label.lower(): val},
+                    })
             except Exception as e:
-                print(f"[Selector] {code} 评分失败: {e}")
-            time.sleep(0.3)
+                log.debug(f"[Selector] {market} {anom_type} 扫描失败: {e}")
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        selected = scored[:self.top_n]
+        log.info(f"[Selector] 📡 {market} 异动扫描: {len(results)} 只")
+        return results
 
-        if self.db:
-            for s in selected:
-                vt = s["vt_symbol"]
+    # ========== IPO（仅港股） ==========
+    def _scan_ipo(self, market: str) -> List[dict]:
+        """扫描近期 IPO 新股（港股：最近14天）"""
+        ctx = self.ctx_hk if market == "HK" else self.ctx_us
+        if ctx is None:
+            return []
+        try:
+            from futu import RET_OK, Market
+        except ImportError:
+            return []
+
+        futu_market = Market.HK if market == "HK" else Market.US
+        try:
+            ret, data = ctx.get_ipo_list(futu_market)
+            if ret != RET_OK or data is None or data.empty:
+                return []
+            now = datetime.now()
+            cutoff = now - timedelta(days=14 if market == "HK" else 7)
+            results = []
+            for _, r in data.iterrows():
+                list_time_str = str(r.get("list_time", ""))[:10]
                 try:
-                    self.db.add_to_pool(
-                        symbol=vt,
-                        score=s["score"],
-                        reason=s.get("reason", ""),
-                        market=self.market,
-                        source="selector"
-                    )
+                    list_time = datetime.strptime(list_time_str, "%Y-%m-%d")
+                except:
+                    continue
+                if list_time < cutoff:
+                    continue
+                code = str(r.get("code", ""))
+                if not code:
+                    continue
+                sym = code.split(".", 1)[-1] if "." in code else code
+                vt = f"{sym}.SEHK" if market == "HK" else f"{sym}.SMART"
+                results.append({
+                    "vt_symbol": vt,
+                    "asset_type": "IPO",
+                    "anomaly_type": "ipo_listing",
+                    "score": 80.0,
+                    "signals": [f"IPO {r.get('name','')} {list_time_str}"],
+                    "market": market,
+                    "underlying": "",
+                    "extra": {
+                        "name": str(r.get("name","")),
+                        "list_time": list_time_str,
+                        "ipo_price_min": float(r.get("ipo_price_min",0) or 0),
+                        "ipo_price_max": float(r.get("ipo_price_max",0) or 0),
+                    },
+                })
+            log.info(f"[Selector] 🆕 {market} IPO 新股: {len(results)} 只")
+            return results
+        except Exception as e:
+            log.debug(f"[Selector] {market} IPO扫描失败: {e}")
+            return []
+
+    # ========== 衍生品链扩展（港股窝轮/牛熊证） ==========
+    def _expand_derivatives(self, anomaly_candidates: List[dict]) -> List[dict]:
+        """对异动正股扩展窝轮/牛熊证链"""
+        ctx = self.ctx_hk
+        if ctx is None:
+            return []
+        try:
+            from futu import RET_OK, WarrantMarket, WarrantScreenRequest, WarrantType
+        except ImportError:
+            return []
+
+        results = []
+        for cand in anomaly_candidates:
+            if cand.get("market") != "HK":
+                continue
+            if cand.get("score", 0) < 60:
+                continue
+            vt = cand.get("vt_symbol", "")
+            sym = vt.split(".")[0]
+            futu_code = f"HK.{sym}"
+
+            for wrt_type, asset_label in [(WarrantType.CALL, "WARRANT"),
+                                           (WarrantType.PUT, "WARRANT"),
+                                           (WarrantType.BULL, "CBBC"),
+                                           (WarrantType.BEAR, "CBBC")]:
+                try:
+                    req = WarrantScreenRequest()
+                    req.warrant_market = WarrantMarket.HK
+                    req.warrant_type = wrt_type
+                    req.code = futu_code
+                    req.volume_min = 500000
+                    req.leverage_min = 3.0
+                    req.recovery_ratio_min = 5.0
+                    ret, data = ctx.get_warrant_screen(req)
+                    if ret != RET_OK or data is None or data.empty:
+                        continue
+                    for _, r in data.head(3).iterrows():
+                        wcode = str(r.get("stock", ""))
+                        if not wcode:
+                            continue
+                        wsym = wcode.split(".", 1)[-1] if "." in wcode else wcode
+                        wvt = f"{wsym}.SEHK"
+                        results.append({
+                            "vt_symbol": wvt,
+                            "asset_type": asset_label,
+                            "anomaly_type": "derivative_chain",
+                            "score": float(r.get("score", 60)),
+                            "signals": [f"{asset_label} {r.get('name','')}"],
+                            "market": "HK",
+                            "underlying": vt,
+                            "extra": {
+                                "leverage": float(r.get("leverage",0)),
+                                "delta": float(r.get("delta",0)),
+                                "recovery_ratio": float(r.get("price_recovery_ratio",0)),
+                                "expiry_days": int(r.get("expiry_date_distance",0)),
+                            },
+                        })
                 except Exception as e:
-                    print(f"[Selector] add_to_pool 失败 {vt}: {e}")
-            print(f"[Selector] ✅ {len(selected)} 只写入 ai_stock_pool")
-
-        return selected
-
-    def _score(self, code: str) -> Dict:
-        ret, data = self.ctx.get_market_snapshot([code])
-        if ret != RET_OK or data.empty:
-            raise RuntimeError(f"snapshot fail for {code}")
-
-        row = data.iloc[0]
-        last = float(row.get("last_price", 0))
-        prev = float(row.get("prev_close_price", last))
-        chg = (last - prev) / prev if prev else 0.0
-        turnover = float(row.get("turnover", 0))
-
-        vt = KlineProvider.futu_to_vt(code)
-        if self.kp is not None:
-            k = self.kp.get_daily(vt, days=120)
-        else:
-            from futu import KLType
-            r2, k, *_ = self.ctx.request_history_kline(
-                code, ktype=KLType.K_DAY,
-                start=(datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
-                end=datetime.now().strftime("%Y-%m-%d"), max_count=120)
-            if r2 != RET_OK:
-                k = None
-
-        if k is None or k.empty:
-            raise RuntimeError(f"kline fail for {code}")
-
-        c = k["close"].astype(float).values
-        v = k["volume"].astype(float).values
-
-        ma5 = self._ma(c, 5)
-        ma10 = self._ma(c, 10)
-        ma20 = self._ma(c, 20)
-        rsi = self._rsi(c, 14)
-        macd, sig, hist = self._macd(c)
-        vr = float(v[-1]) / (self._ma(v, 20) + 1e-6)
-
-        indicators = {
-            "last": round(last, 4),
-            "chg": round(chg, 6),
-            "ma5": round(ma5, 4),
-            "ma20": round(ma20, 4),
-            "rsi": round(rsi, 2),
-            "macd_hist": round(hist, 6),
-            "vr": round(vr, 3),
-        }
-
-        score = 50.0
-        reasons = []
-        if ma5 > ma10 > ma20:
-            score += 15; reasons.append("多头排列")
-        if last > ma20:
-            score += 10; reasons.append("站上MA20")
-        if 30 < rsi < 70:
-            score += 10; reasons.append(f"RSI{rsi:.0f}")
-        if hist > 0:
-            score += 10; reasons.append("MACD金叉")
-        if vr > 1.5:
-            score += 5; reasons.append(f"放量{vr:.1f}x")
-        if 0.01 < chg < 0.05:
-            score += 5; reasons.append(f"温和涨{chg*100:.1f}%")
-        if turnover > 1e8:
-            score += 5; reasons.append("大市值")
-        score = min(score, 100.0)
-
-        return {
-            "vt_symbol": vt,
-            "code": code,
-            "score": round(score, 2),
-            "reason": ";".join(reasons),
-            "indicators": indicators,
-        }
-
-    def _get_default_universe(self) -> List[str]:
-        if self.market == "US":
-            return ["US.NVDA", "US.AAPL", "US.MSFT", "US.AMZN", "US.TSLA",
-                    "US.META", "US.GOOGL", "US.AMD", "US.NFLX", "US.BABA"]
-        return ["HK.00700", "HK.09988", "HK.03690", "HK.00388", "HK.00941"]
-
-    @staticmethod
-    def _ma(d, n):
-        return float(np.mean(d[-n:])) if len(d) >= n else float(d[-1])
-
-    @staticmethod
-    def _rsi(c, n=14):
-        if len(c) < n + 1:
-            return 50.0
-        d = np.diff(c[-(n + 1):])
-        g = np.maximum(d, 0).sum() / n
-        l = np.maximum(-d, 0).sum() / n
-        return 100.0 if l == 0 else float(100 - 100 / (1 + g / (l + 1e-6)))
-
-    @staticmethod
-    def _macd(c, fast=12, slow=26, sig=9):
-        if len(c) < slow + sig:
-            return 0.0, 0.0, 0.0
-        ema_f = AIStockSelector._ema(c, fast)
-        ema_s = AIStockSelector._ema(c, slow)
-        m = ema_f - ema_s
-        s = AIStockSelector._ema(np.r_[np.array([m[:slow].mean()]), m[slow:]], sig)
-        return float(m[-1]), float(s[-1]), float(m[-1] - s[-1])
-
-    @staticmethod
-    def _ema(d, n):
-        r = np.zeros_like(d)
-        r[0] = d[0]
-        k = 2.0 / (n + 1)
-        for i in range(1, len(d)):
-            r[i] = d[i] * k + r[i - 1] * (1 - k)
-        return r
+                    log.debug(f"[Selector] 衍生品链 {wrt_type} 查询失败: {e}")
+        log.info(f"[Selector] 🔗 HK 衍生品扩展: +{len(results)} 只")
+        return results

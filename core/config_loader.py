@@ -1,9 +1,57 @@
 # -*- coding: utf-8 -*-
-"""热配置加载器（支持文件变化监听）"""
+"""
+core/config_loader.py - Apollo Trader v3.2.0 热配置加载器
+变更：
+  v3.2.0 - 新增 load_config() 模块级便捷函数（修复 main.py 导入错误）
+            新增 get_config_loader() 单例访问
+            保留原有 ConfigLoader 类所有功能
+"""
 import json
 import os
 import threading
-from typing import Callable, Dict, Any
+from typing import Callable, Dict, Any, Optional
+
+# ========== 模块级单例 ==========
+_loader_instance: Optional["ConfigLoader"] = None
+_loader_lock = threading.Lock()
+
+
+def load_config(name: str = "system", config_dir: str = "config") -> dict:
+    """
+    模块级便捷函数：加载配置文件
+    :param name: 配置名（如 'system' → system_config.json）
+    :param config_dir: 配置目录
+    :return: 配置字典
+    用法：
+        from core.config_loader import load_config
+        CONFIG = load_config("system")
+    """
+    loader = get_config_loader(config_dir)
+    return loader.load(name)
+
+
+def get_config_loader(config_dir: str = "config") -> "ConfigLoader":
+    """获取/创建 ConfigLoader 单例"""
+    global _loader_instance
+    with _loader_lock:
+        if _loader_instance is None:
+            _loader_instance = ConfigLoader(config_dir)
+        return _loader_instance
+
+
+def save_config(name: str, data: dict, config_dir: str = "config"):
+    """模块级便捷函数：保存配置"""
+    loader = get_config_loader(config_dir)
+    loader.save(name, data)
+
+
+def register_config_callback(callback: Callable[[str], None], config_dir: str = "config"):
+    """模块级便捷函数：注册配置变更回调"""
+    loader = get_config_loader(config_dir)
+    loader.register_callback(callback)
+
+
+# ========== 原有类（保持不变） ==========
 
 class ConfigChangeHandler:
     """配置文件变更处理器"""
@@ -16,6 +64,7 @@ class ConfigChangeHandler:
                 self.callback(event.src_path)
             except Exception as e:
                 print(f"Config callback error: {e}")
+
 
 class ConfigLoader:
     """配置加载器（单例），支持热加载"""
@@ -67,7 +116,7 @@ class ConfigLoader:
     def load(self, name: str) -> dict:
         """
         加载配置（带缓存）
-        :param name: 配置文件名（不含路径，如 'vwap_config'）
+        :param name: 配置文件名（不含路径，如 'vwap_config' 或 'system'）
         """
         filepath = self._resolve_path(name)
         if not os.path.exists(filepath):

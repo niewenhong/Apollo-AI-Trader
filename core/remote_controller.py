@@ -14,21 +14,48 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("RemoteController")
 
-# ★ 导入 futu_gateway 中的工具函数 ★
-try:
-    from vnpy_futu import convert_symbol_futu2vt
-except ImportError:
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from gateway.futu_gateway import convert_symbol_futu2vt
-    except ImportError:
-        # 兜底定义
-        def convert_symbol_futu2vt(code):
-            parts = str(code).split(".")
-            if len(parts) >= 2:
-                return ".".join(parts[1:]), None
-            return code, None
-        logger.warning("convert_symbol_futu2vt 导入失败，使用兜底版本")
+# ★ 正确的 convert_symbol_futu2vt 内联定义（无需从 vnpy_futu 导入）★
+# 官方 vnpy_futu 包的 EXCHANGE_VT2FUTU 映射 
+def convert_symbol_futu2vt(futu_code: str):
+    """
+    富途代码 -> (vnpy_symbol, vnpy_exchange)
+    例: 'US.AAPL'    -> ('AAPL', Exchange.SMART)
+        'HK.00700'   -> ('00700', Exchange.SEHK)
+        'HK_FUTURE.XXX' -> ('XXX', Exchange.HKFE)
+    """
+    from vnpy.trader.constant import Exchange
+
+    if not futu_code or '.' not in futu_code:
+        return futu_code, Exchange.SMART
+
+    prefix, symbol = futu_code.split('.', 1)
+    exchange_map = {
+        "US": Exchange.SMART,
+        "HK": Exchange.SEHK,
+        "HK_FUTURE": Exchange.HKFE,
+        "SH": Exchange.SSE,
+        "SZ": Exchange.SZSE,
+    }
+    exchange = exchange_map.get(prefix, Exchange.SMART)
+    return symbol, exchange
+
+
+def convert_symbol_vt2futu(symbol: str, exchange) -> str:
+    """
+    vnpy (symbol, exchange) -> 富途代码
+    例: ('AAPL', Exchange.SMART) -> 'US.AAPL'
+    """
+    exchange_map = {
+        "SMART": "US",
+        "SEHK": "HK",
+        "HKFE": "HK_FUTURE",
+        "SSE": "SH",
+        "SZSE": "SZ",
+    }
+    # exchange 可能是 Exchange 枚举或字符串
+    exch_key = exchange.value if hasattr(exchange, 'value') else str(exchange)
+    futu_market = exchange_map.get(exch_key, "US")
+    return f"{futu_market}.{symbol}"
 
 
 class RemoteController:

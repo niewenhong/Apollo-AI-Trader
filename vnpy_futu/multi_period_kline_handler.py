@@ -1,16 +1,12 @@
 """
-multi_period_kline_handler.py — 多周期 K 线回调 v3.0.2（最终修复版）
+multi_period_kline_handler.py — 多周期 K 线回调 v3.0.3（vnpy 4.4.0 正确修复版）
 =================================================================
 
-修复内容（相对 v3.0.0）：
-1. ★ 双事件推送：同时向 "eBar" 和 "eBar.{interval}" 发送 BarData
-   - CTA 引擎的 BarGenerator 监听 "eBar"（无后缀），之前只发 "eBar.1m" 导致
-     策略永远收不到 K 线 → am 永远 inited=False → 永远不下单
-2. ★ symbol/exchange 格式修正：从富途 "US.AAPL" 转为 "AAPL"/Exchange.SMART
-   - 与策略 vt_symbol（AAPL.SMART）对齐，CTA 引擎才能正确路由
-3. ★ 详细日志：每根 K 线都打印，方便确认推送是否到达
-4. ★ 时间解析容错：支持多种 time_key 格式，失败时用当前时间兜底
-5. 保留原有多周期缓存、按需落盘接口
+修复依据（查证源码）：
+1. futu-api 官方实时K线回调基类 = CurKlineHandlerBase（非 KlineHandlerBase）
+2. vnpy 4.4.0 Interval 枚举只有：MINUTE/HOUR/DAILY/WEEKLY/TICK
+   不存在 MINUTE5/MINUTE15/MINUTE30，故 5/15/30/60 分钟统一映射到 HOUR
+   真正的 N 分钟合成由 BarGenerator(window=N, interval=Interval.MINUTE) 完成
 """
 from datetime import datetime
 from typing import Dict, Optional
@@ -19,28 +15,19 @@ from vnpy.trader.constant import Interval, Exchange
 from vnpy.trader.object import BarData, TickData
 from vnpy.trader.utility import ZoneInfo
 import pandas as pd
-from futu import KLType, KlineHandlerBase, RET_OK
+from futu import KLType, CurKlineHandlerBase, RET_OK
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
-# SubType → Interval 映射
+# SubType → Interval 映射（严格遵循 vnpy 4.4.0 源码定义）
+# vnpy Interval 枚举成员：MINUTE="1m", HOUR="1h", DAILY="d", WEEKLY="w", TICK="tick"
 SUBTYPE_TO_INTERVAL = {
-    KLType.K_1M:  Interval.MINUTE,
-    KLType.K_5M:  Interval.MINUTE5,
-    KLType.K_15M: Interval.MINUTE15,
-    KLType.K_30M: Interval.MINUTE30,
-    KLType.K_60M: Interval.HOUR,
-    KLType.K_DAY: Interval.DAILY,
-}
-
-# Interval → 分钟数（备用）
-INTERVAL_MINUTES = {
-    Interval.MINUTE:   1,
-    Interval.MINUTE5:  5,
-    Interval.MINUTE15: 15,
-    Interval.MINUTE30: 30,
-    Interval.HOUR:      60,
-    Interval.DAILY:    1440,
+    KLType.K_1M:  Interval.MINUTE,   # "1m"
+    KLType.K_5M:  Interval.HOUR,     # vnpy 无 MINUTE5，映射到 HOUR
+    KLType.K_15M: Interval.HOUR,     # 同上
+    KLType.K_30M: Interval.HOUR,     # 同上
+    KLType.K_60M: Interval.HOUR,     # "1h"
+    KLType.K_DAY: Interval.DAILY,    # "d"
 }
 
 # 富途交易所前缀 → vnpy Exchange
@@ -50,15 +37,15 @@ FUTU_EXCHANGE_MAP = {
 }
 
 
-class MultiPeriodKlineHandler(KlineHandlerBase):
+class MultiPeriodKlineHandler(CurKlineHandlerBase):
     """
     富途多周期 K 线回调处理器。
 
     收到富途推送的 K 线后：
     1. 将 code 从 "US.AAPL" 格式转为 symbol="AAPL", exchange=SMART
-    2. 构造 BarData
+    2. 构造 BarData（interval 取自 SUBTYPE_TO_INTERVAL）
     3. 同时向事件引擎发送两个事件：
-       - "eBar"          → CTA 引擎 BarGenerator 监听（★关键修复）
+       - "eBar"          → CTA 引擎 BarGenerator 监听
        - "eBar.{interval}" → 其他多周期组件监听
     """
 
@@ -67,11 +54,8 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
         self.gateway = gateway
         self.market_bus = market_bus
         self._bars: Dict[str, Dict[Interval, BarData]] = {}
-        self._kline_count = 0  # 统计收到多少根 K 线
+        self._kline_count = 0
 
-    # ───────────────────────────────
-    #  富途回调入口
-    # ───────────────────────────────
     def on_recv_rsp(self, rsp_str):
         ret_code, content = super().on_recv_rsp(rsp_str)
         if ret_code != RET_OK:
@@ -84,9 +68,6 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
             traceback.print_exc()
         return RET_OK, content
 
-    # ───────────────────────────────
-    #  核心处理逻辑
-    # ───────────────────────────────
     def process_kline(self, data: pd.DataFrame):
         if data is None or data.empty:
             return
@@ -98,22 +79,22 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
             if not code:
                 continue
 
-            # ★ 关键：富途 "US.AAPL" → symbol="AAPL", exchange=SMART
+            # 富途 "US.AAPL" → symbol="AAPL", exchange=SMART
             sym, exchange = self._parse_futu_code(code)
 
-            # 周期由 KLType 决定
+            # 周期由 KLType 决定 → 映射到 vnpy Interval
             ktype = row.get("ktype", KLType.K_1M)
             interval = SUBTYPE_TO_INTERVAL.get(ktype, Interval.MINUTE)
 
-            # 时间解析（容错）
+            # 时间解析
             t = str(row.get("time_key", ""))
             dt = self._parse_time(t)
 
             # 构造 BarData
             bar = BarData(
                 gateway_name=gw.gateway_name,
-                symbol=sym,            # ★ "AAPL" 而不是 "US.AAPL"
-                exchange=exchange,      # ★ Exchange.SMART
+                symbol=sym,
+                exchange=exchange,
                 datetime=dt,
                 interval=interval,
                 volume=float(row.get("volume", 0) or 0),
@@ -128,10 +109,8 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
             # 缓存最新一根
             self._bars.setdefault(code, {})[interval] = bar
 
-            # ★ 双事件推送
-            # 1) "eBar" —— CTA 引擎 / BarGenerator 监听此事件
+            # 双事件推送
             event_general = Event(EVENT_BAR, bar)
-            # 2) "eBar.{interval}" —— 多周期组件监听
             event_specific = Event(f"eBar.{interval.value}", bar)
 
             if self.market_bus:
@@ -141,7 +120,7 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
                 gw.event_engine.put(event_general)
                 gw.event_engine.put(event_specific)
 
-            # ★ 日志：确认 K 线送达
+            # 日志
             self._kline_count += 1
             if self._kline_count <= 5 or self._kline_count % 100 == 0:
                 gw.write_log(
@@ -152,31 +131,19 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
                     f"V={bar.volume:.0f}"
                 )
 
-    # ───────────────────────────────
-    #  工具方法
-    # ───────────────────────────────
     def _parse_futu_code(self, code: str) -> tuple:
-        """
-        富途代码 → (symbol, Exchange)
-        "US.AAPL"    → ("AAPL",  Exchange.SMART)
-        "HK.00700"   → ("00700", Exchange.SEHK)
-        "US.AAPL.B"   → ("AAPL.B", Exchange.SMART)  # 期权等嵌套
-        "AAPL"        → ("AAPL",  Exchange.SMART)    # 无前缀兜底
-        """
         if "." not in code:
             return code, Exchange.SMART
 
         parts = code.split(".")
         prefix = parts[0]
-        symbol = ".".join(parts[1:])  # 支持嵌套点号
+        symbol = ".".join(parts[1:])
         exchange = FUTU_EXCHANGE_MAP.get(prefix, Exchange.SMART)
         return symbol, exchange
 
     def _parse_time(self, t: str) -> datetime:
-        """解析 time_key 字符串为 datetime，失败返回 now()"""
         if not t:
             return datetime.now(CHINA_TZ)
-        # 尝试多种格式
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
                    "%Y%m%d %H:%M:%S", "%Y%m%d"):
             try:
@@ -186,11 +153,9 @@ class MultiPeriodKlineHandler(KlineHandlerBase):
         return datetime.now(CHINA_TZ)
 
     def get_latest_bar(self, code: str, interval: Interval) -> Optional[BarData]:
-        """获取指定 code + 周期的缓存 bar"""
         return self._bars.get(code, {}).get(interval)
 
     def get_stats(self) -> str:
-        """返回统计信息"""
         return f"K线总数={self._kline_count}, 缓存品种数={len(self._bars)}"
 
 

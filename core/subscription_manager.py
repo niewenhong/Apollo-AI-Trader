@@ -15,17 +15,14 @@ class SubscriptionManager:
         self._user_subs: Dict[str, Dict[str, List[str]]] = {}
         self._quote_ctx_us: Optional[OpenQuoteContext] = None
         self._quote_ctx_hk: Optional[OpenQuoteContext] = None
-        self._gateways: Dict[str, object] = {}  # gateway_name -> gateway instance
+        self._gateways: Dict[str, object] = {}
 
     def set_contexts(self, us_ctx: OpenQuoteContext, hk_ctx: OpenQuoteContext):
-        """直接设置行情上下文（旧接口）"""
         self._quote_ctx_us = us_ctx
         self._quote_ctx_hk = hk_ctx
 
     def register_gateway(self, gateway_name: str, gateway: object):
-        """注册网关实例（新接口）"""
         self._gateways[gateway_name] = gateway
-        # 同时从网关中提取 quote_ctx
         if hasattr(gateway, 'quote_ctx'):
             if gateway_name == "FUTU_US":
                 self._quote_ctx_us = gateway.quote_ctx
@@ -33,13 +30,7 @@ class SubscriptionManager:
                 self._quote_ctx_hk = gateway.quote_ctx
         log.info(f"✅ 网关已注册: {gateway_name}")
 
-    # ★ FIX: 新增公开的 subscribe 方法，供 StrategyEngine 直接调用
     def subscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
-        """
-        统一订阅入口：记录引用计数，若为新订阅则调用底层订阅。
-        futu_symbol: 如 "US.AAPL"
-        subtypes: 如 ["QUOTE", "K_1M"]
-        """
         return self.subscribe_demand(futu_symbol, user, subtypes)
 
     def subscribe_demand(self, symbol: str, user: str, subtypes: List[str]) -> bool:
@@ -56,6 +47,7 @@ class SubscriptionManager:
                 self._user_subs[user][symbol] = []
             if st not in self._user_subs[user][symbol]:
                 self._user_subs[user][symbol].append(st)
+
         if newly_subscribed:
             ok = self._do_subscribe(symbol, newly_subscribed)
             if not ok:
@@ -67,7 +59,6 @@ class SubscriptionManager:
                 return False
         return True
 
-    # ★ FIX: 新增公开的 unsubscribe 方法
     def unsubscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
         return self.release_demand(futu_symbol, user, subtypes)
 
@@ -101,10 +92,9 @@ class SubscriptionManager:
         session = Session.ALL if symbol.startswith("US.") else Session.NONE
         sub_objs = [self._str_to_subtype(s) for s in subtypes]
         sub_objs = [s for s in sub_objs if s is not None]
-        code, data = ctx.subscribe(
-            symbol, sub_objs,
-            is_first_push=True, subscribe_push=True, session=session
-        )
+        code, data = ctx.subscribe(symbol, sub_objs,
+                                   is_first_push=True, subscribe_push=True,
+                                   session=session)
         if code == RET_OK:
             log.info(f"✅ 订阅成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
             return True
@@ -114,15 +104,12 @@ class SubscriptionManager:
 
     def _do_unsubscribe(self, symbol: str, subtypes: List[str]) -> bool:
         ctx = self._get_ctx_for(symbol)
-        if ctx is None:
-            return False
+        if ctx is None: return False
         sub_objs = [self._str_to_subtype(s) for s in subtypes]
         sub_objs = [s for s in sub_objs if s is not None]
         code, data = ctx.unsubscribe(symbol, sub_objs)
         if code == RET_OK:
             log.info(f"✅ 退订成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
-        else:
-            log.warning(f"⚠️ 退订: {symbol} | {data}")
         return code == RET_OK
 
     def used(self) -> int:
@@ -132,7 +119,7 @@ class SubscriptionManager:
         return self.max_quota - self.used()
 
     def audit_quota(self):
-        print(f"📊 配额审计: 已用 {self.used()}/{self.max_quota}，剩余 {self.remaining()}")
+        print(f"📊 配额审计: 已用 {self.used()}/{self.max_quota}, 剩余 {self.remaining()}")
         stock_map: Dict[str, List[str]] = {}
         for sym, st in self._ref_count.keys():
             stock_map.setdefault(sym, []).append(st)
@@ -142,32 +129,25 @@ class SubscriptionManager:
             print(f"   {sym}: {sts} (用户: {set(users)})")
 
     def _get_ctx_for(self, symbol: str) -> Optional[OpenQuoteContext]:
-        if symbol.startswith("US."):
-            return self._quote_ctx_us
-        elif symbol.startswith("HK."):
-            return self._quote_ctx_hk
+        if symbol.startswith("US."): return self._quote_ctx_us
+        elif symbol.startswith("HK."): return self._quote_ctx_hk
         return None
 
     @staticmethod
     def _str_to_subtype(s: str):
         mapping = {
-            "QUOTE": SubType.QUOTE,
-            "K_1M": SubType.K_1M,
-            "K_5M": SubType.K_5M,
-            "K_15M": SubType.K_15M,
-            "K_30M": SubType.K_30M,
-            "K_60M": SubType.K_60M,
-            "K_DAY": SubType.K_DAY,
-            "ORDER_BOOK": SubType.ORDER_BOOK,
+            "QUOTE": SubType.QUOTE, "K_1M": SubType.K_1M,
+            "K_5M": SubType.K_5M, "K_15M": SubType.K_15M,
+            "K_30M": SubType.K_30M, "K_60M": SubType.K_60M,
+            "K_DAY": SubType.K_DAY, "ORDER_BOOK": SubType.ORDER_BOOK,
             "TICKER": SubType.TICKER,
         }
         return mapping.get(s)
 
-    @staticmethod
-    def build_plan(config: dict, deployed_strategies: set = None) -> Dict[str, Dict[str, List[str]]]:
-        from .subscription_plan import build_subscription_plan
+    def build_plan(self, config: dict, deployed_strategies: set = None) -> Dict[str, Dict[str, List[str]]]:
+        from core.subscription_plan import build_subscription_plan
         return build_subscription_plan(config, deployed_strategies)
 
     def apply_plan(self, config: dict, deployed_strategies: set = None) -> bool:
-        from .subscription_plan import apply_subscription_plan
+        from core.subscription_plan import apply_subscription_plan
         return apply_subscription_plan(self, config, deployed_strategies)
