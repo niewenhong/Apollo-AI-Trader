@@ -1,6 +1,9 @@
 """
-core/strategy_engine.py - Apollo Trader v3.1.5 双引擎增强版
-（严格幂等 + 状态追踪 + 外部 Advisor + 衍生品自动K线订阅 + 类映射完备）
+core/strategy_engine.py - Apollo Trader v3.3.2 双引擎增强版
+变更：
+  v3.3.2 - _remove_strategy 在删除前调用 db.move_strategy_to_history
+           将策略归档到 strategy_history 表（含绩效数据）
+           保留所有原有逻辑不变
 """
 import importlib
 import json
@@ -78,7 +81,6 @@ class StrategyEngine:
         self.quote_ctx = quote_ctx
         self.telegram_bot = None
 
-        # 可选注入属性（由 main.py 设置）
         self.sub_manager = None
         self.kline_provider = None
         self.matcher = None
@@ -170,7 +172,6 @@ class StrategyEngine:
         self.boot(configs=db_configs, operator="system:bootstrap")
 
     def _trigger_pipeline(self):
-        """后备流水线：当 strategy_config 为空时触发一次选股"""
         try:
             from ai.stock_selector import AIStockSelector
             selector = AIStockSelector(
@@ -185,7 +186,6 @@ class StrategyEngine:
                 logger.error("[Pipeline] ❌ 选股返回空")
                 return
 
-            # 构造 regime_map（如果 regime_trainer 可用）
             regime_map = {}
             if hasattr(self, 'regime_trainer') and self.regime_trainer:
                 for item in selected:
@@ -206,7 +206,6 @@ class StrategyEngine:
                     if vt:
                         regime_map[vt] = {"regime": "range", "confidence": 0.5, "iv_percentile": 0.5}
 
-            # StrategyGenerator 真实签名: (quote_ctx, db_path, kline_provider, config)
             db_path = getattr(self.db, 'db_path', '') or 'data/history.db'
             generator = StrategyGenerator(
                 quote_ctx=self.quote_ctx or self._get_quote_ctx(),
@@ -577,6 +576,14 @@ class StrategyEngine:
     def check_and_reload_changed(self, operator: str = "system") -> List[str]:
         db_configs = self.db.get_all_strategies(enabled_only=True)
         db_map = {cfg["strategy_name"]: cfg for cfg in db_configs}
+
+        # 收集所有 CTA 引擎中正在运行的策略
+        active_in_cta = set()
+        for label in ("US", "HK"):
+            cta = self._get_cta_engine(label)
+            if cta:
+                active_in_cta.update(cta.strategies.keys())
+
         to_process = []
         for name, cfg in db_map.items():
             if name not in self._deployed:
@@ -585,8 +592,18 @@ class StrategyEngine:
                 current_hash = self._compute_params_hash(cfg.get("params", {}))
                 if self._deployed[name]["params_hash"] != current_hash:
                     to_process.append((name, "update"))
+
         db_names = set(db_map.keys())
-        to_delete = set(self._deployed.keys()) - db_names
+        potential_delete = set(self._deployed.keys()) - db_names
+        # 只删除既不在 DB 中、也不在 CTA 引擎中运行的策略
+        to_delete = potential_delete - active_in_cta
+        skip_delete = potential_delete & active_in_cta
+
+        if skip_delete:
+            logger.warning(
+                f"[HotReload] 以下策略仍在 CTA 引擎中运行，跳过删除: {skip_delete}"
+            )
+
         processed = []
         for name in to_delete:
             self._remove_strategy(name, operator)
@@ -659,30 +676,52 @@ class StrategyEngine:
 
     def _remove_strategy(self, strategy_name: str, operator: str) -> bool:
         strategy_obj = self.strategies.get(strategy_name)
+
+        # 收集绩效数据
+        perf_data = {}
         if strategy_obj is not None:
             vt_symbol = getattr(strategy_obj, 'vt_symbol', '')
             market = self._infer_market_from_vt_symbol(vt_symbol)
+            perf_data["total_pnl"] = getattr(strategy_obj, 'total_pnl', 0)
+            perf_data["total_trades"] = getattr(strategy_obj, 'total_trades', 0)
+            perf_data["win_rate"] = getattr(strategy_obj, 'win_rate', 0)
         else:
             vt_symbol = ''
             market = 'US'
 
+        # 取消订阅
         if self.sub_manager and vt_symbol:
             futu_symbol = self._to_futu_symbol(vt_symbol, market)
             if futu_symbol:
                 self.sub_manager.unsubscribe(futu_symbol, ["QUOTE", "K_1M"])
                 logger.info(f"[StrategyEngine] ✅ 已从 SubManager 注销订阅: {futu_symbol}")
 
+        # 从 CTA 引擎停止并移除
         for label, me in [("US", self.main_us), ("HK", self.main_hk)]:
             cta = self._get_cta_engine(label)
             if cta and strategy_name in cta.strategies:
                 try:
                     cta.stop_strategy(strategy_name)
                     cta.remove_strategy(strategy_name)
-                    self._set_status(strategy_name, "REMOVED", f"手动移除 (by {operator})")
+                    self._set_status(strategy_name, "REMOVED", f"移除 (by {operator})")
                     logger.info(f"[StrategyEngine] ✅ {strategy_name} 已从 {label} CTA 引擎移除")
                 except Exception as e:
                     logger.error(f"[StrategyEngine] 移除 {strategy_name} 失败: {e}")
                     return False
+
+        # ★ v3.3.2: 移入历史记录（在清理内存之前）
+        if self.db:
+            try:
+                self.db.move_strategy_to_history(
+                    strategy_name,
+                    perf_data=perf_data,
+                    removed_by=operator,
+                    reason="strategy_engine_remove"
+                )
+            except Exception as e:
+                logger.warning(f"[StrategyEngine] 移入历史失败 {strategy_name}: {e}")
+
+        # 清理内存
         self._deployed.pop(strategy_name, None)
         self.strategies.pop(strategy_name, None)
         return True

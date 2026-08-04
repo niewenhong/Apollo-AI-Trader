@@ -1,18 +1,16 @@
 """
-core/db_manager.py - Apollo Trader v3.2.0 全功能数据库管理器
-============================================================
+core/db_manager.py - Apollo Trader v3.3.0 全功能数据库管理器
 变更：
-  v3.2.0 - 新增 strategy_runs 表（运行生命周期）
-            新增 strategy_daily_pnl 表（每日盈亏曲线）
-            新增 performance_snapshot 表（绩效快照）
-            add_to_pool() 支持 extra JSON 参数
-            ai_stock_pool 表自动增加列
-            修复事务模式（isolation_level=None 自动提交）
+  v3.3.0 - 新增 strategy_history 表（已删除策略的历史记录，含绩效）
+           新增 move_strategy_to_history() 方法
+           新增 get_strategy_history() 查询方法
+           _create_tables 中 strategy_config 增加 created_at/updated_at 列迁移
 """
 import sqlite3
 import json
 import logging
 import uuid
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -20,13 +18,12 @@ logger = logging.getLogger("DBManager")
 
 
 class DBManager:
-    """数据库管理器 v3.2.0"""
+    """数据库管理器 v3.3.0"""
 
     def __init__(self, db_path: str = "data/history.db"):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # 自动提交模式（避免事务混乱）
         self.conn.isolation_level = None
         self._create_tables()
         self._migrate_all_tables()
@@ -38,7 +35,7 @@ class DBManager:
             self.conn.commit()
         except sqlite3.OperationalError as e:
             if "no transaction" in str(e):
-                pass  # 无事务可提交，忽略
+                pass
             else:
                 raise
 
@@ -168,7 +165,7 @@ class DBManager:
             )
         """)
 
-        # === strategy_runs（v3.2.0 新增：运行生命周期）===
+        # === strategy_runs ===
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS strategy_runs (
                 run_id TEXT PRIMARY KEY,
@@ -197,7 +194,7 @@ class DBManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_runs_name ON strategy_runs(strategy_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON strategy_runs(status)")
 
-        # === strategy_daily_pnl（v3.2.0 新增：每日盈亏）===
+        # === strategy_daily_pnl ===
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS strategy_daily_pnl (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,7 +214,7 @@ class DBManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_name ON strategy_daily_pnl(strategy_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_run ON strategy_daily_pnl(run_id)")
 
-        # === performance_snapshot（v3.2.0 新增：绩效快照）===
+        # === performance_snapshot ===
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS performance_snapshot (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,12 +238,34 @@ class DBManager:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_perf_name ON performance_snapshot(strategy_name)")
 
+        # === strategy_history (v3.3.0 新增) ===
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_name TEXT NOT NULL,
+                class_name TEXT,
+                vt_symbol TEXT,
+                market TEXT,
+                params TEXT DEFAULT '{}',
+                status TEXT,
+                start_time TEXT,
+                end_time TEXT,
+                total_pnl REAL DEFAULT 0,
+                total_trades INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                removed_by TEXT,
+                remove_reason TEXT,
+                removed_at TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hist_name ON strategy_history(strategy_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hist_market ON strategy_history(market)")
+
         self._safe_commit()
         logger.info(f"[DB INIT] ✅ 数据库表创建/验证完成 ({self.db_path})")
 
     def _migrate_all_tables(self):
         """自动补全缺失列"""
-        # --- strategy_config ---
         sc_additions = {
             'status': "ALTER TABLE strategy_config ADD COLUMN status TEXT DEFAULT 'PENDING'",
             'status_msg': "ALTER TABLE strategy_config ADD COLUMN status_msg TEXT DEFAULT ''",
@@ -254,10 +273,11 @@ class DBManager:
             'active': "ALTER TABLE strategy_config ADD COLUMN active INTEGER DEFAULT 1",
             'current_version': "ALTER TABLE strategy_config ADD COLUMN current_version INTEGER DEFAULT 1",
             'version': "ALTER TABLE strategy_config ADD COLUMN version INTEGER DEFAULT 1",
+            'created_at': "ALTER TABLE strategy_config ADD COLUMN created_at TEXT DEFAULT ''",
+            'updated_at': "ALTER TABLE strategy_config ADD COLUMN updated_at TEXT DEFAULT ''",
         }
         self._migrate_columns("strategy_config", sc_additions)
 
-        # --- ai_stock_pool ---
         asp_additions = {
             'anomaly_type': "ALTER TABLE ai_stock_pool ADD COLUMN anomaly_type TEXT DEFAULT 'none'",
             'regime': "ALTER TABLE ai_stock_pool ADD COLUMN regime TEXT DEFAULT 'range'",
@@ -266,7 +286,6 @@ class DBManager:
         }
         self._migrate_columns("ai_stock_pool", asp_additions)
 
-        # --- regime_records ---
         rr_additions = {
             'exchange': "ALTER TABLE regime_records ADD COLUMN exchange TEXT NOT NULL DEFAULT 'US'",
             'features_json': "ALTER TABLE regime_records ADD COLUMN features_json TEXT DEFAULT '{}'",
@@ -405,20 +424,15 @@ class DBManager:
             result.append(d)
         return result
 
-    # ========== ★ 运行生命周期管理（v3.2.0 核心） ==========
+    # ========== ★ 运行生命周期管理 ==========
 
     def start_run(self, strategy_name: str, class_name: str,
                   vt_symbol: str, market: str,
                   params: dict) -> str:
-        """
-        开始一次策略运行，返回 run_id
-        如果同一策略已有 RUNNING 状态的记录，先结束它（防止重复）
-        """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         params_json = json.dumps(params, ensure_ascii=False)
         params_hash = hashlib.md5(params_json.encode()).hexdigest() if isinstance(params, dict) else ""
 
-        # 先结束该策略之前的 RUNNING 记录
         self._end_orphan_runs(strategy_name, reason="restart")
 
         run_id = str(uuid.uuid4())[:12]
@@ -435,7 +449,6 @@ class DBManager:
         return run_id
 
     def _end_orphan_runs(self, strategy_name: str, reason: str = "restart"):
-        """结束该策略所有未关闭的运行"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -448,7 +461,6 @@ class DBManager:
 
     def end_run(self, run_id: str, exit_reason: str = "manual",
                 perf_data: Optional[dict] = None):
-        """结束一次运行，可选写入最终绩效"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor = self.conn.cursor()
         if perf_data:
@@ -480,7 +492,6 @@ class DBManager:
         logger.info(f"[DB] 🔚 run_id={run_id} 已结束 (reason={exit_reason})")
 
     def update_run_performance(self, run_id: str, perf_data: dict):
-        """更新运行中的绩效数据（不结束运行）"""
         cursor = self.conn.cursor()
         cursor.execute("""
             UPDATE strategy_runs SET
@@ -502,7 +513,6 @@ class DBManager:
         self._safe_commit()
 
     def get_active_runs(self) -> List[dict]:
-        """获取所有 RUNNING 状态的运行"""
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM strategy_runs WHERE status='RUNNING' ORDER BY started_at DESC")
         rows = cursor.fetchall()
@@ -510,7 +520,6 @@ class DBManager:
         return [dict(zip(columns, row)) for row in rows]
 
     def get_run_history(self, strategy_name: str, limit: int = 20) -> List[dict]:
-        """获取某策略的运行历史"""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT * FROM strategy_runs WHERE strategy_name=?
@@ -521,7 +530,6 @@ class DBManager:
         return [dict(zip(columns, row)) for row in rows]
 
     def get_all_runs_summary(self) -> List[dict]:
-        """获取所有策略的运行汇总"""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT strategy_name, COUNT(*) as total_runs,
@@ -545,7 +553,6 @@ class DBManager:
                         high_water_mark: float = 0,
                         daily_drawdown: float = 0,
                         cumulative_pnl: float = 0):
-        """保存每日盈亏快照"""
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO strategy_daily_pnl
@@ -557,7 +564,6 @@ class DBManager:
         self._safe_commit()
 
     def get_daily_pnl(self, strategy_name: str, limit: int = 30) -> List[dict]:
-        """获取某策略的每日盈亏曲线"""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT * FROM strategy_daily_pnl WHERE strategy_name=?
@@ -571,7 +577,6 @@ class DBManager:
 
     def save_performance_snapshot(self, strategy_name: str, run_id: str,
                                   perf_data: dict):
-        """保存一次绩效快照"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -598,7 +603,6 @@ class DBManager:
         self._safe_commit()
 
     def get_latest_performance(self, strategy_name: str) -> Optional[dict]:
-        """获取某策略最新绩效快照"""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT * FROM performance_snapshot WHERE strategy_name=?
@@ -609,6 +613,73 @@ class DBManager:
             return None
         columns = [desc[0] for desc in cursor.description]
         return dict(zip(columns, row))
+
+    # ========== ★ strategy_history（v3.3.0 核心） ==========
+
+    def move_strategy_to_history(self, strategy_name: str, perf_data: dict = None,
+                                  removed_by: str = "system", reason: str = "manual") -> bool:
+        """
+        将策略从 strategy_config 移到 strategy_history。
+        记录运行起止时间 + 最终绩效，供用户查询。
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM strategy_config WHERE strategy_name = ?", (strategy_name,))
+        row = cursor.fetchone()
+        if not row:
+            logger.warning(f"[DB] 策略 {strategy_name} 不在 strategy_config 中，无法移入历史")
+            return False
+        columns = [desc[0] for desc in cursor.description]
+        record = dict(zip(columns, row))
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        perf = perf_data or {}
+
+        cursor.execute("""
+            INSERT INTO strategy_history
+            (strategy_name, class_name, vt_symbol, market, params, status,
+             start_time, end_time, total_pnl, total_trades, win_rate,
+             removed_by, remove_reason, removed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record["strategy_name"],
+            record.get("class_name", ""),
+            record.get("vt_symbol", ""),
+            record.get("market", ""),
+            record.get("params", "{}"),
+            record.get("status", "REMOVED"),
+            record.get("created_at", ""),   # 首次创建时间 = 运行起始
+            now,                            # 删除时间 = 运行结束
+            perf.get("total_pnl", 0),
+            perf.get("total_trades", 0),
+            perf.get("win_rate", 0),
+            removed_by,
+            reason,
+            now,
+        ))
+
+        # 物理删除 strategy_config 中的记录
+        cursor.execute("DELETE FROM strategy_config WHERE strategy_name = ?", (strategy_name,))
+        self._safe_commit()
+        logger.info(f"[DB] 📜 {strategy_name} → history (PnL={perf.get('total_pnl',0)}, trades={perf.get('total_trades',0)})")
+        return True
+
+    def get_strategy_history(self, market: str = None, limit: int = 50) -> List[dict]:
+        """查询历史策略记录，供用户查询"""
+        cursor = self.conn.cursor()
+        if market:
+            cursor.execute("""
+                SELECT * FROM strategy_history
+                WHERE market = ?
+                ORDER BY removed_at DESC LIMIT ?
+            """, (market, limit))
+        else:
+            cursor.execute("""
+                SELECT * FROM strategy_history
+                ORDER BY removed_at DESC LIMIT ?
+            """, (limit,))
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in rows]
 
     # ========== 选股池 ==========
 
@@ -828,13 +899,9 @@ class DBManager:
     def close(self):
         self.conn.close()
 
-    # ========== ★ 启动恢复（v3.2.0） ==========
+    # ========== 启动恢复 ==========
 
     def get_running_strategies_for_restart(self) -> List[dict]:
-        """
-        获取所有 status='RUNNING' 的策略配置，用于重启时恢复
-        同时返回它们对应的 run_id
-        """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT r.strategy_name, r.run_id, r.class_name, r.vt_symbol,
@@ -849,7 +916,6 @@ class DBManager:
         result = []
         for row in rows:
             d = dict(zip(columns, row))
-            # 优先用 strategy_config 的 params（最新），回退到 runs 的 params_json
             if d.get("sc_params"):
                 try:
                     d["params"] = json.loads(d["sc_params"])

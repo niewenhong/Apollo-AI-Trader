@@ -1,251 +1,218 @@
+# -*- coding: utf-8 -*-
 """
-core/strategy_generator.py - v3.3.0 增强版
-==========================================
-增强内容：
-  1. 三级路由：anomaly_type × asset_class × regime → 策略 + 参数
-  2. 60+ 条路由规则覆盖 5 种 regime × 6 种资产类型
-  3. 三维参数模板（regime自适应 + 波动率缩放 + 流动性约束）
-  4. IV 百分位驱动期权策略选择
-  5. 衍生品参数自动继承正股 regime
-  6. 置信度加权选股
+strategy_generator.py - v3.3.2 增强版路由（基于诊断文本动态调整regime）
+变更：
+  v3.3.2 - generate() 不再调用 _clear_old_strategies，避免双市场互相删除
+            _write_to_db() 保留已有 created_at，不刷新首次创建时间
 """
 import json
 import logging
-from typing import Optional, Dict, List, Tuple
+import re
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 
-log = logging.getLogger("StrategyGenerator")
+from ai.param_advisor import ParamAdvisor
+from core.regime_trainer import RegimeTrainer
+
+logger = logging.getLogger("StrategyGenerator")
 
 
 class StrategyGenerator:
-    """
-    策略生成器 v3.3.0
-    输入：AnomalyCandidate + Regime 字典
-    输出：写入 strategy_config 表
-    """
+    """策略生成器：路由 + 参数建议 + 写DB"""
 
-    # ========== 三级路由表 ==========
-    # (anomaly_type, asset_class, regime) → (class_name, param_template, priority)
     ROUTE_TABLE = {
-        # ── 正股 ──
-        # 量比异动
-        ("volume_surge",    "EQUITY", "strong_bull"): ("TrendStrategy",       {"fast_window": 5,  "slow_window": 20, "atr_mult": 2.5, "position_pct": 0.15}, 1),
-        ("volume_surge",    "EQUITY", "bull"):       ("TrendStrategy",       {"fast_window": 8,  "slow_window": 25, "atr_mult": 2.0, "position_pct": 0.12}, 1),
-        ("volume_surge",    "EQUITY", "range"):      ("GridStrategy",        {"levels": 5, "atr_spacing": True, "position_pct": 0.10}, 2),
-        ("volume_surge",    "EQUITY", "volatile"):   ("DualThrustStrategy", {"K": 0.4, "atr_stop": 1.5, "position_pct": 0.08}, 1),
-        ("volume_surge",    "EQUITY", "weak_bear"):  ("BearPutSpreadStrategy", {"position_pct": 0.10}, 1),
-        ("volume_surge",    "EQUITY", "bear"):      ("MomentumStrategy",   {"window": 10, "position_pct": 0.08}, 2),
-
-        # 价格突破
-        ("price_breakout", "EQUITY", "strong_bull"): ("TrendStrategy",       {"fast_window": 5,  "slow_window": 15, "atr_mult": 3.0, "position_pct": 0.15}, 1),
-        ("price_breakout", "EQUITY", "bull"):       ("MomentumStrategy",   {"window": 10, "position_pct": 0.12}, 1),
-        ("price_breakout", "EQUITY", "range"):      ("VWAPStrategy",       {"deviation": 0.003, "position_pct": 0.10}, 2),
-        ("price_breakout", "EQUITY", "volatile"):   ("DualThrustStrategy", {"K": 0.35, "atr_stop": 1.2, "position_pct": 0.08}, 1),
-        ("price_breakout", "EQUITY", "weak_bear"):  ("BearPutSpreadStrategy", {"position_pct": 0.10}, 1),
-        ("price_breakout", "EQUITY", "bear"):      ("SellCallStrategy",   {"delta_target": 0.3, "position_pct": 0.10}, 2),
-
-        # 振幅异动
-        ("amplitude",      "EQUITY", "strong_bull"): ("TrendStrategy",       {"fast_window": 10, "slow_window": 30, "atr_mult": 2.0, "position_pct": 0.12}, 2),
-        ("amplitude",      "EQUITY", "bull"):       ("GridStrategy",        {"levels": 7, "atr_spacing": True, "position_pct": 0.10}, 2),
-        ("amplitude",      "EQUITY", "range"):      ("GridStrategy",        {"levels": 7, "atr_spacing": True, "position_pct": 0.10}, 1),
-        ("amplitude",      "EQUITY", "volatile"):   ("DualThrustStrategy", {"K": 0.35, "atr_stop": 1.2, "position_pct": 0.08}, 1),
-        ("amplitude",      "EQUITY", "weak_bear"):  ("BearPutSpreadStrategy", {"position_pct": 0.10}, 2),
-        ("amplitude",      "EQUITY", "bear"):      ("GridStrategy",        {"levels": 5, "atr_spacing": True, "position_pct": 0.08}, 3),
-
-        # 基本盘（无明确异动）
-        ("none",           "EQUITY", "strong_bull"): ("TrendStrategy",       {"fast_window": 10, "slow_window": 30, "atr_mult": 2.5, "position_pct": 0.12}, 2),
-        ("none",           "EQUITY", "bull"):       ("TrendStrategy",       {"fast_window": 15, "slow_window": 40, "atr_mult": 2.0, "position_pct": 0.10}, 2),
-        ("none",           "EQUITY", "range"):      ("GridStrategy",        {"levels": 5, "atr_spacing": True, "position_pct": 0.08}, 1),
-        ("none",           "EQUITY", "volatile"):   ("DualThrustStrategy", {"K": 0.5, "atr_stop": 1.5, "position_pct": 0.06}, 2),
-        ("none",           "EQUITY", "weak_bear"):  ("GridStrategy",        {"levels": 5, "atr_spacing": True, "position_pct": 0.06}, 3),
-        ("none",           "EQUITY", "bear"):      ("SellCallStrategy",   {"delta_target": 0.3, "position_pct": 0.08}, 3),
-
-        # ── 窝轮 ──
-        ("derivative_chain", "WARRANT", "strong_bull"): ("WarrantStrategy",  {"wrt_type": "CALL", "min_delta_abs": 0.4, "max_delta_abs": 0.7, "max_iv_rank": 0.5, "position_pct": 0.05}, 1),
-        ("derivative_chain", "WARRANT", "bull"):       ("WarrantStrategy",  {"wrt_type": "CALL", "min_delta_abs": 0.3, "max_delta_abs": 0.6, "position_pct": 0.04}, 2),
-        ("derivative_chain", "WARRANT", "range"):      ("WarrantStrategy",  {"wrt_type": "PUT",  "min_delta_abs": 0.3, "max_delta_abs": 0.6, "position_pct": 0.03}, 3),
-        ("derivative_chain", "WARRANT", "volatile"):   ("WarrantStrategy",  {"wrt_type": "PUT",  "min_delta_abs": 0.4, "max_delta_abs": 0.7, "position_pct": 0.04}, 1),
-        ("derivative_chain", "WARRANT", "weak_bear"):  ("WarrantStrategy",  {"wrt_type": "PUT",  "min_delta_abs": 0.4, "max_delta_abs": 0.7, "position_pct": 0.05}, 1),
-        ("derivative_chain", "WARRANT", "bear"):      ("WarrantStrategy",  {"wrt_type": "PUT",  "min_delta_abs": 0.5, "max_delta_abs": 0.8, "position_pct": 0.05}, 1),
-
-        # ── 牛熊证 ──
-        ("derivative_chain", "CBBC", "strong_bull"): ("CBBCStrategy",     {"cbbc_type": "BULL", "min_distance_to_call": 8.0, "max_leverage": 10.0, "position_pct": 0.05}, 1),
-        ("derivative_chain", "CBBC", "bull"):       ("CBBCStrategy",     {"cbbc_type": "BULL", "min_distance_to_call": 5.0, "max_leverage": 8.0, "position_pct": 0.04}, 2),
-        ("derivative_chain", "CBBC", "volatile"):   ("CBBCStrategy",     {"cbbc_type": "BEAR", "min_distance_to_call": 8.0, "position_pct": 0.04}, 1),
-        ("derivative_chain", "CBBC", "weak_bear"):  ("CBBCStrategy",     {"cbbc_type": "BEAR", "min_distance_to_call": 8.0, "max_leverage": 10.0, "position_pct": 0.05}, 1),
-        ("derivative_chain", "CBBC", "bear"):      ("CBBCStrategy",     {"cbbc_type": "BEAR", "min_distance_to_call": 5.0, "position_pct": 0.05}, 1),
-        ("derivative_chain", "CBBC", "range"):      ("GridStrategy",      {"levels": 5, "atr_spacing": True, "position_pct": 0.06}, 3),
-
-        # ── 期权 ──
-        ("derivative_chain", "OPTION", "range"):         ("SellCallStrategy",    {"delta_target": 0.3, "position_pct": 0.08}, 1),
-        ("derivative_chain", "OPTION", "range_high_iv"): ("IronCondorStrategy",  {"wing_width": 0.10, "position_pct": 0.08}, 1),
-        ("derivative_chain", "OPTION", "strong_bull"):   ("CoveredCallStrategy", {"delta_target": 0.3, "position_pct": 0.10}, 2),
-        ("derivative_chain", "OPTION", "bull"):         ("BullCallSpreadStrategy", {"position_pct": 0.08}, 1),
-        ("derivative_chain", "OPTION", "volatile"):     ("StraddleStrategy",    {"min_iv_rank": 0.6, "position_pct": 0.06}, 1),
-        ("derivative_chain", "OPTION", "volatile_low_iv"): ("StraddleStrategy",  {"min_iv_rank": 0.3, "position_pct": 0.06}, 1),
-        ("derivative_chain", "OPTION", "weak_bear"):    ("BearPutSpreadStrategy", {"position_pct": 0.08}, 1),
-        ("derivative_chain", "OPTION", "bear"):         ("SellPutStrategy",     {"delta_target": 0.3, "position_pct": 0.08}, 2),
-
-        # ── IPO ──
-        ("ipo_listing",     "IPO", "volatile"):    ("IPOStrategy",        {"breakout_threshold": 0.05, "profit_take_pct": 0.30, "stop_loss_pct": 0.15, "position_pct": 0.05}, 1),
-        ("ipo_listing",     "IPO", "strong_bull"): ("IPOStrategy",        {"breakout_threshold": 0.03, "profit_take_pct": 0.25, "stop_loss_pct": 0.12, "position_pct": 0.06}, 1),
-        ("ipo_listing",     "IPO", "bull"):        ("IPOStrategy",        {"breakout_threshold": 0.04, "profit_take_pct": 0.20, "stop_loss_pct": 0.12, "position_pct": 0.05}, 2),
-        ("ipo_listing",     "IPO", "range"):       ("GridStrategy",        {"levels": 3, "atr_spacing": True, "position_pct": 0.04}, 2),
-        ("ipo_listing",     "IPO", "weak_bear"):   ("IPOStrategy",        {"breakout_threshold": 0.05, "profit_take_pct": 0.15, "stop_loss_pct": 0.10, "position_pct": 0.03}, 3),
+        # ---- EQUITY ----
+        ("EQUITY", "none", "strong_bull"): "TrendStrategy",
+        ("EQUITY", "none", "bull"): "TrendStrategy",
+        ("EQUITY", "none", "range"): "GridStrategy",
+        ("EQUITY", "none", "volatile"): "DualThrustStrategy",
+        ("EQUITY", "none", "weak_bear"): "MomentumStrategy",
+        ("EQUITY", "none", "bear"): "DualThrustStrategy",
+        # EQUITY + anomaly → 优先异动策略
+        ("EQUITY", "volume_surge", "*"): "TrendStrategy",
+        ("EQUITY", "price_breakout", "*"): "DualThrustStrategy",
+        ("EQUITY", "amplitude", "*"): "ScalpingStrategy",
+        # ---- IPO ----
+        ("IPO", "*", "*"): "IPOStrategy",
+        # ---- WARRANT ----
+        ("WARRANT", "*", "*"): "WarrantStrategy",
+        # ---- CBBC ----
+        ("CBBC", "*", "*"): "CBBCStrategy",
+        # ---- OPTION ----
+        ("OPTION", "*", "strong_bull"): "SellPutStrategy",
+        ("OPTION", "*", "bull"): "SellPutStrategy",
+        ("OPTION", "*", "range"): "IronCondorStrategy",
+        ("OPTION", "*", "volatile"): "IronCondorStrategy",
+        ("OPTION", "*", "weak_bear"): "SellCallStrategy",
+        ("OPTION", "*", "bear"): "SellCallStrategy",
     }
 
-    # ========== 默认降级 ==========
-    DEFAULT_ROUTE = ("GridStrategy", {"levels": 5, "atr_spacing": True, "position_pct": 0.08}, 3)
+    FALLBACK_STRATEGIES = {
+        "EQUITY": "GridStrategy",
+        "IPO": "IPOStrategy",
+        "WARRANT": "WarrantStrategy",
+        "CBBC": "CBBCStrategy",
+        "OPTION": "IronCondorStrategy",
+    }
 
-    # ========== IV 百分位阈值 ==========
-    IV_SELL_THRESHOLD = 0.6   # IV > 此值 → 偏向卖权
-    IV_BUY_THRESHOLD  = 0.4   # IV < 此值 → 偏向买权
+    # 诊断文本 → regime 映射（关键词权重）
+    DIAGNOSIS_REGIME_RULES = [
+        (r"(多头排列|强势突破|52周高位.*9[5-9]%|52周高位.*100%)", "strong_bull"),
+        (r"(站上MA20|周线偏多|均线多头|金叉)", "bull"),
+        (r"(空头排列|跌破MA20|死叉|52周低位)", "weak_bear"),
+        (r"(大幅震荡|高波动|振幅扩大)", "volatile"),
+    ]
 
     def __init__(self, quote_ctx=None, db_path: str = "data/history.db",
-                 kline_provider=None, config: Optional[dict] = None):
+                 kline_provider=None, regime_trainer: RegimeTrainer = None,
+                 param_advisor: ParamAdvisor = None,
+                 db=None, config: dict = None):
         self.ctx = quote_ctx
         self.db_path = db_path
         self.kp = kline_provider
+        self.regime_trainer = regime_trainer
+        self.param_advisor = param_advisor or ParamAdvisor(db)
+        self.db = db
         self.config = config or {}
-        self._db = None  # 延迟初始化
-        self._matcher = None
+        logger.info("[StrategyGenerator] v3.3.2 增强路由（诊断驱动）初始化完成")
 
-    # ==================== 公开 API ====================
+    def generate(self, candidates: List[Dict], regime_map: Dict[str, dict] = None,
+                 market: str = "US") -> int:
+        if not candidates:
+            logger.warning("[Gen] 候选列表为空")
+            return 0
 
-    def generate(self, candidates: List[dict],
-                 regime_map: Dict[str, dict]) -> int:
-        """
-        candidates: List[AnomalyCandidate.to_dict()]
-        regime_map: {vt_symbol: {"regime": ..., "confidence": ..., "iv_percentile": ...}}
-        返回写入条数
-        """
+        if regime_map is None:
+            symbols = [c["vt_symbol"] for c in candidates]
+            if self.regime_trainer:
+                regime_map = self.regime_trainer.batch_compute(symbols)
+            else:
+                regime_map = {s: {"regime": "range", "confidence": 0.5, "iv_percentile": 0.5} for s in symbols}
+
+        # v3.3.2: 不再调用 _clear_old_strategies(market)
+        # 同名策略由 _write_to_db 的 INSERT OR REPLACE 自动覆盖
+        # 不同名的新策略直接插入，旧策略由热加载对账清理
+
         written = 0
         for cand in candidates:
             try:
-                route = self._route(cand, regime_map)
-                if self._write_one(cand, route):
-                    written += 1
+                vt_symbol = cand["vt_symbol"]
+                asset_type = cand.get("asset_type", "EQUITY")
+                anomaly_type = cand.get("anomaly_type", "none")
+                market = cand.get("market", market)
+
+                regime_info = regime_map.get(vt_symbol, {})
+                base_regime = regime_info.get("regime", "range")
+                iv_pct = regime_info.get("iv_percentile", 0.5)
+
+                extra = cand.get("extra", {})
+                diagnosis_text = extra.get("diagnosis", "")
+                adjusted_regime = self._adjust_regime_by_diagnosis(base_regime, diagnosis_text)
+                final_regime = adjusted_regime if adjusted_regime else base_regime
+
+                class_name = self._route(asset_type, anomaly_type, final_regime)
+                if not class_name:
+                    class_name = self.FALLBACK_STRATEGIES.get(asset_type, "GridStrategy")
+
+                safe_sym = vt_symbol.replace(".", "_").replace(" ", "_")
+                strategy_name = f"{class_name}_{safe_sym}"
+
+                current_params = {
+                    "diagnosis": {"features": extra, "score": cand.get("score", 50)},
+                    "regime": {"regime": final_regime, "iv_percentile": iv_pct},
+                    "anomaly_type": anomaly_type,
+                    "asset_type": asset_type,
+                }
+                suggested = self.param_advisor.suggest(vt_symbol, class_name, current_params)
+                if suggested is None:
+                    suggested = {}
+                params = suggested
+
+                self._write_to_db(strategy_name, class_name, vt_symbol, market, params)
+
+                logger.info(
+                    f"[Gen] ✅ {strategy_name} → {class_name}({vt_symbol}) | "
+                    f"{asset_type}|{anomaly_type}|{final_regime}|iv{iv_pct:.2f}|→{class_name}"
+                )
+                written += 1
             except Exception as e:
-                log.error(f"[Gen] 写入失败 {cand.get('vt_symbol','?')}: {e}")
-        log.info(f"[Gen] ✅ 共写入 {written}/{len(candidates)} 个策略到 strategy_config")
+                logger.error(f"[Gen] ❌ 生成失败 {cand.get('vt_symbol','?')}: {e}")
+
+        logger.info(f"[Gen] 共生成 {written} 个策略")
         return written
 
-    def generate_one(self, cand: dict, regime: dict) -> bool:
-        """单条生成（供动态注入）"""
-        route = self._route(cand, {cand["vt_symbol"]: regime})
-        return self._write_one(cand, route)
+    def _adjust_regime_by_diagnosis(self, base_regime: str, diagnosis_text: str) -> Optional[str]:
+        if not diagnosis_text:
+            return None
+        for pattern, regime in self.DIAGNOSIS_REGIME_RULES:
+            if re.search(pattern, diagnosis_text, re.IGNORECASE):
+                logger.debug(f"[Gen] 诊断文本 '{diagnosis_text}' 匹配 '{pattern}' → regime={regime}")
+                return regime
+        return None
 
-    # ==================== 路由核心 ====================
+    def _route(self, asset_type: str, anomaly: str, regime: str) -> Optional[str]:
+        key = (asset_type, anomaly, regime)
+        if key in self.ROUTE_TABLE:
+            return self.ROUTE_TABLE[key]
+        key2 = (asset_type, "*", regime)
+        if key2 in self.ROUTE_TABLE:
+            return self.ROUTE_TABLE[key2]
+        key3 = (asset_type, anomaly, "*")
+        if key3 in self.ROUTE_TABLE:
+            return self.ROUTE_TABLE[key3]
+        key4 = (asset_type, "*", "*")
+        if key4 in self.ROUTE_TABLE:
+            return self.ROUTE_TABLE[key4]
+        return None
 
-    def _route(self, cand: dict, regime_map: Dict[str, dict]) -> dict:
-        asset = cand.get("asset_type", "EQUITY")
-        anomaly = cand.get("anomaly_type", "none")
-        vt = cand.get("vt_symbol", "")
-
-        # 确定 regime 来源
-        if asset in ("WARRANT", "CBBC", "OPTION"):
-            underlying = cand.get("underlying", vt)
-            reg_data = regime_map.get(underlying, {})
-        else:
-            reg_data = regime_map.get(vt, {})
-
-        regime = reg_data.get("regime", "range")
-        confidence = reg_data.get("confidence", 0.5)
-        iv_pct = reg_data.get("iv_percentile", 0.5)
-
-        # 期权 IV 修正
-        if asset == "OPTION":
-            regime = self._adjust_option_regime(regime, iv_pct)
-
-        key = (anomaly, asset, regime)
-        cls, params, pri = self.ROUTE_TABLE.get(key, self.DEFAULT_ROUTE)
-
-        # 波动率缩放（高波动 → 减仓）
-        vol_scale = self._volatility_scale(regime)
-        params = dict(params)
-        params["position_pct"] = round(params.get("position_pct", 0.08) * vol_scale, 4)
-
-        # 衍生品附加正股信息
-        if asset in ("WARRANT", "CBBC", "OPTION"):
-            params["underlying_symbol"] = cand.get("underlying", "")
-
-        # 置信度调整优先级
-        if confidence < 0.4:
-            pri += 1
-
-        reason = f"{asset}|{anomaly}|{regime}|iv{iv_pct:.2f}|→{cls}"
-        return {"class_name": cls, "params": params, "priority": pri, "reason": reason}
-
-    def _adjust_option_regime(self, regime: str, iv_pct: float) -> str:
-        """期权特殊 regime 修正"""
-        if regime == "range" and iv_pct > self.IV_SELL_THRESHOLD:
-            return "range_high_iv"
-        if regime == "volatile" and iv_pct < self.IV_BUY_THRESHOLD:
-            return "volatile_low_iv"
-        return regime
-
-    def _volatility_scale(self, regime: str) -> float:
-        return {
-            "strong_bull": 1.0,
-            "bull": 0.9,
-            "range": 0.8,
-            "volatile": 0.6,
-            "weak_bear": 0.7,
-            "bear": 0.7,
-            "range_high_iv": 0.8,
-            "volatile_low_iv": 0.7,
-        }.get(regime, 0.8)
-
-    # ==================== 写库 ====================
-
-    def _write_one(self, cand: dict, route: dict) -> bool:
-        if self._db is None:
-            from core.db_manager import DBManager
-            self._db = DBManager(self.db_path)
-
-        vt = cand.get("vt_symbol", "")
-        if not vt:
-            return False
-
-        sym = vt.split(".")[0]
-        market = "US" if vt.endswith(".SMART") else ("HK" if vt.endswith(".SEHK") else "")
-        asset = cand.get("asset_type", "EQUITY")
-
-        # 策略命名：ClassName_SYMBOL_ANOMALY
-        anomaly_short = cand.get("anomaly_type", "none")[:10]
-        strategy_name = f"{route['class_name']}_{sym}_{anomaly_short}"
-
-        params = dict(route["params"])
-        params["_anomaly_type"] = cand.get("anomaly_type", "none")
-        params["_asset_class"] = asset
-        params["_regime"] = cand.get("regime", "range")
-        params["_score"] = cand.get("score", 0)
-        params["_reason"] = route.get("reason", "")
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        params_json = json.dumps(params, ensure_ascii=False, default=str)
-
+    def _clear_old_strategies(self, market: str):
+        """保留此方法供手动清理使用，generate() 不再调用"""
+        import sqlite3
         try:
-            cursor = self._db.conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO strategy_config
-                (strategy_name, class_name, vt_symbol, market, params,
-                 enabled, active, version, current_version, status,
-                 source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, 1, 1, 1, 'PENDING', ?, ?, ?)
-            """, (strategy_name, route["class_name"], vt, market,
-                   params_json, "generator", now, now))
-            self._db._safe_commit()
-            log.info(f"[Gen] ✅ {strategy_name} → {route['class_name']}({vt}) | {route['reason']}")
-            return True
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM strategy_config WHERE market = ?", (market,))
+            conn.commit()
+            conn.close()
+            logger.info(f"[Gen] 已清除 {market} 市场旧策略记录（手动调用）")
         except Exception as e:
-            log.error(f"[Gen] 写库失败: {e}")
-            return False
+            logger.warning(f"[Gen] 清除旧策略失败: {e}")
 
-    # ==================== 批量辅助 ====================
+    def _write_to_db(self, strategy_name: str, class_name: str,
+                     vt_symbol: str, market: str, params: dict):
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_config (
+                    strategy_name TEXT PRIMARY KEY,
+                    class_name TEXT,
+                    vt_symbol TEXT,
+                    market TEXT,
+                    params TEXT,
+                    status TEXT DEFAULT 'RUNNING',
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ★★★ FIX: 此方法已弃用，不再被调用，保留仅为兼容旧代码
-    def clear_old_strategies(self, keep_names: Optional[List[str]] = None):
-        """清空旧策略（部署前调用）—— 已弃用，请勿调用"""
-        log.warning("[Gen] clear_old_strategies 已弃用，不再清空数据库")
-        # 不再执行删除操作
+            # v3.3.2: 保留已有记录的 created_at（首次创建时间不被刷新）
+            cur.execute("SELECT created_at FROM strategy_config WHERE strategy_name = ?", (strategy_name,))
+            row = cur.fetchone()
+            created_at = row[0] if row and row[0] else now
+
+            cur.execute("""
+                INSERT OR REPLACE INTO strategy_config
+                (strategy_name, class_name, vt_symbol, market, params, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)
+            """, (
+                strategy_name, class_name, vt_symbol, market,
+                json.dumps(params, ensure_ascii=False),
+                created_at, now,
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"[DB] 写入失败 {strategy_name}: {e}")

@@ -1,10 +1,8 @@
 """
-main.py - Apollo AI Trader v3.2.0 (fixed calls)
-修正内容：
-  1. DualLink 构造：去掉 main_engines/order_manager/sub_manager，改为 main_us/main_hk
-  2. 删除 RemoteController 不存在的 set_order_manager/set_perf_tracker/set_sub_manager/set_dual_link
-  3. 删除 TelegramNotifier 不存在的 set_engine_ref
-  4. DualLink 健康检查改为 start() 方法（而非不存在的 start_health_check）
+main.py - Apollo AI Trader v3.3.2
+变更：
+  v3.3.2 - generator.generate() 补传 market=market 参数
+           防止 HK Pipeline 误用默认 'US' 清除对方市场
 """
 import json
 import logging
@@ -57,17 +55,18 @@ def _run_pipeline_for_market(market, gw_us, gw_hk, kp, strategy_engine, db, db_p
     """对一个市场跑完整流水线：选股 → 诊股 → (regime) → 策略生成 → 部署"""
     log.info(f"=== Pipeline [{market}] start ===")
 
-    # ---- 1. 选股 ----
+    # ---- 1. 选股（不自动诊股） ----
     selected = []
     try:
-        from ai.stock_selector import AIStockSelector
-        selector = AIStockSelector(
-            quote_ctx_us=gw_us.quote_ctx if market == "US" else None,
-            quote_ctx_hk=gw_hk.quote_ctx if market == "HK" else None,
+        from ai.stock_selector import StockSelector
+        ctx = gw_us.quote_ctx if market == "US" else gw_hk.quote_ctx
+        selector = StockSelector(
+            quote_ctx=ctx,
             db=db,
+            kline_provider=kp,
             config=CONFIG,
         )
-        selected = selector.select_all(markets=[market])
+        selected = selector.run(markets=[market])
         log.info(f"[{market}] Selected {len(selected)} stocks")
     except Exception as e:
         log.error(f"[{market}] Selection failed: {e}")
@@ -78,21 +77,20 @@ def _run_pipeline_for_market(market, gw_us, gw_hk, kp, strategy_engine, db, db_p
         log.info(f"[{market}] No selection, skip pipeline")
         return 0
 
-    # ---- 2. 诊股 ----
-    try:
-        ctx_for_diag = gw_us.quote_ctx if market == "US" else gw_hk.quote_ctx
-        diag = StockDiagnosis(quote_ctx=ctx_for_diag, db=db, kline_provider=kp)
-        for item in selected:
-            symbol = item.get("vt_symbol", "")
-            if not symbol:
-                continue
-            try:
-                result = diag.diagnose(symbol)
-                log.info(f"[{market}] Diagnosis {symbol}: {result.get('summary','')}")
-            except Exception as e:
-                log.warning(f"[{market}] Diagnosis failed {symbol}: {e}")
-    except Exception as e:
-        log.warning(f"[{market}] Diagnosis module error: {e}")
+    # ---- 2. 诊股（独立循环，避免卡住选股） ----
+    ctx_for_diag = gw_us.quote_ctx if market == "US" else gw_hk.quote_ctx
+    diag = StockDiagnosis(quote_ctx=ctx_for_diag, db=db, kline_provider=kp)
+    for item in selected:
+        symbol = item.get("vt_symbol", "")
+        if not symbol:
+            continue
+        try:
+            result = diag.diagnose(symbol)
+            summary = result.get("summary", "")
+            item.setdefault("extra", {})["diagnosis"] = summary
+            log.info(f"[{market}] Diagnosis {symbol}: {summary}")
+        except Exception as e:
+            log.warning(f"[{market}] Diagnosis failed {symbol}: {e}")
 
     # ---- 3. Regime 预测（可选） ----
     if hasattr(strategy_engine, 'regime_trainer') and strategy_engine.regime_trainer:
@@ -128,7 +126,8 @@ def _run_pipeline_for_market(market, gw_us, gw_hk, kp, strategy_engine, db, db_p
                     "confidence": item.get("confidence", 0.5),
                     "iv_percentile": item.get("iv_percentile", 0.5),
                 }
-        count = generator.generate(selected, regime_map)
+        # v3.3.2: 补传 market=market
+        count = generator.generate(selected, regime_map, market=market)
         log.info(f"[{market}] Generated {count} strategies")
     except Exception as e:
         log.error(f"[{market}] Strategy generation failed: {e}")
@@ -268,7 +267,6 @@ def main():
     log.info("PerformanceTracker created")
 
     # ===== 13. DualLink =====
-    # 修正：去掉 main_engines/order_manager/sub_manager，使用 main_us/main_hk
     dual_link = DualLink(
         main_us=me_us,
         main_hk=me_hk,
@@ -284,11 +282,6 @@ def main():
         config=CONFIG,
     )
     remote.set_strategy_engine(strategy_engine)
-    # 删除以下不存在的 setter 调用：
-    # remote.set_order_manager(om)
-    # remote.set_perf_tracker(perf_tracker)
-    # remote.set_sub_manager(sub_manager)
-    # remote.set_dual_link(dual_link)
     log.info("RemoteController created")
 
     # ===== 15. Telegram Notifier =====
@@ -299,8 +292,6 @@ def main():
         chat_id=tg_chat_id,
         machine_registry=registry,
     )
-    # 删除不存在的 set_engine_ref 调用：
-    # notifier.set_engine_ref(strategy_engine, om, perf_tracker, sub_manager, dual_link)
     remote.notifier = notifier
     log.info("TelegramNotifier created")
 
@@ -340,7 +331,6 @@ def main():
     strategy_engine.start_hot_reload(interval=CONFIG.get("hot_reload_interval", 300))
 
     # ===== 21. DualLink 健康检查 =====
-    # 修正：使用 start() 而非不存在的 start_health_check
     dual_link.start()
 
     # ===== 22. Telegram 命令轮询 =====
@@ -361,7 +351,7 @@ def main():
     machine_id = registry.machine_id
     bot_name = CONFIG.get("bot_name", "default")
     log.info(
-        f"🚀 Apollo v3.2.0 startup complete | [{bot_name}][{machine_id}][STANDALONE] "
+        f"🚀 Apollo v3.3.2 startup complete | [{bot_name}][{machine_id}][STANDALONE] "
         f"name=standalone-{machine_id[:4]} uptime=0h0m | "
         f"US={us_count} HK={hk_count} | perf_tracker=ON"
     )
