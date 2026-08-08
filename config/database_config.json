@@ -1,0 +1,13 @@
+{
+  "engine": "sqlite",
+  "sqlite_path": "data/database/apollo.db",
+  "postgresql": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "apollo_trader",
+    "user": "",
+    "password": ""
+  },
+  "pool_size": 10,
+  "echo_sql": false
+}

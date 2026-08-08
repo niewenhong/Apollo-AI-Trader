@@ -1,0 +1,30 @@
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "bot_token": "",
+      "chat_id": ""
+    },
+    "wechat_claw": {
+      "enabled": false,
+      "webhook_url": "",
+      "corp_id": "",
+      "agent_id": ""
+    },
+    "email": {
+      "enabled": false,
+      "smtp_server": "",
+      "smtp_port": 465,
+      "username": "",
+      "password": "",
+      "to_addresses": []
+    }
+  },
+  "rules": {
+    "order_filled": {"level": "info", "channels": ["telegram"]},
+    "order_rejected": {"level": "warning", "channels": ["telegram", "wechat_claw"]},
+    "daily_loss_exceeded": {"level": "critical", "channels": ["telegram", "wechat_claw", "email"]},
+    "system_error": {"level": "critical", "channels": ["telegram", "wechat_claw"]},
+    "heartbeat": {"level": "info", "channels": ["telegram"], "interval_minutes": 60}
+  }
+}

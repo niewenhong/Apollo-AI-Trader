@@ -1,17 +1,21 @@
 """
-strategies/equity/dual_thrust_strategy.py - v3.1.4
-Dual Thrust 开盘区间突破 + 多周期确认 + Regime感知
-继承 BaseStrategy，启动交易保护
+strategies/equity/dual_thrust_strategy.py - v3.0.0
+Dual Thrust 开盘区间突破 + 多周期确认
+
+v3.0.0 更新：
+- ❌ 删除 is_regime_tradeable() 调用
+- ✅ 开仓决策仅由 DT 信号 + 5M 确认 + 时间窗口决定
+- ✅ 黑天鹅过滤由基类 _check_trading_allowed() 统一处理
 """
 import numpy as np
 
-from vnpy.trader.object import BarData, TradeData
+from vnpy.trader.object import BarData, TickData, TradeData
 
 from strategies.base_strategy import BaseStrategy
 
 
 class DualThrustStrategy(BaseStrategy):
-    """Dual Thrust 开盘区间突破（v3.1.4）"""
+    """Dual Thrust 开盘区间突破"""
 
     author = "Apollo"
 
@@ -120,16 +124,14 @@ class DualThrustStrategy(BaseStrategy):
                 self.write_log(f"⏰ DT超时(空) @ {close:.2f}")
                 return
 
-        # 开仓（需5M确认 + Regime）
+        # 开仓（5M 确认 + 时间窗口，无 regime 过滤）
         else:
             if self.use_5m_confirm and not (self._5m_breakout_up or self._5m_breakout_down):
-                return
-            if not self.is_regime_tradeable():
                 return
             allow_open, _ = self.check_time_window(bar.datetime)
             if not allow_open:
                 return
-            if not getattr(self, '_trading_allowed', False):
+            if not getattr(self, 'trading', False):
                 return
 
             if close > self.upper_band:
@@ -163,8 +165,8 @@ class DualThrustStrategy(BaseStrategy):
         self.lower_band = self.open_price - self.range_val * self.klong
 
     def _is_session_open(self, bar_datetime) -> bool:
-        h = getattr(bar_datetime, 'hour', 0)
-        m = getattr(bar_datetime, 'minute', 0)
+        h = bar_datetime.hour if hasattr(bar_datetime, 'hour') else 0
+        m = bar_datetime.minute if hasattr(bar_datetime, 'minute') else 0
         return (h == self.session_open_hour and m >= self.session_open_minute)
 
     def on_trade(self, trade: TradeData):

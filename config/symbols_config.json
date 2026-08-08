@@ -1,0 +1,66 @@
+{
+  "equity": {
+    "NVDA": {
+      "exchange": "SMART",
+      "market": "US",
+      "lot_size": 1,
+      "min_tick": 0.01,
+      "trading_hours": "us_regular",
+      "enabled": true
+    },
+    "QQQ": {
+      "exchange": "SMART",
+      "market": "US",
+      "lot_size": 1,
+      "min_tick": 0.01,
+      "trading_hours": "us_regular",
+      "enabled": true
+    },
+    "AAPL": {
+      "exchange": "SMART",
+      "market": "US",
+      "lot_size": 1,
+      "min_tick": 0.01,
+      "trading_hours": "us_regular",
+      "enabled": false
+    },
+    "0700.HK": {
+      "exchange": "HKEX",
+      "market": "HK",
+      "lot_size": 100,
+      "min_tick": 0.2,
+      "trading_hours": "hk_regular",
+      "enabled": true
+    }
+  },
+  "futures": {
+    "ES": {
+      "exchange": "CME",
+      "market": "US",
+      "multiplier": 50,
+      "min_tick": 0.25,
+      "trading_hours": "es_extended",
+      "enabled": true
+    },
+    "NQ": {
+      "exchange": "CME",
+      "market": "US",
+      "multiplier": 20,
+      "min_tick": 0.25,
+      "trading_hours": "nq_extended",
+      "enabled": false
+    }
+  },
+  "structured_products": {
+    "warrants": {
+      "enabled": true,
+      "min_lot": 10000,
+      "tracking_mode": "issuer_hedge"
+    },
+    "cbbc": {
+      "enabled": true,
+      "min_lot": 10000,
+      "knockout_buffer_pct": 2.0
+    }
+  }
+}

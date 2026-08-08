@@ -1,153 +1,170 @@
+# -*- coding: utf-8 -*-
 """
-subscription_manager.py — 按需订阅管理 + 引用计数 + 配额审计
+core/subscription_manager.py - Apollo Trader v3.8.3
+
+职责：只做引用计数 + 配额统计，不再发起真实行情订阅。
+真实订阅由 FutuGateway -> MainEngine -> quote_ctx.subscribe() 完成。
+
+变更记录：
+  v3.8.3 - 彻底移除 set_contexts / register_gateway / _do_subscribe / _do_unsubscribe
+           - 只保留 subscribe_demand / release_demand / audit_quota / get_subscription_report
+           - 新增 _normalize_symbol() 静态方法，确保符号带市场前缀
+  v3.8.2 - 修复参数顺序、回退订阅逻辑
+  v3.2.0 - 初始版本
 """
 import logging
-from typing import Dict, List, Optional, Tuple
-from futu import OpenQuoteContext, SubType, RET_OK, Session
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger("SubManager")
 
 
 class SubscriptionManager:
-    def __init__(self, max_quota: int = 300):
+    """
+    订阅管理器（引用计数版）
+    不再持有行情上下文或网关，只做注册/注销统计。
+    """
+
+    def __init__(self, max_quota: int = 200):
         self.max_quota = max_quota
-        self._ref_count: Dict[Tuple[str, str], int] = {}
-        self._user_subs: Dict[str, Dict[str, List[str]]] = {}
-        self._quote_ctx_us: Optional[OpenQuoteContext] = None
-        self._quote_ctx_hk: Optional[OpenQuoteContext] = None
-        self._gateways: Dict[str, object] = {}
+        # {futu_symbol: {user: set(subtypes)}}
+        self._demands: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+        # 快速查询：{futu_symbol: set(subtypes)}
+        self._merged: Dict[str, Set[str]] = {}
 
-    def set_contexts(self, us_ctx: OpenQuoteContext, hk_ctx: OpenQuoteContext):
-        self._quote_ctx_us = us_ctx
-        self._quote_ctx_hk = hk_ctx
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """
+        标准化符号，确保带市场前缀。
+        规则：
+          - 如果已有 US./HK. 前缀，直接返回
+          - 如果是纯数字且长度5，视为港股，加 HK.
+          - 否则视为美股，加 US.
+        """
+        if symbol.startswith("US.") or symbol.startswith("HK."):
+            return symbol
+        # 去除可能的后缀 .SMART/.SEHK
+        clean = symbol.replace(".SMART", "").replace(".SEHK", "")
+        if clean.isdigit() and len(clean) == 5:
+            return f"HK.{clean}"
+        return f"US.{clean}"
 
-    def register_gateway(self, gateway_name: str, gateway: object):
-        self._gateways[gateway_name] = gateway
-        if hasattr(gateway, 'quote_ctx'):
-            if gateway_name == "FUTU_US":
-                self._quote_ctx_us = gateway.quote_ctx
-            elif gateway_name == "FUTU_HK":
-                self._quote_ctx_hk = gateway.quote_ctx
-        log.info(f"✅ 网关已注册: {gateway_name}")
+    def subscribe_demand(self, symbol: str, user: str,
+                         subtypes: Optional[List[str]] = None) -> bool:
+        """
+        注册一个订阅需求（引用计数）。
+        :param symbol: 可以是 QQQ / US.QQQ / 00700 / HK.00700
+        :param user: 使用者标识（如策略名）
+        :param subtypes: 需要的行情类型列表，如 ["QUOTE","K_1M"]
+        :return: 是否成功（仅当超过配额时失败）
+        """
+        if subtypes is None:
+            subtypes = ["QUOTE"]
 
-    def subscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
-        return self.subscribe_demand(futu_symbol, user, subtypes)
+        futu_sym = self._normalize_symbol(symbol)
+        current_total = self.used()
 
-    def subscribe_demand(self, symbol: str, user: str, subtypes: List[str]) -> bool:
-        if user not in self._user_subs:
-            self._user_subs[user] = {}
-        newly_subscribed = []
-        for st in subtypes:
-            key = (symbol, st)
-            is_new = key not in self._ref_count
-            self._ref_count[key] = self._ref_count.get(key, 0) + 1
-            if is_new:
-                newly_subscribed.append(st)
-            if symbol not in self._user_subs[user]:
-                self._user_subs[user][symbol] = []
-            if st not in self._user_subs[user][symbol]:
-                self._user_subs[user][symbol].append(st)
+        # 检查配额上限
+        if current_total >= self.max_quota:
+            log.warning(f"⚠️ 配额已满 ({current_total}/{self.max_quota})，拒绝订阅: {futu_sym}")
+            return False
 
-        if newly_subscribed:
-            ok = self._do_subscribe(symbol, newly_subscribed)
-            if not ok:
-                for st in newly_subscribed:
-                    key = (symbol, st)
-                    self._ref_count[key] -= 1
-                    if self._ref_count[key] <= 0:
-                        del self._ref_count[key]
-                return False
+        # 记录需求
+        old_count = len(self._merged.get(futu_sym, set()))
+        self._demands[futu_sym][user].update(subtypes)
+        self._rebuild_merged()
+
+        new_count = len(self._merged.get(futu_sym, set()))
+        added = new_count - old_count
+        log.info(f"[Sub] ✅ 注册新订阅: {futu_sym} 类型={sorted(self._merged[futu_sym])} "
+                 f"(已用 {self.used()}/{self.max_quota})")
         return True
 
-    def unsubscribe(self, futu_symbol: str, subtypes: List[str], user: str = "strategy_engine") -> bool:
-        return self.release_demand(futu_symbol, user, subtypes)
-
-    def release_demand(self, symbol: str, user: str, subtypes: List[str]) -> bool:
-        if user not in self._user_subs:
+    def release_demand(self, symbol: str, user: str,
+                       subtypes: Optional[List[str]] = None) -> bool:
+        """
+        释放一个订阅需求（减少引用计数）。
+        :param symbol: 符号（会自动标准化）
+        :param user: 使用者标识
+        :param subtypes: 要释放的类型，None 表示释放该用户的所有需求
+        :return: 是否成功
+        """
+        futu_sym = self._normalize_symbol(symbol)
+        if futu_sym not in self._demands:
+            log.warning(f"[Sub] 未找到订阅记录: {futu_sym}")
             return False
-        to_unsub = []
-        for st in subtypes:
-            key = (symbol, st)
-            if key in self._ref_count:
-                self._ref_count[key] -= 1
-                if self._ref_count[key] <= 0:
-                    del self._ref_count[key]
-                    to_unsub.append(st)
-            if symbol in self._user_subs[user]:
-                if st in self._user_subs[user][symbol]:
-                    self._user_subs[user][symbol].remove(st)
-        if to_unsub:
-            self._do_unsubscribe(symbol, to_unsub)
-        if symbol in self._user_subs[user] and not self._user_subs[user][symbol]:
-            del self._user_subs[user][symbol]
-        if not self._user_subs[user]:
-            del self._user_subs[user]
-        return True
 
-    def _do_subscribe(self, symbol: str, subtypes: List[str]) -> bool:
-        ctx = self._get_ctx_for(symbol)
-        if ctx is None:
-            log.error(f"❌ 无行情上下文: {symbol}")
+        user_demands = self._demands[futu_sym]
+        if user not in user_demands:
+            log.warning(f"[Sub] 用户 {user} 未订阅 {futu_sym}")
             return False
-        session = Session.ALL if symbol.startswith("US.") else Session.NONE
-        sub_objs = [self._str_to_subtype(s) for s in subtypes]
-        sub_objs = [s for s in sub_objs if s is not None]
-        code, data = ctx.subscribe(symbol, sub_objs,
-                                   is_first_push=True, subscribe_push=True,
-                                   session=session)
-        if code == RET_OK:
-            log.info(f"✅ 订阅成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
-            return True
+
+        if subtypes is None:
+            # 释放该用户的所有订阅
+            del user_demands[user]
+            log.info(f"[Sub] 释放 {futu_sym} 用户 {user} 的全部订阅")
         else:
-            log.error(f"❌ 订阅失败: {symbol} {subtypes} | {data}")
-            return False
+            # 移除指定的子类型
+            for st in subtypes:
+                user_demands[user].discard(st)
+            if not user_demands[user]:
+                del user_demands[user]
 
-    def _do_unsubscribe(self, symbol: str, subtypes: List[str]) -> bool:
-        ctx = self._get_ctx_for(symbol)
-        if ctx is None: return False
-        sub_objs = [self._str_to_subtype(s) for s in subtypes]
-        sub_objs = [s for s in sub_objs if s is not None]
-        code, data = ctx.unsubscribe(symbol, sub_objs)
-        if code == RET_OK:
-            log.info(f"✅ 退订成功: {symbol} 类型={subtypes} (已用 {self.used()}/{self.max_quota})")
-        return code == RET_OK
+        # 如果没有任何用户订阅该符号，清除条目
+        if not user_demands:
+            del self._demands[futu_sym]
+
+        self._rebuild_merged()
+        log.info(f"[Sub] 释放完成: {futu_sym} (已用 {self.used()}/{self.max_quota})")
+        return True
 
     def used(self) -> int:
-        return len(self._ref_count)
+        """当前已使用的配额数（合并后的子类型总数）"""
+        total = 0
+        for subs in self._merged.values():
+            total += len(subs)
+        return total
 
     def remaining(self) -> int:
         return self.max_quota - self.used()
 
-    def audit_quota(self):
-        print(f"📊 配额审计: 已用 {self.used()}/{self.max_quota}, 剩余 {self.remaining()}")
-        stock_map: Dict[str, List[str]] = {}
-        for sym, st in self._ref_count.keys():
-            stock_map.setdefault(sym, []).append(st)
-        print(f"📊 当前订阅股票数: {len(stock_map)}")
-        for sym, sts in sorted(stock_map.items()):
-            users = [u for u, d in self._user_subs.items() if sym in d]
-            print(f"   {sym}: {sts} (用户: {set(users)})")
-
-    def _get_ctx_for(self, symbol: str) -> Optional[OpenQuoteContext]:
-        if symbol.startswith("US."): return self._quote_ctx_us
-        elif symbol.startswith("HK."): return self._quote_ctx_hk
-        return None
-
-    @staticmethod
-    def _str_to_subtype(s: str):
-        mapping = {
-            "QUOTE": SubType.QUOTE, "K_1M": SubType.K_1M,
-            "K_5M": SubType.K_5M, "K_15M": SubType.K_15M,
-            "K_30M": SubType.K_30M, "K_60M": SubType.K_60M,
-            "K_DAY": SubType.K_DAY, "ORDER_BOOK": SubType.ORDER_BOOK,
-            "TICKER": SubType.TICKER,
+    def audit_quota(self) -> dict:
+        """
+        审计配额使用情况
+        :return: {"total": int, "remaining": int, "details": {symbol: [subtypes]}}
+        """
+        details = {sym: sorted(list(subs)) for sym, subs in self._merged.items()}
+        return {
+            "total": self.max_quota,
+            "used": self.used(),
+            "remaining": self.remaining(),
+            "details": details
         }
-        return mapping.get(s)
 
-    def build_plan(self, config: dict, deployed_strategies: set = None) -> Dict[str, Dict[str, List[str]]]:
-        from core.subscription_plan import build_subscription_plan
-        return build_subscription_plan(config, deployed_strategies)
+    def get_subscription_report(self) -> str:
+        """生成人类可读的订阅报告"""
+        report_lines = []
+        report_lines.append(f"📊 配额审计: 已用 {self.used()}/{self.max_quota}, 剩余 {self.remaining()}")
+        report_lines.append(f"📊 当前订阅股票数: {len(self._merged)}")
+        for sym, subs in sorted(self._merged.items()):
+            report_lines.append(f"  {sym}: {sorted(subs)}")
+        return "\n".join(report_lines)
 
-    def apply_plan(self, config: dict, deployed_strategies: set = None) -> bool:
-        from core.subscription_plan import apply_subscription_plan
-        return apply_subscription_plan(self, config, deployed_strategies)
+    def _rebuild_merged(self):
+        """重建合并后的订阅视图"""
+        merged = {}
+        for sym, users_dict in self._demands.items():
+            all_subs = set()
+            for subs_set in users_dict.values():
+                all_subs.update(subs_set)
+            merged[sym] = all_subs
+        self._merged = merged
+
+    # ---------- 兼容旧接口（空实现，避免导入报错） ----------
+    def set_contexts(self, *args, **kwargs):
+        log.debug("[Sub] set_contexts 已废弃，无操作")
+        pass
+
+    def register_gateway(self, *args, **kwargs):
+        log.debug("[Sub] register_gateway 已废弃，无操作")
+        pass

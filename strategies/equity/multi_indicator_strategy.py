@@ -1,19 +1,25 @@
 """
-strategies/equity/multi_indicator_strategy.py - v3.1.4
-10维共振策略 + 多周期确认 + Regime感知
-继承 BaseStrategy，启动交易保护
+strategies/equity/multi_indicator_strategy.py - v3.0.0
+10 维共振策略 + 多周期确认
+
+v3.0.0 更新：
+- ❌ 删除 is_regime_tradeable() 调用
+- ❌ 删除 use_regime_filter 参数
+- ✅ 开仓决策仅由综合评分 + 5M 确认 + 时间窗口决定
+- ✅ Regime 标签仅记录到日志，不参与决策
+- ✅ 黑天鹅过滤由基类 _check_trading_allowed() 统一处理
 """
 import numpy as np
 
 from vnpy.trader.constant import Direction
-from vnpy.trader.object import BarData, TradeData
+from vnpy.trader.object import BarData, OrderData, TradeData
 from vnpy.trader.utility import ArrayManager
 
 from strategies.base_strategy import BaseStrategy
 
 
 class MultiIndicatorStrategy(BaseStrategy):
-    """10+维共振策略（v3.1.4）"""
+    """10+ 维共振策略"""
 
     author = "Apollo-AI-Trader"
 
@@ -26,7 +32,6 @@ class MultiIndicatorStrategy(BaseStrategy):
         "volume_ma_period", "volume_spike_mult",
         "score_threshold", "sell_threshold",
         "use_5m_confirm",
-        "use_regime_filter",
     ]
     variables = BaseStrategy.variables + [
         "composite_score", "cumulative_pnl",
@@ -51,7 +56,6 @@ class MultiIndicatorStrategy(BaseStrategy):
         "score_threshold": 6,
         "sell_threshold": 2,
         "use_5m_confirm": True,
-        "use_regime_filter": True,
     }
 
     def __init__(self, cta_engine, strategy_name: str, vt_symbol: str, setting: dict):
@@ -67,7 +71,7 @@ class MultiIndicatorStrategy(BaseStrategy):
         self.adx_val = 0.0
 
         # 5M 确认状态
-        self._5m_agree = 0
+        self._5m_agree = 0  # 1 同向, -1 反向, 0 未知
 
         # 5M ArrayManager
         self.am_5m = ArrayManager(100)
@@ -84,9 +88,9 @@ class MultiIndicatorStrategy(BaseStrategy):
     def on_stop(self):
         super().on_stop()
 
-    # ────────────────────────
+    # ────────────────────────────
     #  1M 层：主决策
-    # ────────────────────────
+    # ────────────────────────────
     def on_1m_bar(self, bar: BarData):
         super().on_1m_bar(bar)
         if not self.am.inited:
@@ -105,7 +109,7 @@ class MultiIndicatorStrategy(BaseStrategy):
         self.boll_lower = boll_dn
         atr = self.am.atr(self.atr_period, array=False)
 
-        # ADX
+        # ADX 计算
         if len(self.am.close) >= self.adx_period:
             self.adx_val = self.am.adx(self.adx_period, array=False)
         else:
@@ -119,21 +123,29 @@ class MultiIndicatorStrategy(BaseStrategy):
         else:
             self.vol_ratio = 1.0
 
-        # ── 10维评分 ──
+        # ── 10 维评分 ──
         score = 5
+        # 1. 均线方向
         if fast_ma > slow_ma: score += 2
         elif fast_ma < slow_ma: score -= 2
+        # 2. RSI
         if self.rsi_val > 60: score += 1
         elif self.rsi_val < 40: score -= 1
+        # 3. MACD 柱
         if macd_hist > 0: score += 1
         elif macd_hist < 0: score -= 1
+        # 4. 价格相对布林带
         if close > boll_up: score += 1
         elif close < boll_dn: score -= 1
+        # 5. 成交量异动
         if self.vol_ratio > self.volume_spike_mult: score += 1
+        # 6. ADX
         if self.adx_val > 25: score += 1
+        # 7. 5M 确认
         if self.use_5m_confirm:
             if self._5m_agree == 1 and fast_ma > slow_ma: score += 1
             elif self._5m_agree == -1 and fast_ma < slow_ma: score -= 1
+        # 8. ATR 趋势
         if len(self.am.close) >= 10:
             if close > self.am.close[-10]: score += 0.5
             else: score -= 0.5
@@ -152,13 +164,16 @@ class MultiIndicatorStrategy(BaseStrategy):
             self.write_log(f"🛑 尾盘清仓 | score={score:.1f}")
             return
 
-        # Regime 过滤
-        regime_ok = self.is_regime_tradeable() if self.use_regime_filter else True
+        # 记录 regime 标签（仅供参考，不参与决策）
+        self.update_regime_label()
+        regime_label = self.current_regime
+        if self.pos == 0 and allow_open:
+            self.write_log(f"[SCORE] score={score:.1f} regime={regime_label} close={close:.2f} RSI={self.rsi_val:.0f}")
 
-        # 买入
-        if score >= self.score_threshold and self.pos == 0 and regime_ok and allow_open:
-            if getattr(self, '_trading_allowed', False):
-                self.write_log(f"[SIGNAL] BUY | score={score:.1f} close={close:.2f} RSI={self.rsi_val:.0f}")
+        # 买入（无 regime 过滤）
+        if score >= self.score_threshold and self.pos == 0 and allow_open:
+            if getattr(self, 'trading', False):
+                self.write_log(f"[SIGNAL] BUY | score={score:.1f} close={close:.2f} RSI={self.rsi_val:.0f} MACD={macd_hist:.3f}")
                 self.on_buy_signal(self.fixed_size, close)
 
         # 卖出
@@ -166,9 +181,9 @@ class MultiIndicatorStrategy(BaseStrategy):
             self.write_log(f"[SIGNAL] SELL | score={score:.1f} close={close:.2f}")
             self.on_sell_signal(abs(self.pos), close)
 
-    # ────────────────────────
+    # ────────────────────────────
     #  5M 层：确认
-    # ────────────────────────
+    # ────────────────────────────
     def on_5m_bar(self, bar: BarData):
         self.am_5m.update_bar(bar)
         if not self.am_5m.inited:
@@ -182,11 +197,19 @@ class MultiIndicatorStrategy(BaseStrategy):
         else:
             self._5m_agree = 0
 
-    # ────────────────────────
+    # ────────────────────────────
+    #  60M 层：宏观
+    # ────────────────────────────
+    def on_60m_bar(self, bar: BarData):
+        if self.am.inited:
+            ma60 = self.am.sma(60, array=False)
+            self.write_log(f"[60M] close={bar.close_price:.2f} MA60={ma60:.2f} score={self.composite_score:.1f}")
+
+    # ────────────────────────────
     #  下单
-    # ────────────────────────
+    # ────────────────────────────
     def on_buy_signal(self, size: int, price: float):
-        if not getattr(self, '_trading_allowed', False) or self.pos > 0 or self.is_ordering:
+        if not self.trading or self.pos > 0 or self.is_ordering:
             return
         self.is_ordering = True
         try:
@@ -197,7 +220,7 @@ class MultiIndicatorStrategy(BaseStrategy):
             self.write_log(f"[BUY] 异常: {e}")
 
     def on_sell_signal(self, size: int, price: float):
-        if not getattr(self, '_trading_allowed', False) or self.pos <= 0 or self.is_ordering:
+        if not self.trading or self.pos <= 0 or self.is_ordering:
             return
         self.is_ordering = True
         try:
@@ -206,6 +229,10 @@ class MultiIndicatorStrategy(BaseStrategy):
         except Exception as e:
             self.is_ordering = False
             self.write_log(f"[SELL] 异常: {e}")
+
+    def on_order(self, order: OrderData):
+        super().on_order(order)
+        self.write_log(f"[on_order] {order.vt_orderid} | {order.status.name} | {order.traded}/{order.volume}")
 
     def on_trade(self, trade: TradeData):
         super().on_trade(trade)

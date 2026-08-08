@@ -1,12 +1,12 @@
+# -*- coding: utf-8 -*-
 """
-core/strategy_matcher.py - v3.3.0 增强版
+core/strategy_matcher.py - v3.5.0 增强版
 ==========================================
-增强内容：
-  1. 完整 Sharpe 表覆盖 5 种 regime × 17 种策略
-  2. 期权 IV 百分位 4 桶决策（低IV买/高IV卖）
-  3. 置信度加权评分
-  4. 衍生品权重缩放
-  5. 新增 get_all_strategies_for_regime() 排名查询
+变更：
+  v3.5.0 - 新增高频策略评分（Scalping/VWAP/OrderFlow）
+           - 新增 micro_state 因子支持
+           - 新增 get_all_strategies_for_regime() 排名查询
+           - IV 百分位 5 桶决策完善
 """
 from typing import Optional, Dict, List, Tuple
 import logging
@@ -16,17 +16,17 @@ log = logging.getLogger("StrategyMatcher")
 
 class StrategyMatcher:
     """
-    Regime → 策略 Sharpe 评分匹配器 v3.3.0
+    Regime → 策略 Sharpe 评分匹配器 v3.5.0
 
     评分维度：
-      1) regime × strategy Sharpe 基础分（历史回测）
-      2) 期权 IV 百分位修正（低IV→买权加分，高IV→卖权加分）
+      1) regime × strategy Sharpe 基础分
+      2) 期权 IV 百分位修正
       3) regime 置信度加权
-      4) 衍生品类型缩放（窝轮/牛熊证置信度×0.9）
+      4) 衍生品类型缩放
+      5) 高频策略 micro_state 修正
     """
 
     # ========== Sharpe 表（regime × strategy）==========
-    # 值 = 期望 Sharpe 比率（历史回测近似）
     SHARPE_TABLE = {
         # ── strong_bull ──
         "strong_bull": {
@@ -35,6 +35,7 @@ class StrategyMatcher:
             "GridStrategy": 0.8, "SellCallStrategy": 1.5,
             "CoveredCallStrategy": 1.2, "BullCallSpreadStrategy": 1.7,
             "CashSecuredPutStrategy": 0.9, "IPOStrategy": 1.4,
+            "ScalpingStrategy": 1.3, "OrderFlowStrategy": 1.4,
         },
         # ── bull ──
         "bull": {
@@ -42,7 +43,7 @@ class StrategyMatcher:
             "DualThrustStrategy": 1.3, "VWAPStrategy": 1.2,
             "GridStrategy": 1.0, "BullCallSpreadStrategy": 1.5,
             "CoveredCallStrategy": 1.1, "SellPutStrategy": 1.0,
-            "IPOStrategy": 1.2,
+            "IPOStrategy": 1.2, "ScalpingStrategy": 1.2,
         },
         # ── range ──
         "range": {
@@ -50,7 +51,7 @@ class StrategyMatcher:
             "SellCallStrategy": 1.6, "SellPutStrategy": 1.5,
             "IronCondorStrategy": 1.7, "StraddleStrategy": 0.9,
             "VWAPStrategy": 1.2, "CashSecuredPutStrategy": 1.3,
-            "CoveredCallStrategy": 1.0,
+            "CoveredCallStrategy": 1.0, "ScalpingStrategy": 1.0,
         },
         # ── volatile ──
         "volatile": {
@@ -58,17 +59,20 @@ class StrategyMatcher:
             "StraddleStrategy": 1.6, "GridStrategy": 0.6,
             "TrendStrategy": 0.8, "IronCondorStrategy": 1.3,
             "BearPutSpreadStrategy": 1.4, "BullCallSpreadStrategy": 1.2,
+            "ScalpingStrategy": 1.6, "OrderFlowStrategy": 1.5,
+            "VWAPStrategy": 1.0,
         },
         # ── weak_bear / bear ──
         "weak_bear": {
             "BearPutSpreadStrategy": 1.6, "MomentumStrategy": 1.3,
             "DualThrustStrategy": 1.2, "SellCallStrategy": 1.4,
             "GridStrategy": 0.7, "CashSecuredPutStrategy": 1.0,
+            "ScalpingStrategy": 1.1,
         },
         "bear": {
             "BearPutSpreadStrategy": 1.7, "MomentumStrategy": 1.5,
             "DualThrustStrategy": 1.3, "SellCallStrategy": 1.5,
-            "CashSecuredPutStrategy": 1.1,
+            "CashSecuredPutStrategy": 1.1, "ScalpingStrategy": 1.0,
         },
         # ── 衍生品专用 regime ──
         "range_high_iv": {
@@ -83,14 +87,13 @@ class StrategyMatcher:
 
     # ========== IV 百分位修正 ==========
     IV_BUCKETS = {
-        "very_low":  (0.0,  0.2),   # 买权便宜 → 买权策略加分
+        "very_low":  (0.0,  0.2),
         "low":       (0.2,  0.4),
         "medium":    (0.4,  0.6),
         "high":      (0.6,  0.8),
-        "very_high": (0.8,  1.01),  # 卖权贵 → 卖权策略加分
+        "very_high": (0.8,  1.01),
     }
 
-    # IV 桶 → 策略方向偏好（正=买权加分，负=卖权加分）
     IV_DIRECTION = {
         "very_low":  {"buy": 0.3, "sell": -0.2},
         "low":       {"buy": 0.15, "sell": -0.1},
@@ -99,7 +102,6 @@ class StrategyMatcher:
         "very_high": {"buy": -0.2, "sell": 0.3},
     }
 
-    # 哪些策略属于"买权"方向 vs "卖权"方向
     BUY_STRATEGIES = {
         "BullCallSpreadStrategy", "BearPutSpreadStrategy",
         "StraddleStrategy", "MomentumStrategy",
@@ -108,6 +110,20 @@ class StrategyMatcher:
         "SellCallStrategy", "SellPutStrategy",
         "CoveredCallStrategy", "CashSecuredPutStrategy",
         "IronCondorStrategy",
+    }
+
+    # ========== 高频策略 micro_state 修正 ==========
+    MICRO_STATE_MODIFIERS = {
+        "toxic_orderflow": {
+            "ScalpingStrategy": +0.3, "VWAPStrategy": -0.1, "OrderFlowStrategy": +0.2,
+        },
+        "liquidity_surge": {
+            "OrderFlowStrategy": +0.3, "ScalpingStrategy": +0.1, "VWAPStrategy": -0.1,
+        },
+        "tight_spread": {
+            "VWAPStrategy": +0.2, "ScalpingStrategy": +0.1,
+        },
+        "normal": {},
     }
 
     # ========== 衍生品缩放 ==========
@@ -121,20 +137,21 @@ class StrategyMatcher:
 
     # ========== 置信度权重 ==========
     CONFIDENCE_WEIGHTS = {
-        "high":   1.0,   # >= 0.7
-        "medium": 0.8,   # 0.4 ~ 0.7
-        "low":    0.5,   # < 0.4
+        "high":   1.0,
+        "medium": 0.8,
+        "low":    0.5,
     }
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
-        self._override: Dict[str, float] = {}  # 手动覆盖 Sharpe
+        self._override: Dict[str, float] = {}
 
     # ==================== 公开 API ====================
 
     def match(self, regime: str, asset_class: str = "EQUITY",
               iv_percentile: float = 0.5,
               confidence: float = 0.5,
+              micro_state: str = "normal",
               top_n: int = 5) -> List[Tuple[str, float]]:
         """
         返回 [(strategy_name, adjusted_sharpe), ...] 降序
@@ -154,9 +171,11 @@ class StrategyMatcher:
         # 3) 衍生品缩放
         deriv_scale = self.DERIVATIVE_PENALTY.get(asset_class, 1.0)
 
+        # 4) 高频 micro_state 修正
+        micro_mod = self.MICRO_STATE_MODIFIERS.get(micro_state, {})
+
         scored = []
         for sname, base_sharpe in base_table.items():
-            # 手动覆盖优先
             if sname in self._override:
                 sharpe = self._override[sname]
             else:
@@ -168,11 +187,14 @@ class StrategyMatcher:
             elif sname in self.SELL_STRATEGIES:
                 sharpe += iv_dir["sell"]
 
+            # micro_state 修正
+            if sname in micro_mod:
+                sharpe += micro_mod[sname]
+
             # 置信度 + 衍生品缩放
             sharpe *= conf_weight
             sharpe *= deriv_scale
 
-            # 手动 floor
             sharpe = max(sharpe, 0.1)
             scored.append((sname, round(sharpe, 3)))
 
@@ -181,17 +203,17 @@ class StrategyMatcher:
 
     def get_best(self, regime: str, asset_class: str = "EQUITY",
                  iv_percentile: float = 0.5,
-                 confidence: float = 0.5) -> str:
-        """返回最佳策略类名"""
-        results = self.match(regime, asset_class, iv_percentile, confidence, top_n=1)
+                 confidence: float = 0.5,
+                 micro_state: str = "normal") -> str:
+        results = self.match(regime, asset_class, iv_percentile, confidence, micro_state, top_n=1)
         return results[0][0] if results else "GridStrategy"
 
     def get_all_strategies_for_regime(self, regime: str,
                                       asset_class: str = "EQUITY",
                                       iv_percentile: float = 0.5,
-                                      confidence: float = 0.5) -> List[dict]:
-        """返回完整排名列表（含评分明细），供 UI / 日志使用"""
-        results = self.match(regime, asset_class, iv_percentile, confidence, top_n=50)
+                                      confidence: float = 0.5,
+                                      micro_state: str = "normal") -> List[dict]:
+        results = self.match(regime, asset_class, iv_percentile, confidence, micro_state, top_n=50)
         output = []
         for rank, (sname, score) in enumerate(results, 1):
             output.append({
@@ -202,6 +224,7 @@ class StrategyMatcher:
                 "asset_class": asset_class,
                 "iv_percentile": iv_percentile,
                 "confidence": confidence,
+                "micro_state": micro_state,
             })
         return output
 
@@ -209,12 +232,9 @@ class StrategyMatcher:
                                weights: Optional[Dict[str, float]] = None,
                                asset_class: str = "EQUITY",
                                iv_percentile: float = 0.5,
-                               confidence: float = 0.5) -> List[Tuple[str, float]]:
-        """
-        带用户权重的推荐（weights: {strategy_name: user_weight}）
-        最终分 = adjusted_sharpe × user_weight
-        """
-        base = self.match(regime, asset_class, iv_percentile, confidence, top_n=50)
+                               confidence: float = 0.5,
+                               micro_state: str = "normal") -> List[Tuple[str, float]]:
+        base = self.match(regime, asset_class, iv_percentile, confidence, micro_state, top_n=50)
         if not weights:
             return base
         scored = []
@@ -225,7 +245,6 @@ class StrategyMatcher:
         return scored
 
     def set_override(self, strategy_name: str, sharpe: float):
-        """手动覆盖某策略 Sharpe（用于 A/B 测试 / 紧急调整）"""
         self._override[strategy_name] = sharpe
 
     def clear_overrides(self):

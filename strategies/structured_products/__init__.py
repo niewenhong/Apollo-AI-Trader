@@ -1,8 +1,6 @@
 """
-strategies/structured_products/__init__.py - v2.9.7
-注册结构化产品策略
+strategies/structured_products/__init__.py - v3.8.0
+结构化产品策略包
 """
-from .warrant_strategy import WarrantStrategy
-from .cbbc_strategy import CBBCStrategy
-
-__all__ = ["WarrantStrategy", "CBBCStrategy"]
+__version__ = "3.8.0"
+__all__ = []

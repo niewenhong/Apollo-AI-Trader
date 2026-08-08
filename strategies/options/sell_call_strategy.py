@@ -1,125 +1,222 @@
+# -*- coding: utf-8 -*-
 """
-strategies/options/sell_call_strategy.py - 卖出看涨期权策略 v1.3 (修复版)
+strategies/options/sell_call_strategy.py - Apollo-AI-Trader v3.1.1
+Sell Call：卖Call收权利金（看不涨/想高价出货）
+
+v3.1.1 变更：
+- 修复：实现抽象方法 on_init（加载历史K线）
+- 修复：实现抽象方法 _on_bar_impl
+- 修复：strike 拼写错误（原 strik）
+- 修复：delta 多括号语法错误
+- 增加 _stopped 检查
+- 增加初始化重试上限（max_retries=5）
 """
-import logging
-from vnpy.trader.constant import Direction, Offset
-from vnpy.trader.object import TickData, BarData, OrderData, TradeData
-from vnpy_ctastrategy import CtaTemplate, StopOrder
-
-from .base_option_strategy import BaseOptionStrategy
-
-logger = logging.getLogger(__name__)
+from vnpy.trader.object import BarData, Direction, Offset
+from vnpy.trader.constant import Interval
+from strategies.options.base_option_strategy import BaseOptionStrategy
 
 
 class SellCallStrategy(BaseOptionStrategy):
-    """卖出看涨期权策略（备兑开仓或裸卖）"""
+    author = "Apollo"
+    version = "3.1.1"
 
-    author = "Apollo AI Trader"
-
-    # 额外参数
-    short_call_strike_offset = 0.05
-    roll_when_itm_pct = 0.80
-    max_dte_roll = 7
-    min_premium_collect = 0.02
-
-    # ★ 变量列表：必须与 __init__ 中初始化的实例属性完全一致
-    variables = [
-        "net_premium",
-        "current_option_price",
-        "option_delta",
-        "option_theta",
-        "option_iv",
-        "days_to_expiry",
-        "strike_price",
-        "is_itm",
-        "is_rolled",
-        "last_roll_date",
-        # 继承自父类的变量
-        "current_price", "position_value",
-        "unrealized_pnl", "realized_pnl", "trade_count",
-        "entry_price", "highest_price", "lowest_price", "atr_value"
-    ]
+    delta_target        = 0.20
+    delta_tolerance     = 0.10
+    min_otm_prob        = 78.0
+    min_days_to_expire  = 7
+    max_days_to_expire  = 90
+    min_annual_roi      = 0.20
+    position_size       = 1
+    max_positions       = 5
+    roll_when_ditm      = 0.32
+    cash_buffer_ratio   = 0.10
+    adx_trend_threshold = 22
+    min_premium_usd     = 0.15
+    min_oi             = 50
+    min_volume         = 10
+    expire_close_days   = 2
 
     parameters = [
-        "short_call_strike_offset", "roll_when_itm_pct", "max_dte_roll",
-        "min_premium_collect",
-        "delta_target", "min_delta_abs", "max_delta_abs",
-        "min_premium", "max_premium",
-        "expiry_days", "min_expiry_days", "max_expiry_days",
-        "position_pct", "fixed_size",
-        "stop_loss", "take_profit", "max_positions",
-        "use_trailing_stop", "trailing_stop_pct"
+        "delta_target", "delta_tolerance", "min_otm_prob",
+        "min_days_to_expire", "max_days_to_expire", "min_annual_roi",
+        "position_size", "max_positions", "roll_when_ditm",
+        "cash_buffer_ratio", "adx_trend_threshold", "min_premium_usd",
+        "min_oi", "min_volume", "expire_close_days",
     ]
+    variables = ["net_premium", "max_loss", "pnl", "legs",
+                 "cash_reserved", "regime_label", "last_adx"]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
-        # ★ 先调用父类初始化（父类会设置一些属性）
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+        self.cash_reserved = 0.0
+        self.last_adx = 0.0
+        self._rolling = False
+        self._init_retry_count = 0
+        for param in self.parameters:
+            if not hasattr(self, param):
+                setattr(self, param, getattr(type(self), param, None))
 
-        # ★ 强制初始化所有在 variables 中声明的属性（防止任何遗漏）
-        self.net_premium = 0.0
-        self.current_option_price = 0.0
-        self.option_delta = 0.0
-        self.option_theta = 0.0
-        self.option_iv = 0.0
-        self.days_to_expiry = 0
-        self.strike_price = 0.0
-        self.is_itm = False
-        self.is_rolled = False
-        self.last_roll_date = ""
-
-        # 额外参数
-        self.short_call_strike_offset = setting.get("short_call_strike_offset", 0.05)
-        self.roll_when_itm_pct = setting.get("roll_when_itm_pct", 0.80)
-        self.max_dte_roll = setting.get("max_dte_roll", 7)
-        self.min_premium_collect = setting.get("min_premium_collect", 0.02)
-
-        logger.info(f"[SellCall] {strategy_name} 初始化完成")
-
+    # ── 初始化（实现抽象方法） ──────────────────
     def on_init(self):
-        """策略初始化"""
-        self.write_log("SellCallStrategy 初始化")
-        self.load_bar(10)
+        """策略初始化：加载历史K线"""
+        self.write_log("[SellCall] on_init 开始，加载历史K线")
+        try:
+            self.load_bar(days=30, interval=Interval.DAILY, callback=self.on_bar)
+            self.load_bar(days=2, interval=Interval.HOUR, callback=self.on_bar)
+        except Exception as e:
+            self.write_log("[SellCall] load_bar 异常: %s" % e)
+        self._init_retry_count = 0
+        self.write_log("[SellCall] on_init 完成")
 
-    def on_start(self):
-        """策略启动"""
-        self.write_log("SellCallStrategy 启动")
-        self.put_event()
+    # ── 5分钟K线：趋势过滤 ────────────────────────
+    def _on_5m_bar_impl(self, bar: BarData):
+        if self._stopped:
+            return
+        adx = getattr(self, "_adx_5m", 0.0)
+        self.last_adx = adx
+        if adx > self.adx_trend_threshold:
+            self.write_log("[SellCall] ADX=%.1f 强趋势，暂停卖Call" % adx)
 
-    def on_stop(self):
-        """策略停止"""
-        self.write_log("SellCallStrategy 停止")
-        self.put_event()
+    # ── 主K线逻辑（实现抽象方法） ──────────────
+    def _on_bar_impl(self, bar: BarData):
+        if self._stopped:
+            return
 
-    def on_tick(self, tick: TickData):
-        """Tick行情回调"""
-        self.current_price = tick.last_price
-        self.put_event()
+        # 1. 到期管理
+        if self._manage_expire(bar):
+            self._rolling = False
+            return
 
-    def on_bar(self, bar: BarData):
-        """Bar回调 - 简单示例逻辑"""
-        self.current_price = bar.close_price
-        # 更新一些变量以避免被优化掉
-        self.days_to_expiry = self.expiry_days
-        self.strike_price = self.current_price * 1.05
-        self.option_delta = -0.3
-        self.option_theta = 0.002
-        self.option_iv = 0.25
-        self.is_itm = self.current_price > self.strike_price
-        self.current_option_price = max(self.min_premium, self.current_price * 0.02)
-        self.put_event()
+        # 2. 展期检查
+        if self.legs and not self._rolling:
+            for name, leg in list(self.legs.items()):
+                delta = abs(leg.get("delta", 0))
+                if delta > self.roll_when_ditm:
+                    self.write_log("[SellCall] %s delta=%.2f>%.2f，展期" %
+                                   (name, delta, self.roll_when_ditm))
+                    self._rolling = True
+                    self._roll_positions()
+                    return
 
-    def on_order(self, order: OrderData):
-        """委托回调"""
-        pass
+        # 3. 更新 PnL
+        if self.legs:
+            self.pnl = self._estimate_pnl()
 
-    def on_trade(self, trade: TradeData):
-        """成交回调"""
-        self.trade_count += 1
-        if trade.direction == Direction.SHORT and trade.offset == Offset.OPEN:
-            self.entry_price = trade.price
-        self.realized_pnl += trade.profit if hasattr(trade, 'profit') else 0
-        self.put_event()
+        # 4. 无持仓时尝试开仓
+        if not self.legs:
+            self._rolling = False
+            if len(self.legs) < self.max_positions:
+                self._find_call_to_sell(bar)
 
-    def on_stop_order(self, stop_order: StopOrder):
-        """停止单回调"""
-        pass
+    # ── 现金/保证金检查 ──────────────────────────────
+    def _enough_cash(self, bar: BarData) -> bool:
+        """卖Call需要保证金（约=标的价×20%）"""
+        strike = bar.close_price
+        if strike <= 0:
+            return False
+        margin_per = strike * 0.20
+        need = margin_per * 100 * self._scaled_size() * (1 + self.cash_buffer_ratio)
+        self.cash_reserved = need
+        avail = self._get_available_cash()
+        if avail <= 0:
+            return True
+        ok = avail >= need
+        if not ok:
+            self.write_log("[SellCall] 保证金不足 需要≈%.0f 可用=%.0f" % (need, avail))
+        return ok
+
+    # ── 选合约 ────────────────────────────────────
+    def _find_call_to_sell(self, bar: BarData):
+        if self._init_retry_count >= 5:
+            self.write_log("[SellCall] 初始化重试已达上限，跳过本次开仓")
+            return
+        self._init_retry_count += 1
+
+        if not self._enough_cash(bar):
+            return
+
+        code = self._to_futu_code()
+        if not code:
+            return
+
+        chain = self._query_full_chain(code)
+        if chain is None:
+            self.write_log("[SellCall] %s 期权链为空" % code)
+            return
+
+        # 使用基类筛选方法
+        calls = self._select_contracts(chain, "call",
+                                        min_days=self.min_days_to_expire,
+                                        max_days=self.max_days_to_expire)
+        if not calls:
+            self.write_log("[SellCall] 无符合条件的Call")
+            return
+
+        lo = abs(self.delta_target) - self.delta_tolerance
+        hi = abs(self.delta_target) + self.delta_tolerance
+
+        candidates = []
+        for c in calls:
+            d = abs(c.get("delta", 0))
+            if d < lo or d > hi:
+                continue
+            if c.get("premium", 0) < self.min_premium_usd:
+                continue
+            otm = c.get("otm_prob", 0)
+            if otm < self.min_otm_prob / 100.0:
+                continue
+            candidates.append(c)
+
+        if not candidates:
+            self.write_log("[SellCall] 无符合delta区间(%.2f-%.2f)的Call" % (lo, hi))
+            return
+
+        # 按 OTM 概率降序，再按权利金降序
+        candidates.sort(key=lambda x: (-x.get("otm_prob", 0), -x.get("premium", 0)))
+        target = candidates[0]
+
+        # 年化 ROI
+        strike = target.get("strike_price", 0)
+        prem = target.get("premium", 0)
+        dte = max(target.get("days_to_expire", 30), 1)
+        annual_roi = (prem / max(strike, 0.01)) * (365.0 / dte)
+        if annual_roi < self.min_annual_roi:
+            self.write_log("[SellCall] ROI=%.1f%%<%.0f%%，跳过" % (annual_roi * 100, self.min_annual_roi * 100))
+            return
+
+        target["name"] = "sold_call"
+        target["is_long"] = False
+        ok = self._send_option_order(target, Direction.SHORT, Offset.OPEN,
+                                     qty=self._scaled_size())
+        if ok:
+            self.net_premium += prem
+            self.max_loss = (strike - prem) * 100
+            self.pnl = self._estimate_pnl()
+            self.write_log("[SellCall] 卖出Call %s K=%.0f premium=%.2f "
+                           "delta=%.2f otm%%=%.0f annual_roi=%.1f%%" %
+                           (target.get('code', '?'), strike, prem,
+                            target.get('delta', 0), target.get('otm_prob', 0) * 100,
+                            annual_roi * 100))
+        else:
+            self.write_log("[SellCall] 卖出Call失败 %s" % target.get('code', '?'))
+
+    # ── Tick 退出 ──────────────────────────────────
+    def _check_tick_exit(self, bar: BarData = None):
+        if not self.legs:
+            return
+        cur_pnl = self._estimate_pnl()
+        cost = abs(self.max_loss) + 0.01
+        if cost <= 0:
+            return
+        if cur_pnl < -cost * 0.8:
+            self.write_log("[SellCall] 止损 cur=%.0f cost=%.0f" % (cur_pnl, cost))
+            self._close_all_legs()
+            self._rolling = False
+        elif cur_pnl > self.net_premium * 0.7:
+            self.write_log("[SellCall] 止盈 cur=%.0f prem=%.0f" % (cur_pnl, self.net_premium))
+            self._close_all_legs()
+            self._rolling = False
+
+    def _roll_positions(self):
+        self._close_all_legs()
+        self.write_log("[SellCall] 展期完成，等下根bar重开")

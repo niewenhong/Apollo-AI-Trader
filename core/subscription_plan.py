@@ -1,5 +1,5 @@
 """
-core/subscription_plan.py - Apollo Trader v3.2.0
+core/subscription_plan.py - Apollo Trader v3.8.2
 ==============================================
 按需订阅管理：
   - 根据选股结果自动推断需要订阅的K线周期
@@ -9,19 +9,18 @@ core/subscription_plan.py - Apollo Trader v3.2.0
   - 不浪费富途300配额
 """
 import logging
-from typing import Dict, List, Set, Tuple, Optional
-from futu import SubType, RET_OK, Session
+from typing import Dict, List, Set, Optional
 
 log = logging.getLogger("SubPlan")
 
 # 每只股票需要的订阅类型映射
-ANOMALY_SUBS = ["QUOTE", "K_1M"]     # 异动检测必需
-BASIC_SUBS = ["K_DAY"]                  # 基本盘评分
+ANOMALY_SUBS = ["QUOTE", "K_1M"]    # 异动检测必需
+BASIC_SUBS = ["K_DAY"]                   # 基本盘评分
 REGIME_SUBS = ["K_DAY"]                 # Regime 计算
 WARRANT_SUBS = ["QUOTE"]               # 涡轮只需要正股报价
 CBBC_SUBS = ["QUOTE"]                  # 牛熊证同理
 OPTION_SUBS = ["QUOTE"]                # 期权同理
-TREND_SUBS = ["K_5M", "K_15M"]      # 趋势策略可选
+TREND_SUBS = ["K_5M", "K_15M"]       # 趋势策略可选
 
 
 def build_subscription_plan(selected: List[dict]) -> Dict[str, List[str]]:
@@ -37,7 +36,7 @@ def build_subscription_plan(selected: List[dict]) -> Dict[str, List[str]]:
         anomaly_type = item.get("anomaly_type", "none")
         asset_class = item.get("asset_class", "EQUITY")
         regime = item.get("regime", "range")
-        underling = item.get("underlying", "")
+        underlying = item.get("underlying", "")
 
         # 确定 futu_symbol
         futu_sym = code if code else vt
@@ -68,11 +67,8 @@ def build_subscription_plan(selected: List[dict]) -> Dict[str, List[str]]:
         # ---- 涡轮/牛熊/期权：需要正股报价 ----
         if asset_class in ("HK_WARRANT", "HK_CBBC_BULL", "HK_CBBC_BEAR",
                           "US_OPTION_CALL", "US_OPTION_PUT", "US_OPTION_BOTH"):
-            if underling:
-                plan.setdefault(underling, set()).add("QUOTE")
-            else:
-                # 没有正股信息，用自身
-                plan.setdefault(futu_sym, set()).add("QUOTE")
+            target = underlying if underlying else futu_sym
+            plan.setdefault(target, set()).add("QUOTE")
 
         # ---- 趋势策略额外订阅 ----
         if regime == "strong_bull" and asset_class == "EQUITY":
@@ -80,7 +76,7 @@ def build_subscription_plan(selected: List[dict]) -> Dict[str, List[str]]:
                 plan.setdefault(futu_sym, set()).add(s)
 
     # 转换为列表格式
-    result = {}
+    result: Dict[str, List[str]] = {}
     for sym, subs in plan.items():
         result[sym] = sorted(list(subs))
 
@@ -92,7 +88,7 @@ def build_subscription_plan(selected: List[dict]) -> Dict[str, List[str]]:
 
 
 def apply_subscription_plan(sub_manager, config: dict,
-                              deployed_strategies: set = None) -> bool:
+                            deployed_strategies: Optional[set] = None) -> bool:
     """
     应用订阅计划到 SubscriptionManager。
     按需订阅，不浪费配额。
@@ -106,27 +102,23 @@ def apply_subscription_plan(sub_manager, config: dict,
 
     success_count = 0
     for futu_sym, subs in plan.items():
-        # 确定用户（用于引用计数）
         user = "selector_plan"
         if sub_manager.subscribe_demand(futu_sym, user, subs):
             success_count += 1
         else:
             log.warning(f"[SubPlan] 订阅失败: {futu_sym} {subs}")
 
-    log.info(f"[SubPlan] ✅ 订阅完成: {success_count}/{len(plan)}")
+    log.info(f"[SubPlan] 订阅完成: {success_count}/{len(plan)}")
     return success_count == len(plan)
 
 
 def get_required_quota(selected: List[dict]) -> int:
     """预估需要的配额数量"""
     plan = build_subscription_plan(selected)
-    total = 0
-    for subs in plan.values():
-        total += len(subs)
-    return total
+    return sum(len(subs) for subs in plan.values())
 
-def _strategy_required_subtypes(strategy_names: set) -> list:
+
+def strategy_required_subtypes(strategy_names: set) -> list:
     """根据策略名称返回所需的订阅数据类型"""
     required = {"K_1M", "K_DAY", "QUOTE"}
-    # 可根据策略名称扩展（例如某些策略需要 TICKER）
     return list(required)

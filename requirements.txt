@@ -1,37 +1,45 @@
-# Apollo AI Trader v2.8.0 — 依赖清单
-# 安装: pip install -r requirements.txt
+# Apollo AI Trader v3.8.0 依赖
 
-# ── 核心依赖 ──
-futu-api>=8.0.0
+# ─── 核心框架 ───
 vnpy>=3.9.0
-numpy>=1.24.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-scipy>=1.11.0
+vnpy_ctastrategy>=3.9.0
+vnpy_ctatrader>=3.9.0
 
-# ── 优化 ──
-optuna>=3.4.0
+# ─── FUTU API ───
+futu-api>=7.0.3608
 
-# ── 调度 ──
+# ─── 定时任务 ───
 apscheduler>=3.10.0
 
-# ── Telegram ──
-python-telegram-bot>=20.0
+# ─── 数据库 ───
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
 
-# ── Web 框架（管理面板用）──
+# ─── 数据分析 ───
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# ─── 技术指标 ───
+TA-Lib>=0.4.28
+# 替代方案（如果 TA-Lib 安装困难）
+# pandas-ta>=0.3.14b0
+
+# ─── Web/API ───
 fastapi>=0.100.0
 uvicorn>=0.23.0
-pydantic>=2.0
+pydantic>=2.0.0
 
-# ── 数据库 ──
-# SQLite 内置于 Python，无需额外安装
-# 如需 PostgreSQL:
-# psycopg2-binary>=2.9.0
+# ─── 通信 ───
+python-telegram-bot>=21.0
+websockets>=12.0
 
-# ── 工具 ──
+# ─── 工具 ───
+pydantic>=2.0.0
 python-dotenv>=1.0.0
 loguru>=0.7.0
-redis>=5.0.0
+rich>=13.0.0
 
-# ── 测试 ──
+# ─── 测试 ───
 pytest>=7.4.0
+pytest-asyncio>=0.21.0

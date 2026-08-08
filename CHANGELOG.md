@@ -1,22 +1,66 @@
-## v2.7.0-beta (2026-07-25)
+# Changelog - Apollo AI Trader v3.8.0
 
-### 新增
-- **SubscriptionManager**: 全套订阅（K_1M+K_5M+K_15M+K_60M=4额度/只），市场路由（港股HK链路/美股US链路），延迟60秒反订阅，日线走历史接口，配额审计
-- **MultiPeriodDB**: 多周期本地数据库（kline_1m/5m/15m/60m/1d分表），数据缺口检测，原生OHLCV零损耗存储
-- **MarketDataBus**: 统一行情总线，自动落库+15m ATR门禁检查+策略分发
-- **StrategyMatcher**: 策略-标的匹配器，自动检测市场regime（trend/range），为每个标的匹配最优策略+参数
-- **MultiPeriodBacktestEngine**: 多周期回测引擎，100%读本地库，与实盘预热使用相同BarGenerator逻辑
-- **MultiPeriodKlineHandler**: 富途原生多周期K线回调（K_1M/K_5M/K_15M/K_60M），转换为vn.py BarData事件分发
+## [3.8.0] - 2026-08-07
 
-### 改进
-- 取消分级订阅，统一全套订阅，避免数据缺失和调试混乱
-- 主策略周期从1m升到5m/15m（降噪），1m只做精确进场
-- 门禁用15m ATR（噪声远低于1m）
-- 回测与实盘数据完全同源（本地库）
-- 历史数据按需补齐，消耗历史K线额度（7天滚动）
+### 🚀 重大新功能
 
-### 注意
-- 需在 futu_gateway.py 的 connect 中注册 MultiPeriodKlineHandler
-- 首次运行自动创建多周期表
-- 300订阅额度可支撑75只标的全套订阅
-- 历史K线额度300（7天滚动），同股票多周期只算1额度
+#### 多用户架构
+- 新增 `UserManager` 模块，支持多用户隔离
+- 每个用户拥有独立的策略池、持仓、资金配置
+- 系统级策略可共享给所有用户使用
+- 用户级策略仅属于创建者
+
+#### 策略分级与生命周期管理
+- 新增 `StrategyLifecycleManager`（策略生命周期总管）
+- 策略层级：`PENDING` → `TRIAL`(3%) → `FORMAL`(10%) → `CORE`(20%)
+- 自动绩效评估与层级升降
+- 信号衰减检测与自动响应
+- 资金分配按层级动态缩放
+
+#### 外部持仓自动接管
+- 自动检测非本系统买入的持仓
+- 生成 `ManagedPositionStrategy` 接管管理
+- 持仓盈亏不污染策略绩效评分
+
+### 🔧 核心改进
+
+#### BaseStrategy 增强
+- `buy/sell/short/cover` 增加下单日志
+- 集成 `LifecycleManager` 下单前检查链
+- 支持 `lifecycle_manager` 外部注入
+
+#### DBManager 扩展
+- 新增多用户表结构
+- 策略配置表增加 `tier`、`trial_score`、`optimize_count` 等字段
+- 新增 `user_id` 字段区分用户级/系统级策略
+- 新增事件日志表
+
+#### SchedulerJobs 增强
+- 新增 `evaluate_strategies_job`（每小时评估）
+- 新增 `detect_decay_job`（每日衰减检测）
+- 新增 `detect_unmanaged_positions_job`（每30分钟）
+
+### 📊 绩效评估体系
+- 综合评分公式：夏普(25%) + 回撤(20%) + 盈利因子(15%) + 索提诺(15%) + 胜率×盈亏比(15%) + 执行质量(10%)
+- 试用期转正门槛：score≥75 且交易≥30笔 且运行≥14天
+- 衰减检测：滚动夏普/盈利因子/回撤三重监测
+
+### 🛡️ 风控整合
+- `LifecycleManager` 统一协调风控、资金、层级、衰减检查
+- 下单前检查链：交易许可 → 风控 → 资金 → 层级 → 衰减
+- 严重衰减自动降规模50%
+
+### 📁 新增文件
+- `core/strategy_lifecycle_manager.py` - 策略生命周期总管
+- `core/user_manager.py` - 多用户管理
+- `core/account_manager.py` - 账户资金管理
+- `strategies/equity/managed_position_strategy.py` - 外部持仓接管策略
+- `data/migrations/v3.8.0.sql` - 数据库迁移脚本
+
+### 📝 修改文件
+- `strategies/base_strategy.py` - 增加下单日志 + LifecycleManager 集成
+- `core/db_manager.py` - 多用户 + 策略层级字段
+- `core/scheduler_jobs.py` - 新增评估/衰减/接管任务
+- `core/strategy_engine.py` - 注入 LifecycleManager
+- `main.py` - 初始化新组件
+- `config/system_config.json` - 新增多用户/生命周期配置节

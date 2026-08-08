@@ -1,6 +1,9 @@
 """
-vnpy_futu — 富途网关包 v2.7.0
+vnpy_futu/__init__.py - v3.8.0
+FUTU 网关包
 """
-from .futu_gateway import FutuGateway
+from vnpy_futu.futu_gateway import FutuGateway
+from vnpy_futu.futu_bridge import FutuBridge
 
-__all__ = ["FutuGateway"]
+__version__ = "3.8.0"
+__all__ = ['FutuGateway', 'FutuBridge']

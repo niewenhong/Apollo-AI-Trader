@@ -1,15 +1,13 @@
+# -*- coding: utf-8 -*-
 """
-ai/stock_diagnosis.py — 诊股模块 v3.0.0
+ai/stock_diagnosis.py — 诊股模块 v3.8.1
 ==========================================
-变更：
-  v3.0.0 - 接入 KlineProvider，日K/周K 全部走统一缓存，
-           不再各自调 request_history_kline。
-           数据不足时返回真实降级（不再假装 54 分）。
-           内置 vt↔futu 符号转换。
-功能：技术面+资金面+趋势综合诊断，结果存数据库。
+- 兼容 KlineProvider 返回 dict 格式（isinstance 判断）
+- 兼容返回 DataFrame 格式
+- 数据不足时返回真实降级
 """
-
 import numpy as np
+import pandas as pd
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -22,23 +20,10 @@ from core.kline_provider import KlineProvider
 
 
 class StockDiagnosis:
-    """
-    单票诊股器。
-    使用方式：
-        kp = KlineProvider(quote_ctx=us_ctx, market="US")
-        diag = StockDiagnosis(kline_provider=kp, db=db_manager)
-        result = diag.diagnose("AAPL.SMART")
-    """
+    """单票诊股器 v3.8.1（兼容 dict / DataFrame 两种 K线返回格式）"""
 
     def __init__(self, quote_ctx=None, db=None,
                  kline_provider: Optional[KlineProvider] = None):
-        """
-        Parameters
-        ----------
-        quote_ctx : 富途行情上下文（仅资金流用，可 None 若不需要）
-        db : 实现 save_diagnosis(vt_symbol, result, summary) 的对象
-        kline_provider : KlineProvider 实例（必需，否则诊股降级）
-        """
         self.ctx = quote_ctx
         self.db = db
         self.kp = kline_provider
@@ -46,11 +31,6 @@ class StockDiagnosis:
     # ==================== 公开 API ====================
 
     def diagnose(self, vt_symbol: str) -> Dict:
-        """
-        对单只票做综合诊断。
-        返回 dict 含 technical / money / trend / summary。
-        即使 K线拿不到也返回完整结构（降级），不会抛异常。
-        """
         code_for_flow = KlineProvider.vt_to_futu(vt_symbol)
 
         result = {
@@ -62,7 +42,6 @@ class StockDiagnosis:
         }
         result["summary"] = self._summary(result)
 
-        # 落库
         if self.db is not None:
             try:
                 self.db.save_diagnosis(vt_symbol, result, result["summary"])
@@ -76,15 +55,23 @@ class StockDiagnosis:
     def _tech(self, vt_symbol: str) -> Dict:
         """技术面：MA 排列 + RSI"""
         if self.kp is None:
-            return {"error": "no_kline_provider", "rsi": 50.0,
-                    "bullish": False, "above_ma20": False,
-                    "ma5": 0, "ma20": 0, "ma60": 0}
+            return self._empty_tech("no_kline_provider")
 
-        df = self.kp.get_for_diagnosis(vt_symbol)
+        # ★ v3.8.1: 兼容 dict 和 DataFrame 两种返回
+        data = self.kp.get_for_diagnosis(vt_symbol)
+        if data is None:
+            return self._empty_tech("kline_insufficient")
+
+        # 兼容 dict 格式（KlineProvider 返回 {"daily_df": DataFrame, ...}）
+        if isinstance(data, dict):
+            df = data.get("daily_df")
+        elif isinstance(data, pd.DataFrame):
+            df = data
+        else:
+            df = None
+
         if df is None or df.empty or len(df) < 6:
-            return {"error": "kline_insufficient", "rsi": 50.0,
-                    "bullish": False, "above_ma20": False,
-                    "ma5": 0, "ma20": 0, "ma60": 0}
+            return self._empty_tech("kline_insufficient")
 
         c = df["close"].astype(float).values
         ma5 = float(np.mean(c[-5:]))
@@ -104,10 +91,9 @@ class StockDiagnosis:
         }
 
     def _money(self, futu_code: str) -> Dict:
-        """资金面：大单净流入（走富途 get_capital_flow）"""
+        """资金面：大单净流入"""
         if self.ctx is None:
             return {"error": "no_quote_ctx", "net": 0.0, "large": 0.0}
-
         try:
             ret, mf = self.ctx.get_capital_flow(futu_code)
         except Exception as e:
@@ -125,13 +111,11 @@ class StockDiagnosis:
     def _trend(self, vt_symbol: str) -> Dict:
         """趋势：52周高低位 + 近期方向"""
         if self.kp is None:
-            return {"error": "no_kline_provider",
-                    "high52": 0, "low52": 0, "pos": 0.5, "trend": "flat"}
+            return self._empty_trend()
 
-        df = self.kp.get_weekly(vt_symbol, weeks=60)  # ~14个月覆盖52周
+        df = self.kp.get_weekly(vt_symbol, count=60)
         if df is None or df.empty or len(df) < 5:
-            return {"error": "weekly_insufficient",
-                    "high52": 0, "low52": 0, "pos": 0.5, "trend": "flat"}
+            return self._empty_trend()
 
         c = df["close"].astype(float).values
         h52 = float(np.max(c[-52:]))
@@ -155,7 +139,6 @@ class StockDiagnosis:
         mf = d.get("money", {}) or {}
         tr = d.get("trend", {}) or {}
 
-        # 安全获取 rsi
         rsi = t.get("rsi", 50.0)
         if rsi > 70:
             parts.append(f"RSI超买{rsi:.0f}")
@@ -189,7 +172,15 @@ class StockDiagnosis:
 
         return ";".join(parts) if parts else "无明显信号"
 
-    # ==================== 静态工具 ====================
+    # ==================== 工具 ====================
+
+    def _empty_tech(self, reason: str) -> Dict:
+        return {"error": reason, "rsi": 50.0, "bullish": False,
+                "above_ma20": False, "ma5": 0, "ma20": 0, "ma60": 0}
+
+    def _empty_trend(self) -> Dict:
+        return {"error": "no_kline", "high52": 0, "low52": 0,
+                "pos": 0.5, "trend": "flat"}
 
     @staticmethod
     def _rsi(c, n=14):

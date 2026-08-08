@@ -1,159 +1,203 @@
-# -*- coding: utf-8 -*-
 """
-core/config_loader.py - Apollo Trader v3.2.0 热配置加载器
-变更：
-  v3.2.0 - 新增 load_config() 模块级便捷函数（修复 main.py 导入错误）
-            新增 get_config_loader() 单例访问
-            保留原有 ConfigLoader 类所有功能
+core/config_loader.py - v3.8.0
+配置加载器（支持多用户配置 + 生命周期配置）
 """
 import json
 import os
-import threading
-from typing import Callable, Dict, Any, Optional
+import logging
+from typing import Any, Dict, Optional
+from pathlib import Path
 
-# ========== 模块级单例 ==========
-_loader_instance: Optional["ConfigLoader"] = None
-_loader_lock = threading.Lock()
+logger = logging.getLogger("ConfigLoader")
+
+DEFAULT_CONFIG = {
+    "version": "3.8.0",
+    "db_path": "data/apollo.db",
+    "enable_us": True,
+    "enable_hk": True,
+    "futu_us": {
+        "host": "127.0.0.1",
+        "port": 11111,
+        "unlock_pwd": "",
+        "trade_password": "",
+        "env": "SIMULATE"
+    },
+    "futu_hk": {
+        "host": "127.0.0.1",
+        "port": 11111,
+        "unlock_pwd": "",
+        "trade_password": "",
+        "env": "SIMULATE"
+    },
+    "risk": {
+        "max_daily_loss_pct": 0.02,
+        "max_position_pct": 0.15,
+        "max_orders_per_minute": 10,
+        "max_strategy_orders_per_minute": 3,
+        "circuit_breaker_pct": 0.05,
+        "max_leverage": 2.0
+    },
+    "lifecycle": {
+        "trial_capital_pct": 0.03,
+        "formal_capital_pct": 0.10,
+        "core_capital_pct": 0.20,
+        "adopt_capital_pct": 0.05,
+        "promotion_score": 75,
+        "min_trial_trades": 30,
+        "min_trial_days": 14,
+        "max_optimize_count": 3,
+        "decay_sharpe_ratio": 0.5,
+        "decay_profit_factor": 0.6,
+        "decay_dd_multiplier": 1.5
+    },
+    "users": {
+        "default_role": "STANDARD",
+        "max_login_attempts": 5,
+        "session_timeout_minutes": 60,
+        "allow_self_registration": False
+    },
+    "scheduler": {
+        "evaluate_interval_minutes": 60,
+        "trial_evaluate_interval_minutes": 30,
+        "decay_check_interval_hours": 6,
+        "adopt_check_interval_minutes": 30,
+        "sync_account_interval_minutes": 5,
+        "promote_check_hour": 2,
+        "cleanup_hour": 3,
+        "status_report_interval_minutes": 60
+    },
+    "logging": {
+        "level": "INFO",
+        "max_file_size_mb": 100,
+        "backup_count": 30,
+        "format": "%(asctime)s | %(levelname)-7s | %(name)-15s | %(message)s"
+    }
+}
 
 
-def load_config(name: str = "system", config_dir: str = "config") -> dict:
+def load_config(config_path: str = "config/system_config.json") -> dict:
     """
-    模块级便捷函数：加载配置文件
-    :param name: 配置名（如 'system' → system_config.json）
-    :param config_dir: 配置目录
-    :return: 配置字典
-    用法：
-        from core.config_loader import load_config
-        CONFIG = load_config("system")
+    加载配置文件，与默认值合并
+    支持环境变量覆盖（APOLLO_DB_PATH 等）
     """
-    loader = get_config_loader(config_dir)
-    return loader.load(name)
+    config = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 
-
-def get_config_loader(config_dir: str = "config") -> "ConfigLoader":
-    """获取/创建 ConfigLoader 单例"""
-    global _loader_instance
-    with _loader_lock:
-        if _loader_instance is None:
-            _loader_instance = ConfigLoader(config_dir)
-        return _loader_instance
-
-
-def save_config(name: str, data: dict, config_dir: str = "config"):
-    """模块级便捷函数：保存配置"""
-    loader = get_config_loader(config_dir)
-    loader.save(name, data)
-
-
-def register_config_callback(callback: Callable[[str], None], config_dir: str = "config"):
-    """模块级便捷函数：注册配置变更回调"""
-    loader = get_config_loader(config_dir)
-    loader.register_callback(callback)
-
-
-# ========== 原有类（保持不变） ==========
-
-class ConfigChangeHandler:
-    """配置文件变更处理器"""
-    def __init__(self, callback: Callable[[str], None]):
-        self.callback = callback
-
-    def on_modified(self, event):
-        if event.src_path.endswith('.json'):
-            try:
-                self.callback(event.src_path)
-            except Exception as e:
-                print(f"Config callback error: {e}")
-
-
-class ConfigLoader:
-    """配置加载器（单例），支持热加载"""
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls, config_dir: str = "config"):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._init(config_dir)
-        return cls._instance
-
-    def _init(self, config_dir: str):
-        self.config_dir = config_dir
-        self._callbacks = []
-        self._cache: Dict[str, dict] = {}
-        self._start_watcher()
-
-    def _start_watcher(self):
-        """启动文件监听（watchdog）"""
+    # 从文件加载
+    path = Path(config_path)
+    if path.exists():
         try:
-            from watchdog.observers import Observer
-            path = os.path.join(os.getcwd(), self.config_dir)
-            if not os.path.exists(path):
-                return
-            event_handler = ConfigChangeHandler(self._on_config_changed)
-            observer = Observer()
-            observer.schedule(event_handler, path, recursive=True)
-            observer.daemon = True
-            observer.start()
-            self._observer = observer
-        except ImportError:
-            # watchdog 未安装，降级为手动加载
-            pass
+            with open(path, 'r', encoding='utf-8') as f:
+                file_config = json.load(f)
+            config = _deep_merge(config, file_config)
+            logger.info(f"✅ 配置已加载: {config_path}")
+        except Exception as e:
+            logger.error(f"⚠️ 配置加载失败，使用默认: {e}")
+    else:
+        logger.warning(f"⚠️ 配置文件不存在: {config_path}，使用默认配置")
+        # 创建默认配置
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+            logger.info(f"✅ 已创建默认配置: {config_path}")
+        except Exception as e:
+            logger.error(f"创建默认配置失败: {e}")
 
-    def _on_config_changed(self, filepath: str):
-        """配置文件变更回调"""
-        for cb in self._callbacks:
-            try:
-                cb(filepath)
-            except Exception as e:
-                print(f"Callback error: {e}")
+    # 环境变量覆盖
+    _apply_env_overrides(config)
 
-    def register_callback(self, callback: Callable[[str], None]):
-        """注册配置变更回调"""
-        self._callbacks.append(callback)
+    return config
 
-    def load(self, name: str) -> dict:
-        """
-        加载配置（带缓存）
-        :param name: 配置文件名（不含路径，如 'vwap_config' 或 'system'）
-        """
-        filepath = self._resolve_path(name)
-        if not os.path.exists(filepath):
-            return {}
-        mtime = os.path.getmtime(filepath)
-        cache_key = filepath
-        cached = self._cache.get(cache_key)
-        if cached and cached.get('_mtime') == mtime:
-            return cached.get('data', {})
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        self._cache[cache_key] = {'data': data, '_mtime': mtime}
-        return data
 
-    def save(self, name: str, data: dict):
-        """保存配置"""
-        filepath = self._resolve_path(name)
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        # 更新缓存
-        self._cache[filepath] = {'data': data, '_mtime': os.path.getmtime(filepath)}
-
-    def _resolve_path(self, name: str) -> str:
-        """解析配置文件路径"""
-        if name.endswith('.json'):
-            filename = name
-        elif name.endswith('_config'):
-            filename = f"{name}.json"
+def _deep_merge(base: dict, override: dict) -> dict:
+    """深度合并字典"""
+    for key, value in override.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            base[key] = _deep_merge(base[key], value)
         else:
-            filename = f"{name}_config.json"
-        # 尝试 strategies 子目录
-        sub = os.path.join(self.config_dir, "strategies", filename)
-        if os.path.exists(sub):
-            return sub
-        return os.path.join(self.config_dir, filename)
+            base[key] = value
+    return base
 
-    def reload_all(self):
-        """强制重新加载所有配置"""
-        self._cache.clear()
+
+def _apply_env_overrides(config: dict):
+    """环境变量覆盖（优先级最高）"""
+    env_mappings = {
+        'APOLLO_DB_PATH': ('db_path', str),
+        'APOLLO_LOG_LEVEL': ('logging', 'level', str),
+        'APOLLO_ENABLE_US': ('enable_us', lambda x: x.lower() == 'true'),
+        'APOLLO_ENABLE_HK': ('enable_hk', lambda x: x.lower() == 'true'),
+        'APOLLO_FUTU_HOST': ('futu_us', 'host', str),
+        'APOLLO_FUTU_PORT': ('futu_us', 'port', int),
+    }
+
+    for env_key, path in env_mappings.items():
+        val = os.environ.get(env_key)
+        if val is None:
+            continue
+        # 导航到目标位置
+        target = config
+        for step in path[:-2]:
+            target = target.setdefault(step, {})
+        converter = path[-1]
+        try:
+            if len(path) == 2:
+                config[path[0]] = converter(val)
+            else:
+                target[path[-2]] = converter(val)
+            logger.info(f"🌍 环境变量覆盖: {env_key}={val}")
+        except Exception as e:
+            logger.error(f"环境变量转换失败 {env_key}: {e}")
+
+
+def get_nested(config: dict, dotted_key: str, default=None):
+    """获取嵌套配置值，如 'risk.max_daily_loss_pct'"""
+    keys = dotted_key.split('.')
+    current = config
+    for k in keys:
+        if isinstance(current, dict) and k in current:
+            current = current[k]
+        else:
+            return default
+    return current
+
+
+def set_nested(config: dict, dotted_key: str, value):
+    """设置嵌套配置值"""
+    keys = dotted_key.split('.')
+    current = config
+    for k in keys[:-1]:
+        current = current.setdefault(k, {})
+    current[keys[-1]] = value
+
+
+def save_config(config: dict, config_path: str = "config/system_config.json"):
+    """保存配置到文件"""
+    path = Path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    logger.info(f"✅ 配置已保存: {config_path}")
+
+
+def load_user_config(user_id: str) -> dict:
+    """加载用户级配置（覆盖系统配置）"""
+    user_config_path = f"config/users/{user_id}/config.json"
+    path = Path(user_config_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"用户配置加载失败 {user_id}: {e}")
+        return {}
+
+
+def save_user_config(user_id: str, config: dict):
+    """保存用户级配置"""
+    user_config_path = f"config/users/{user_id}/config.json"
+    path = Path(user_config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    logger.info(f"✅ 用户配置已保存: {user_id}")

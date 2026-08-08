@@ -1,0 +1,2097 @@
+{
+    "TrendStrategy_TSLA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_BABA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_META_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_TSLA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_BABA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TSLA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {}
+    },
+    "GridStrategy_TSLA_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "TSLA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_SPY_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "SPY.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_SPY_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "SPY.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_SPY_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "SPY.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_NFLX_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NFLX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_DIA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "DIA.SMART",
+        "setting": {}
+    },
+    "GridStrategy_META_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_IWM_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "IWM.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_IWM_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "IWM.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_DIA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "DIA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_DIA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "DIA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLE_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLE.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_IWM_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "IWM.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLF_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLF.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLF_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLF.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_BABA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "BABA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLF_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLF.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLK_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLK.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLK_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLK.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLK_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLK.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FISV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FISV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_QQQ_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "QQQ.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_QQQ_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "QQQ.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FISV_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FISV.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FISV_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FISV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_NWS_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NWS.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_NWS_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "NWS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NWS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NWS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_QQQ_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "QQQ.SMART",
+        "setting": {}
+    },
+    "GridStrategy_QQQ_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "QQQ.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_TSCO_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TSCO.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_TSCO_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "TSCO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TSCO_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TSCO.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_UTHR_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "UTHR.SMART",
+        "setting": {}
+    },
+    "GridStrategy_UTHR_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "UTHR.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_NWSA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NWSA.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_NWSA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "NWSA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NWSA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NWSA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_COKE_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "COKE.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_COKE_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "COKE.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_COKE_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "COKE.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_JKHY_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "JKHY.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_JKHY_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "JKHY.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLE_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLE.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLE_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLE.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_HALO_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "HALO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_JKHY_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "JKHY.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_HALO_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "HALO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_HALO_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "HALO.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_RTX_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "RTX.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_RTX_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "RTX.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_RTX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "RTX.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_GEN_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GEN.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_GEN_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "GEN.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GEN_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GEN.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FDX_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FDX.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FDX_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FDX.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FDX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FDX.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_AMD_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AMD_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AMD_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_GMAB_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "GMAB.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_EOG_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "EOG.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GMAB_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GMAB.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_EOG_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "EOG.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_EOG_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "EOG.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_TRGP_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TRGP.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_TRGP_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "TRGP.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TRGP_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TRGP.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_WPM_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "WPM.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FDX_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FDX.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_LNG_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "LNG.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_LNG_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "LNG.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_COR_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "COR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_LNG_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "LNG.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_DEO_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "DEO.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_WPM_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "WPM.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_WPM_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "WPM.SMART",
+        "setting": {}
+    },
+    "GridStrategy_WPM_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "WPM.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_AEM_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AEM.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FNV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FNV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_AEM_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "AEM.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AEM_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AEM.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_COR_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "COR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_COR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "COR.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_UBER_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "UBER.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_UBER_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "UBER.SMART",
+        "setting": {}
+    },
+    "GridStrategy_UBER_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "UBER.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_WRB_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "WRB.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_WRB_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "WRB.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_WRB_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "WRB.SMART",
+        "setting": {}
+    },
+    "GridStrategy_WRB_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "WRB.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_RL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "RL.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_VEEV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "VEEV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_VEEV_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "VEEV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_RL_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "RL.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_RL_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "RL.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_VEEV_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "VEEV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_WES_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "WES.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_WES_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "WES.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_ZTS_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "ZTS.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_ZTS_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "ZTS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_ZTS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "ZTS.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_NI_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NI.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_NI_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "NI.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NI_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NI.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FNV_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FNV.SMART",
+        "setting": {}
+    },
+    "GridStrategy_NI_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NI.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_PR_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "PR.SMART",
+        "setting": {}
+    },
+    "GridStrategy_ZTS_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "ZTS.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_OVV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "OVV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_OVV_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "OVV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_PR_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "PR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_PR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "PR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_OVV_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "OVV.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FNV_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FNV.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FNV_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FNV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FNF_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FNF.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FNF_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FNF.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_DEO_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "DEO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FNF_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FNF.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_WES_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "WES.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_DEO_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "DEO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GOOGL_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_META_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {}
+    },
+    "GridStrategy_NVDA_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AAPL_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AMZN_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {}
+    },
+    "GridStrategy_GOOGL_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_META_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "META.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_NVDA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_AMZN_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_GOOGL_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_MSFT_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AAPL_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NVDA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AMZN_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_AAPL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_MSFT_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_GOOGL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GOOGL.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_NVDA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "NVDA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_AMZN_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMZN.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_MSFT_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "MSFT.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_AAPL_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "AAPL.SMART",
+        "setting": {}
+    },
+    "MomentumStrategy_UBER_SMART": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "UBER.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_AMD_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {}
+    },
+    "SellCallStrategy_UBER_SMART": {
+        "class_name": "SellCallStrategy",
+        "vt_symbol": "UBER.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_AMD_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "AMD.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_ROP_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "ROP.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_ZM_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "ZM.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_ZM_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "ZM.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_ZM_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "ZM.SMART",
+        "setting": {}
+    },
+    "GridStrategy_ZM_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "ZM.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_ILMN_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "ILMN.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_EXPE_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "EXPE.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_EXPE_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "EXPE.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_EXPE_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "EXPE.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FOXA_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FOXA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FOXA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FOXA.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FOXA_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FOXA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FOX_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FOX.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FOX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FOX.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FOX_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FOX.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FFIV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FFIV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_ERIC_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "ERIC.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_CRM_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "CRM.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_PFE_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "PFE.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_PFE_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "PFE.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_PFE_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "PFE.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FIVE_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FIVE.SMART",
+        "setting": {}
+    },
+    "MomentumStrategy_ALGN_SMART": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "ALGN.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_MS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "MS.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_MS_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MS.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_MS_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "MS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_SAP_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "SAP.SMART",
+        "setting": {}
+    },
+    "WarrantStrategy_13598_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "13598.SEHK",
+        "setting": {}
+    },
+    "VWAPStrategy_00700_SEHK": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "00700.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_01810_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "01810.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_09999_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "09999.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_00700_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "00700.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_09988_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "09988.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_03690_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "03690.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_02015_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "02015.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_52283_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "52283.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_GMED_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GMED.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FRT_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FRT.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FRT_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FRT.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FRT_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FRT.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_PPL_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "PPL.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_PPL_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "PPL.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_RSG_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "RSG.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GMED_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GMED.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_GMED_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "GMED.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_UBS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "UBS.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_UBS_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "UBS.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_MCK_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "MCK.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_PPL_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "PPL.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_RSG_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "RSG.SMART",
+        "setting": {}
+    },
+    "GridStrategy_RIO_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "RIO.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_RIO_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "RIO.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_RIO_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "RIO.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_IBKR_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "IBKR.SMART",
+        "setting": {}
+    },
+    "SellCallStrategy_HONA_SMART": {
+        "class_name": "SellCallStrategy",
+        "vt_symbol": "HONA.SMART",
+        "setting": {}
+    },
+    "MomentumStrategy_HONA_SMART": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "HONA.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_HONA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "HONA.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_IBKR_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "IBKR.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_TXRH_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "TXRH.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TXRH_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TXRH.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_TXRH_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "TXRH.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_SAP_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "SAP.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_UBS_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "UBS.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_MCK_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "MCK.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_SAP_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "SAP.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_MCK_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "MCK.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_RIO_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "RIO.SMART",
+        "setting": {}
+    },
+    "GridStrategy_PAAS_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "PAAS.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_PAAS_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "PAAS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_PAAS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "PAAS.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AGI_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AGI.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_AGI_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "AGI.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AGI_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AGI.SMART",
+        "setting": {}
+    },
+    "GridStrategy_B_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "B.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_B_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "B.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_B_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "B.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_B_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "B.SMART",
+        "setting": {}
+    },
+    "GridStrategy_VST_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "VST.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_VST_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "VST.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_VST_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "VST.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_GEN_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "GEN_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AAPL_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AAPL_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLV_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLV_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLV_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLV_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_DEO_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "DEO_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_NFLX_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NFLX_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_DIA_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "DIA_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_AMD_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "AMD_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_SPY_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "SPY_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_MSFT_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "MSFT_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NFLX_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NFLX_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AMD_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AMD_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AMZN_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AMZN_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLI_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLI_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_DEO_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "DEO_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_QQQ_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "QQQ_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLE_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLE_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_META_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "META_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_BABA_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "BABA_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLF_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLF_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_QQQ_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "QQQ_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_META_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "META_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TSLA_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TSLA_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLF_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLF_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_BABA_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "BABA_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLB_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLB_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_TXRH_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "TXRH_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLB_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLB_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_TXRH_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "TXRH_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLV_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLV_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_NFLX_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "NFLX_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_META_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "META_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_GMAB_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "GMAB_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLK_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLK_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_NVDA_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "NVDA_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FSLR_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FSLR_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_IBKR_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "IBKR_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_MSFT_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "MSFT_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_IWM_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "IWM_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_GEN_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "GEN_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLI_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLI_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AMD_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMD_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLK_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLK_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_MSFT_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "MSFT_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_TXRH_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "TXRH_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLE_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLE_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GEN_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GEN_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_AAPL_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "AAPL_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_DIA_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "DIA_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_GMAB_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "GMAB_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_IBKR_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "IBKR_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_TSLA_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "TSLA_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_SPY_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "SPY_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_NVDA_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NVDA_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_IBKR_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "IBKR_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_BABA_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "BABA_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_FSLR_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "FSLR_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_QQQ_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "QQQ_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FSLR_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FSLR_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_DIA_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "DIA_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_SPY_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "SPY_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_NVDA_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "NVDA_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_VST_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "VST_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_TSLA_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "TSLA_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_AMZN_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "AMZN_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_DEO_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "DEO_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLE_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLE_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_IWM_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "IWM_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GMAB_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GMAB_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_IWM_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "IWM_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLF_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLF_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLB_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLB_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLK_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLK_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLI_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLI_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_GMED_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "GMED_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_GMED_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "GMED_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_GMED_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "GMED_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FRT_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FRT_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_FRT_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "FRT_SMART.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FRT_SMART_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FRT_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FNV_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FNV_SMART.SMART",
+        "setting": {}
+    },
+    "GridStrategy_VST_SMART_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "VST_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_FNV_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "FNV_SMART.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_VST_SMART_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "VST_SMART.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_80941_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "80941.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_02269_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "02269.SEHK",
+        "setting": {}
+    },
+    "VWAPStrategy_FDS_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FDS.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_FDS_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "FDS.SMART",
+        "setting": {}
+    },
+    "GridStrategy_RGA_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "RGA.SMART",
+        "setting": {}
+    },
+    "GridStrategy_EFX_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "EFX.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FDS_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FDS.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_ARCC_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "ARCC.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_ARCC_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "ARCC.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_ARCC_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "ARCC.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_SHG_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "SHG.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_SHG_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "SHG.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_LULU_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "LULU.SMART",
+        "setting": {}
+    },
+    "GridStrategy_LULU_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "LULU.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_LULU_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "LULU.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_LULU_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "LULU.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_EFX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "EFX.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_RSG_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "RSG.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_BR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "BR.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_BR_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "BR.SMART",
+        "setting": {}
+    },
+    "GridStrategy_BR_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "BR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_CX_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "CX.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_CX_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "CX.SMART",
+        "setting": {}
+    },
+    "GridStrategy_CX_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "CX.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_RGA_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "RGA.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_RGA_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "RGA.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLI_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLI.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLK_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLK.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLV_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLV.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLV_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLV.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLV_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLV.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLI_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLI.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_XLB_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "XLB.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLB_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLB.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_XLB_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "XLB.SMART",
+        "setting": {}
+    },
+    "GridStrategy_FSLR_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "FSLR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_FSLR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "FSLR.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_FSLR_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "FSLR.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_FSLR_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "FSLR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_UTHR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "UTHR.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_UTHR_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "UTHR.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_IBKR_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "IBKR.SMART",
+        "setting": {}
+    },
+    "VWAPStrategy_IBKR_SMART": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "IBKR.SMART",
+        "setting": {}
+    },
+    "GridStrategy_IBKR_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "IBKR.SMART",
+        "setting": {}
+    },
+    "GridStrategy_XLE_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "XLE.SMART",
+        "setting": {}
+    },
+    "TrendStrategy_GMAB_SMART": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "GMAB.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_SHG_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "SHG.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_EFX_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "EFX.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_XLI_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "XLI.SMART",
+        "setting": {}
+    },
+    "GridStrategy_NFLX_SMART": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {}
+    },
+    "SellPutStrategy_NFLX_SMART": {
+        "class_name": "SellPutStrategy",
+        "vt_symbol": "NFLX.SMART",
+        "setting": {}
+    },
+    "IronCondorStrategy_XLE_SMART": {
+        "class_name": "IronCondorStrategy",
+        "vt_symbol": "XLE.SMART",
+        "setting": {}
+    },
+    "CBBCStrategy_54038_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "54038.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_00700_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "00700.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_01211_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "01211.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_02382_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "02382.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_09988_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "09988.SEHK",
+        "setting": {}
+    },
+    "VWAPStrategy_09988_SEHK": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "09988.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_09618_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "09618.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_02015_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "02015.SEHK",
+        "setting": {}
+    },
+    "MomentumStrategy_09888_SEHK": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "09888.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_80941_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "80941.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_02628_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "02628.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_02382_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "02382.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_00300_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "00300.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_81211_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "81211.SEHK",
+        "setting": {}
+    },
+    "TrendStrategy_00945_SEHK": {
+        "class_name": "TrendStrategy",
+        "vt_symbol": "00945.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_83690_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "83690.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_02259_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "02259.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_00992_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "00992.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_00016_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "00016.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_06160_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "06160.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_89618_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "89618.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_80016_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "80016.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_02476_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "02476.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_06951_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "06951.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_03692_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "03692.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_00002_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "00002.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_82020_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "82020.SEHK",
+        "setting": {}
+    },
+    "IPOStrategy_02261_SEHK": {
+        "class_name": "IPOStrategy",
+        "vt_symbol": "02261.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_24719_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "24719.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_22629_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "22629.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_27205_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "27205.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_22659_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "22659.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_52811_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "52811.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_52813_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "52813.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_22628_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "22628.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_51984_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "51984.SEHK",
+        "setting": {}
+    },
+    "MomentumStrategy_01299_SEHK": {
+        "class_name": "MomentumStrategy",
+        "vt_symbol": "01299.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_52261_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "52261.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_13220_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "13220.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_13979_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "13979.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_53730_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "53730.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_54019_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "54019.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_03690_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "03690.SEHK",
+        "setting": {}
+    },
+    "VWAPStrategy_03690_SEHK": {
+        "class_name": "VWAPStrategy",
+        "vt_symbol": "03690.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_24127_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "24127.SEHK",
+        "setting": {}
+    },
+    "WarrantStrategy_24170_SEHK": {
+        "class_name": "WarrantStrategy",
+        "vt_symbol": "24170.SEHK",
+        "setting": {}
+    },
+    "CBBCStrategy_52256_SEHK": {
+        "class_name": "CBBCStrategy",
+        "vt_symbol": "52256.SEHK",
+        "setting": {}
+    },
+    "GridStrategy_01276_SEHK": {
+        "class_name": "GridStrategy",
+        "vt_symbol": "01276.SEHK",
+        "setting": {}
+    }
+}

@@ -1,17 +1,22 @@
 """
-strategies/equity/vwap_strategy.py - v3.1.4
-VWAP均值回归策略 + 多周期确认 + Regime感知
-继承 BaseStrategy，启动交易保护
+strategies/equity/vwap_strategy.py - v3.0.0
+VWAP 均值回归策略 + 多周期确认
+
+v3.0.0 更新：
+- ❌ 删除 is_regime_tradeable() 调用
+- ✅ 开仓决策仅由 VWAP 偏离 + 5M 趋势过滤 + 时间窗口决定
+- ✅ Regime 标签仅记录到日志，不参与决策
+- ✅ 黑天鹅过滤由基类 _check_trading_allowed() 统一处理
 """
 import numpy as np
 
-from vnpy.trader.object import BarData, TradeData
+from vnpy.trader.object import BarData, TickData, TradeData
 
 from strategies.base_strategy import BaseStrategy
 
 
 class VWAPStrategy(BaseStrategy):
-    """VWAP均值回归策略（v3.1.4）"""
+    """VWAP 均值回归策略"""
 
     author = "Apollo"
 
@@ -111,7 +116,7 @@ class VWAPStrategy(BaseStrategy):
                     self.write_log(f"🛡️ VWAP止损(空) @ {close:.2f}")
                     return
 
-        # ── 开仓 ──
+        # ── 开仓（5M 趋势过滤，无 regime 过滤）──
         else:
             if self.use_5m_filter and self._5m_trend == -1 and close <= self.lower_band:
                 self.write_log(f"⏸ 5M趋势向下，跳过做多信号")
@@ -120,10 +125,15 @@ class VWAPStrategy(BaseStrategy):
                 self.write_log(f"⏸ 5M趋势向上，跳过做空信号")
                 return
 
-            if not self.is_regime_tradeable():
+            # 记录 regime 标签（仅供参考）
+            self.update_regime_label()
+
+            # 检查交易状态
+            if not getattr(self, 'trading', False):
                 return
 
-            if not getattr(self, '_trading_allowed', False):
+            allow_open, _ = self.check_time_window(bar.datetime)
+            if not allow_open:
                 return
 
             if close <= self.lower_band:

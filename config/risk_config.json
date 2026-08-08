@@ -1,0 +1,15 @@
+{
+  "max_daily_loss_pct": 2.0,
+  "max_position_pct": 50.0,
+  "max_single_order_pct": 10.0,
+  "max_orders_per_minute": 10,
+  "max_drawdown_pct": 15.0,
+  "futures_margin_call_pct": 80.0,
+  "warrant_knockout_check": true,
+  "cbbc_knockout_buffer_pct": 2.0,
+  "circuit_breaker": {
+    "enabled": true,
+    "daily_loss_limit_pct": 3.0,
+    "action": "stop_all"
+  }
+}
